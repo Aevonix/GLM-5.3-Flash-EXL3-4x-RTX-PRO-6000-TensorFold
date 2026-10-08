@@ -1,0 +1,49 @@
+GLM-5.3-Flash EXL3 with TensorFold on one host with 4x RTX PRO 6000 Blackwell
+Copyright 2026 Aevonix Research. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This recipe builds on third-party work that keeps its own license. If you redistribute it or a modified version,
+keep this NOTICE and the notices below, and state what you changed (Apache-2.0, section 4).
+
+TensorFold
+  https://github.com/ashhart/TensorFold, by Ash Hart and the TensorFold contributors.
+  TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors / https://github.com/ashhart/TensorFold".
+  Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its MIT notice (TensorFold's
+  LICENSES/MIT.txt): Copyright (c) 2026 TensorFold contributors; permission is granted free of charge to deal in the
+  Software without restriction, provided the copyright notice and the permission notice are included in all copies
+  or substantial portions of the Software; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+  scripts/prepare.sh installs TensorFold v0.6.6 from its repository; patches/*/*.patch modify its source before installation.
+  Third-party code inside TensorFold and its licenses are listed in TensorFold's THIRD_PARTY_NOTICES.md. Patches 0073
+  and 0077 copy device functions from exl3.cu (TensorFold's EXL3 kernels, with Mia's AI Lab's prompt kernels from her
+  patches) into new kernel files; the EXL3 format they read is ExLlamaV3's (MIT), as THIRD_PARTY_NOTICES.md states.
+  Patch 0075 changes how TensorFold's DFlash2 port (after the MIT reference implementation TensorFold vendors, listed
+  there too) computes drafts; no drafter weights are modified or redistributed.
+
+GLM-5.3-Flash-EXL3 on DGX Sparks with TensorFold (Mia's AI Lab)
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-4x-DGX-Sparks-TensorFold
+  Copyright 2026 Mia's AI Lab. Apache License, Version 2.0. patches/miaai-lab/0001-0056 are Mia's AI Lab's patches (her
+  repository at commit 11eec0b), written for TensorFold v0.6.0 and ported here through v0.6.2 and v0.6.5 to v0.6.6.
+  The original port used 3-way merges; each file's first lines retain that history. Patches 0023 and 0037 are left out
+  because their behavior is supplied upstream. The v0.6.6 rebase changes only hunk line positions in her patches
+  0003, 0036, 0053 and 0054. Their headers and ownership remain unchanged. Her NOTICE credits, for
+  parts of them: b12x (local-inference-lab, Apache-2.0: the RDMA proxy and the one-shot RoCE all-gather design) and
+  glm53-tensorfold-spark (Jay Leaton, Apache-2.0: L2 prefetch and 16-byte trellis loads, adapted). Her recipe
+  (scripts/config.sh, start-tp4.sh) is the basis of scripts/config.sh and start.sh here, adapted from four DGX Sparks over RoCE
+  to one host with four GPUs on PCIe.
+
+b12x (local-inference-lab, Apache-2.0): patch 0058's CUDA IPC buffer design follows b12x's PCIe one-shot collectives;
+  no b12x source is copied. Patch 0070's LL protocol follows the idea of NCCL's LL protocol (NVIDIA); no NCCL source
+  is copied.
+
+What this recipe changes (Apache-2.0 section 4): patches/aevonix/0000 and 0057-0087 are new (this recipe's authors,
+  Apache-2.0), each described in docs/PATCHES.md (0057-0071 were written for TensorFold v0.6.0 and are ported here like
+  Mia's AI Lab's); patches/miaai-lab/0001-0056 are Mia's AI Lab's, ported (above); scripts/config.sh, start.sh, stop.sh,
+  scripts/prepare.sh are adapted from Mia's scripts; scripts/glm_autotune.py is new.
+
+Model weights (downloaded by prepare.sh, never included here)
+  GLM-5.3-Flash by Z.ai / Zhipu AI under its own license; the EXL3 4 bpw quantization by Mia's AI Lab
+  (Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold), under the license supplied with that checkpoint.
+  The DFlash2 drafter by Inco AI (incoai/GLM-5.3-Flash-DFlash2) is licensed
+  CC BY-NC-ND 4.0: NON-COMMERCIAL use only, no derivatives may be shared. This recipe does not modify or redistribute
+  it. To avoid these non-commercial weights set DRAFTER=mtp before the first start
+  (the checkpoint's own MTP head, PARALLEL=1) or obtain a license from the drafter's
+  publisher.

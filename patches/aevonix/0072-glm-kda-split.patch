@@ -1,0 +1,1214 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index d0ff694..625c8cf 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -786,6 +786,12 @@ class GlmEngine:
+         if rank == 0 and kda_chunked_on():
+             print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
+                   "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
++        from . import kda_split as kda_split_mod      # patch 0160: TF_GLM_KDA_SPLIT* (a bad value stops the start)
++
++        if kda_chunked_on() and kda_split_mod.SPLIT is not None:
++            kda_split_mod.prepare()
++            if rank == 0:
++                print(f"[tensorfold] {kda_split_mod.describe()}", flush=True)
+         # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
+         self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
+         if rank == 0 and self.shared:
+diff --git tensorfold/families/glm5_next/cuda/kda_chunked.py tensorfold/families/glm5_next/cuda/kda_chunked.py
+index 6b5e1b9..a06d487 100644
+--- tensorfold/families/glm5_next/cuda/kda_chunked.py
++++ tensorfold/families/glm5_next/cuda/kda_chunked.py
+@@ -191,6 +191,11 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
+     [H, 128, 128]; ``pos`` is the first row's absolute position. Writes out[:rows] (bf16 [rows, H * 128])."""
+ 
+     rows = int(rows)
++    from . import kda_split                    # patch 0160: TF_GLM_KDA_SPLIT, the same bits on the whole GPU
++
++    if kda_split.SPLIT is not None:
++        return kda_split.chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows,
++                               out, state_out, pos)
+     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
+                  dt_bias, norm_w, float(eps), float(lower), rows, int(pos) % CHUNK, out, state_out)
+     return out[:rows]
+diff --git tensorfold/families/glm5_next/cuda/kda_split.cpp tensorfold/families/glm5_next/cuda/kda_split.cpp
+new file mode 100644
+index 0000000..69f600b
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kda_split.cpp
+@@ -0,0 +1,62 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++int64_t kda_split_record_bytes();
++int64_t kda_split_state_smem(int64_t cols);
++void kda_split_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t,
++                    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                    const at::Tensor&, double, double, int64_t, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
++                    int64_t, int64_t, int64_t, int64_t);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
++}
++
++// kda_chunk.cpp's chain (the same arguments and checks), split (kda_split.cu): ``recs`` is a uint8 CUDA buffer of at
++// least window x H records, ``cols`` value columns a piece (a head takes ceil(128 / cols) pieces), ``nt`` threads a
++// state block, ``window`` sub-chunks a pass, ``spb`` sub-chunks a prep block (0: one wave over the SMs).
++void chain(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++           const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
++           const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
++           double eps, double lower, int64_t rows, int64_t off, at::Tensor out, at::Tensor state_out,
++           at::Tensor recs, int64_t cols, int64_t nt, int64_t window, int64_t spb) {
++    check(P, at::kBFloat16, "P");
++    check(A, at::kBFloat16, "A");
++    check(G, at::kBFloat16, "G");
++    check(cs, at::kBFloat16, "conv state");
++    check(cw, at::kBFloat16, "conv weight");
++    check(state_in, at::kFloat, "state");
++    check(state_out, at::kFloat, "state out");
++    check(a_log, at::kFloat, "A_log");
++    check(dt_bias, at::kFloat, "dt_bias");
++    check(norm_w, at::kBFloat16, "norm");
++    check(out, at::kBFloat16, "out");
++    check(recs, at::kByte, "records");
++    TORCH_CHECK(cs.is_contiguous() && cw.is_contiguous() && state_in.is_contiguous() && state_out.is_contiguous() &&
++                out.is_contiguous() && a_log.is_contiguous() && dt_bias.is_contiguous() && norm_w.is_contiguous() &&
++                recs.is_contiguous(), "conv state, conv weight, states, out, the per-head weights and the records "
++                "must be contiguous");
++    TORCH_CHECK(P.stride(1) == 1 && A.stride(1) == 1 && G.stride(1) == 1, "rows must be contiguous along channels");
++    const int64_t H = a_log.numel();
++    TORCH_CHECK(dt_bias.numel() == H * 128 && norm_w.numel() == 128, "dt_bias [H*128], norm [128]");
++    TORCH_CHECK(cw.size(0) == 3 * H * 128 && cw.size(1) == 4 && cs.size(0) == 3 && cs.size(1) == 3 * H * 128,
++                "4-tap convolutions of 3 x H x 128 channels");
++    TORCH_CHECK(state_in.numel() == H * 128 * 128 && state_out.numel() == H * 128 * 128, "states [H, 128, 128]");
++    TORCH_CHECK(state_in.data_ptr() != state_out.data_ptr(), "state_out must not alias state_in");
++    TORCH_CHECK(rows >= 1 && P.size(0) >= rows && A.size(0) >= rows && G.size(0) >= rows && out.size(0) >= rows,
++                "rows");
++    TORCH_CHECK(off >= 0 && off < 32, "off");
++    TORCH_CHECK(spb >= 0, "sub-chunks a prep block: 0 (one wave) or more");
++    TORCH_CHECK(window >= 1 && recs.numel() >= window * H * kda_split_record_bytes(), "records: window x H");
++    TORCH_CHECK((uintptr_t)recs.data_ptr() % 16 == 0 && (uintptr_t)state_in.data_ptr() % 16 == 0 &&
++                (uintptr_t)state_out.data_ptr() % 16 == 0, "records and states 16-byte aligned");
++    c10::cuda::CUDAGuard guard(P.device());
++    kda_split_cuda(P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps, lower,
++                   rows, off, out, state_out, recs, cols, nt, window, spb);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("chain", &chain);
++    m.def("record_bytes", &kda_split_record_bytes);
++    m.def("state_smem", &kda_split_state_smem);
++}
+diff --git tensorfold/families/glm5_next/cuda/kda_split.cu tensorfold/families/glm5_next/cuda/kda_split.cu
+new file mode 100644
+index 0000000..5a3119e
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kda_split.cu
+@@ -0,0 +1,939 @@
++// GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form, split for the whole GPU: kda_chunk.cu's bits, computed by
++// three kernels instead of one block a head.
++//
++// kda_chunk.cu runs one block of 256 threads a head through a prompt chunk's 32-row sub-chunks in order (its 128 x 128
++// state in registers, 255 registers a thread): a rank's 16 heads keep 16 SMs busy. Most of a sub-chunk's work does
++// not depend on the state, and the state's value rows (the output columns) evolve independently given a sub-chunk's
++// keys, decays and betas. So:
++//
++//   prep_kernel   block (sub-chunk, head), 256 threads: steps 0-4 of chunk_kernel for one sub-chunk (the conv,
++//                 norms, decays, beta, L and M, T, the decayed keys and queries), its code and thread layout unchanged,
++//                 written to a record in global memory. Every sub-chunk of a window at once.
++//   state_kernel  block (head, value piece), NT threads: steps 5-7 for NVC of the head's 128 value columns, sub-chunk
++//                 after sub-chunk, the state's slice in shared memory: the read sums of the decayed keys and queries
++//                 with the state, Y, V' = T Y, the read-outs O = (q E) S0^T + M V' rounded to bf16 (written to out,
++//                 not yet normalized), the state update.
++//   norm_kernel   one warp a (row, head): the gated RMSNorm of the bf16 read-outs, in place.
++//
++// Same bits as kda_chunk.cu, element by element: every value is computed by the same operations in the same order
++// with the same roundings (this file is built like kda_chunk.cu, without FMA contraction):
++//   - steps 0-4 are chunk_kernel's code on one sub-chunk (they never read the state or another sub-chunk);
++//   - a read sum of value column v and row r (chunk_kernel's row_sums and tree8): eight partial sums, partial g over
++//     the key quads g, g + 8, g + 16, g + 24 in that order (FMAs from 0), then tree8's xor 4, 2, 1 tree over the
++//     eight; here lane & 7 = g holds partial g as in chunk_kernel (kp = tid % 8), for 4 value columns and one row at a
++//     time, and tree8 is the same function (its association does not depend on which entry a lane keeps);
++//   - Y = (v - k sum) beta; V'[r] and O[r] are FMA chains over t = 0 .. 4 floor(r / 4) + 3 (chunk_kernel's 4-row
++//     tiles run t to the tile's last row; T and M hold exact zeros above the diagonal), O starting from the q sum;
++//   - the state: S diag(E(31)), then one FMA a sub-chunk row in row order;
++//   - the RMSNorm: lane l squares and adds its columns 4 l .. 4 l + 3 in order, then the xor 16, 8, 4, 2, 1 butterfly,
++//     and chunk_kernel's formula for the gate (div_rn where div_ok holds).
++// The value split (TF_GLM_KDA_SPLIT: NV pieces a head) and the window (rows a prep / state pass covers) only choose
++// which block computes an element and when: every setting gives the same bits.
++
++#ifndef KDA_CPU_EMU                    // (tests/K2 builds the kernels for the CPU with its own CUDA stand-ins)
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#endif
++#include <cstddef>
++#include <cstdint>
++
++namespace {
++
++constexpr int DK = 128, DV = 128, TAPS = 4;
++constexpr int BT = 32;                  // rows of a sub-chunk
++constexpr int HALO = TAPS - 1;          // conv rows before a sub-chunk
++constexpr int NT = 256, NW = NT / 32;   // prep_kernel's threads, warps (chunk_kernel's)
++constexpr int VPT = 4;                  // value rows of the state a thread holds (chunk_kernel's layout)
++constexpr int KP = NT * VPT / DV;       // threads sharing those value rows (8), each 16 keys
++constexpr int NQ = DK / 4 / KP;         // key quads a thread holds (4)
++constexpr int LS = BT + 4;              // row stride of L
++constexpr int PCH = 3 * DK;             // projection channels of a head (q | k | v)
++static_assert(KP == 8 && NQ == 4, "layout");
++
++// chunk_kernel's shared memory (steps 0-4 use all of it but the value rows' later uses)
++struct Smem {
++    float q[BT][DK];          // q -> q E(s)
++    float k[BT][DK];          // k -> k E(s)
++    float g[BT][DK];          // decays
++    union {                   // staged projection rows (conv input) -> k E(s ->), L, T, M
++        __nv_bfloat16 raw_p[BT + HALO][PCH];
++        struct {
++            float ke[BT][DK];         // k E(s ->)
++            float L[BT][LS];          // L[s][t]
++            float tt[BT][BT];         // T transposed: tt[t][s] = T[s][t]
++            float mt[BT][BT];         // M transposed: mt[t][s] = M[s][t]
++        } x;
++    } u;
++    __nv_bfloat16 v[BT][DV];
++    __nv_bfloat16 raw_a[BT][DK];      // staged decay rows
++    __nv_bfloat16 cw[PCH][TAPS];      // this head's conv weights
++    float raw_b[BT];
++    float beta[BT];
++    float egl[DK];            // E(31)
++};
++
++// One sub-chunk of one head, written by prep_kernel and read by state_kernel. Three load groups, each staged by
++// state_kernel while the phases before its use run: A (the read sums), T (V' and the read-outs), K (the update).
++struct Rec {
++    float kq[2][BT][DK];              // A: k E(s), q E(s)
++    float beta[BT];                   // A
++    __nv_bfloat16 v[BT][DV];          // A (a block stages its own columns)
++    float tt[BT][BT];                 // T: T transposed
++    float mt[BT][BT];                 // T: M transposed
++    float kd[BT][DK];                 // K: k E(s ->)
++    float egl[DK];                    // K: E(31)
++};
++static_assert(sizeof(Rec) == 66176,
++              "16-byte fields: kq at 0, beta 32768, v 32896, tt 41088, mt 45184, kd 49280, egl 65664");
++
++__device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++__device__ __forceinline__ float ldb(const __nv_bfloat16* p) { return __bfloat162float(*p); }
++__device__ __forceinline__ float fma_(float a, float b, float c) { return __fmaf_rn(a, b, c); }
++__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
++
++// kda_chunk.cu's division: a / b with IEEE rounding, branch-free, wherever ``div_ok`` holds (callers take a / b for
++// the rare operands outside).
++__device__ __forceinline__ float div_rn(float a, float b) {
++    float r;
++#ifdef KDA_CPU_EMU
++    r = emu_rcp_approx_ftz(b);
++#else
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(b));
++#endif
++    const float e = __fmaf_rn(-b, r, 1.0f);
++    r = __fmaf_rn(e, r, r);
++    const float q = a * r;
++    const float rem = __fmaf_rn(-b, q, a);
++    return __fmaf_rn(rem, r, q);
++}
++
++__device__ __forceinline__ bool div_ok(float a, float b) {
++    return (a == 0.0f || fabsf(a) > 1e-36f) && b >= 1.0f && b < 8e37f;
++}
++
++// 8 bf16 from p: one 16-byte load when aligned, else 8 loads.
++__device__ __forceinline__ uint4 ld8(const __nv_bfloat16* p, bool vec) {
++    if (vec) return *reinterpret_cast<const uint4*>(p);
++    const unsigned short* s = reinterpret_cast<const unsigned short*>(p);
++    uint4 r;
++    r.x = s[0] | ((unsigned)s[1] << 16); r.y = s[2] | ((unsigned)s[3] << 16);
++    r.z = s[4] | ((unsigned)s[5] << 16); r.w = s[6] | ((unsigned)s[7] << 16);
++    return r;
++}
++
++// kda_chunk.cu's transposing shuffle trees.
++template <int N>
++__device__ __forceinline__ void tree_level(float (&a)[N], int mask, bool hi) {
++#pragma unroll
++    for (int j = 0; j < N / 2; ++j) {
++        const float send = hi ? a[j] : a[j + N / 2];
++        const float keep = hi ? a[j + N / 2] : a[j];
++        a[j] = keep + __shfl_xor_sync(0xffffffffu, send, mask);
++    }
++}
++
++// Sums of a[0..8) over the lanes xor 4, 2, 1: lane bits (2, 1, 0) = i gets the sum of a[i].
++__device__ __forceinline__ float tree8(float (&a)[8], int lane) {
++    tree_level<8>(a, 4, lane & 4);
++    float b[4] = {a[0], a[1], a[2], a[3]};
++    tree_level<4>(b, 2, lane & 2);
++    float c[2] = {b[0], b[1]};
++    tree_level<2>(c, 1, lane & 1);
++    return c[0];
++}
++
++// Sums of a[0..16) over the lanes xor m0 > m1 > m2 > m3: the lane whose bits (m0, m1, m2, m3) spell i gets a[i]'s.
++__device__ __forceinline__ float tree16(float (&a)[16], int lane, int m0, int m1, int m2, int m3) {
++    tree_level<16>(a, m0, lane & m0);
++    float b[8];
++#pragma unroll
++    for (int j = 0; j < 8; ++j) b[j] = a[j];
++    tree_level<8>(b, m1, lane & m1);
++    float c[4] = {b[0], b[1], b[2], b[3]};
++    tree_level<4>(c, m2, lane & m2);
++    float d[2] = {c[0], c[1]};
++    tree_level<2>(d, m3, lane & m3);
++    return d[0];
++}
++
++// 16 bytes global -> shared, asynchronously (cp.async; the caller commits and waits).
++__device__ __forceinline__ void cp16(void* dst, const void* src) {
++#ifdef KDA_CPU_EMU
++    emu_cp_async(dst, src, 16);
++#else
++    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src));
++#endif
++}
++
++// 8 bytes global -> shared, asynchronously (cp.async.ca).
++__device__ __forceinline__ void cp8(void* dst, const void* src) {
++#ifdef KDA_CPU_EMU
++    emu_cp_async(dst, src, 8);
++#else
++    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(d), "l"(src));
++#endif
++}
++
++__device__ __forceinline__ void cp_commit() {
++#ifdef KDA_CPU_EMU
++    emu_cp_commit();
++#else
++    asm volatile("cp.async.commit_group;" ::: "memory");
++#endif
++}
++
++// Wait until at most N of this thread's committed copy groups are still in flight.
++template <int N>
++__device__ __forceinline__ void cp_wait() {
++#ifdef KDA_CPU_EMU
++    emu_cp_wait(N);
++#else
++    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
++#endif
++}
++
++__device__ __forceinline__ void cp_wait_all() {
++#ifdef KDA_CPU_EMU
++    emu_cp_wait_all();
++#else
++    asm volatile("cp.async.wait_all;" ::: "memory");
++#endif
++}
++
++// The rows kda_chunk.cu's stage() puts in shared memory for the sub-chunk whose row 0 is prompt-chunk row r0:
++// projection rows r0 - 3 .. r0 + 31 of the head's q | k | v channels (the conv state before the prompt chunk, zero
++// rows outside it), the decay rows and the beta logits. Fetched into registers one sub-chunk ahead (in flight while
++// the current one computes, as TensorFold 0.6.1's GDN prompt chain does) and stored where stage() stores them: the
++// same bytes (16-byte items: a 16-byte load where stage() takes cp.async, ld8's loads otherwise).
++struct Prefetch {
++    static constexpr int NPI = (BT + HALO) * PCH / 8, NAI = BT * DK / 8;     // 16-byte items
++    static constexpr int NP = (NPI + NT - 1) / NT, NA = NAI / NT;
++    static_assert(NA * NT == NAI, "decay rows: whole items a thread");
++    uint4 p[NP], a[NA];
++    float b;
++
++    __device__ __forceinline__ void fetch(int tid, int h, int H, int r0, int rows,
++                                          const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++                                          const __nv_bfloat16* __restrict__ A, int a_stride,
++                                          const __nv_bfloat16* __restrict__ cs, bool vec_p, bool vec_a) {
++        const int C = 3 * H * DK;
++#pragma unroll
++        for (int it = 0; it < NP; ++it) {
++            const int item = tid + it * NT;
++            uint4 v = make_uint4(0, 0, 0, 0);
++            if (item < NPI) {
++                const int row = item / (PCH / 8), q8 = item % (PCH / 8);
++                const int ch = (q8 / (DK / 8)) * H * DK + h * DK + 8 * (q8 % (DK / 8));
++                const int r = r0 - HALO + row;
++                const __nv_bfloat16* src = nullptr;
++                if (r >= 0 && r < rows) src = P + (size_t)r * p_stride + ch;
++                else if (r < 0 && r >= -HALO) src = cs + (size_t)(r + HALO) * C + ch;
++                if (src != nullptr) v = ld8(src, vec_p);
++            }
++            p[it] = v;
++        }
++#pragma unroll
++        for (int it = 0; it < NA; ++it) {
++            const int item = tid + it * NT;
++            const int row = item / (DK / 8), c8 = item % (DK / 8);
++            const int r = r0 + row;
++            a[it] = (r < 0 || r >= rows) ? make_uint4(0, 0, 0, 0)
++                                         : ld8(A + (size_t)r * a_stride + h * DK + 8 * c8, vec_a);
++        }
++        b = 0.0f;
++        if (tid < BT) {
++            const int r = r0 + tid;
++            b = (r >= 0 && r < rows) ? ldb(P + (size_t)r * p_stride + b_off + h) : 0.0f;
++        }
++    }
++
++    __device__ __forceinline__ void put(Smem& sm, int tid) const {
++#pragma unroll
++        for (int it = 0; it < NP; ++it) {
++            const int item = tid + it * NT;
++            if (item < NPI) reinterpret_cast<uint4*>(&sm.u.raw_p[item / (PCH / 8)][0])[item % (PCH / 8)] = p[it];
++        }
++#pragma unroll
++        for (int it = 0; it < NA; ++it) {
++            const int item = tid + it * NT;
++            reinterpret_cast<uint4*>(&sm.raw_a[item / (DK / 8)][0])[item % (DK / 8)] = a[it];
++        }
++        if (tid < BT) sm.raw_b[tid] = b;
++    }
++};
++
++// Block (sub-chunks blockIdx.x spb .. + spb - 1 of the window, head): chunk_kernel's steps 0-4 for each of them in
++// order (the code below is chunk_kernel's, line for line, its staging done by Prefetch), each followed by the
++// sub-chunk's record. The window's sub-chunks are c0 .. c0 + n - 1; record (head, window sub-chunk) at h n + that.
++__global__ void __launch_bounds__(NT, 1) prep_kernel(
++        int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++        const __nv_bfloat16* __restrict__ A, int a_stride,
++        const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
++        const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, int rows, int off, int c0,
++        int n, int spb, Rec* __restrict__ recs) {
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
++    const int h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int cb = blockIdx.x * spb, ce = cb + spb < n ? cb + spb : n;     // the block's window sub-chunks
++    const bool vec_p = (p_stride % 8 == 0) && ((uintptr_t)P % 16 == 0) && ((uintptr_t)cs % 16 == 0);
++    const bool vec_a = (a_stride % 8 == 0) && ((uintptr_t)A % 16 == 0);
++    const float rate = expf(a_log[h]);
++    const float dtb = dt_bias[h * DK + (tid & (DK - 1))];     // the decay channel this thread computes (tid % 128)
++    for (int x = tid; x < PCH * TAPS; x += NT) {
++        const int ch = x / TAPS;
++        sm.cw[ch][x % TAPS] = cw[(size_t)((ch / DK) * H * DK + h * DK + ch % DK) * TAPS + x % TAPS];
++    }
++    Prefetch pf;
++    pf.fetch(tid, h, H, (c0 + cb) * BT - off, rows, P, p_stride, b_off, A, a_stride, cs, vec_p, vec_a);
++
++    for (int cl = cb; cl < ce; ++cl) {
++        const int c = c0 + cl;
++        const int r0 = c * BT - off;                  // the prompt chunk's row at the sub-chunk's row 0
++
++        // 0. this sub-chunk's rows into shared memory (after the previous record's reads), the next one's fetched
++        __syncthreads();
++        pf.put(sm, tid);
++        if (cl + 1 < ce)
++            pf.fetch(tid, h, H, r0 + BT, rows, P, p_stride, b_off, A, a_stride, cs, vec_p, vec_a);
++        __syncthreads();
++
++        // 1. conv + SiLU (kda.cu's arithmetic) in 4-row blocks: warp w takes rows 4 w .. 4 w + 3 of q, then of k,
++        // then of v, lane l the channels 4 l .. 4 l + 3 (kda.cu's norm lanes), and the L2 norms of its q and k rows
++        // (kda.cu's sums); then the decays and beta.
++#pragma unroll 1
++        for (int part = 0; part < 3; ++part) {
++            const int rb = 4 * warp, ch = part * DK + 4 * lane;
++            float wt[4][TAPS];
++#pragma unroll
++            for (int x = 0; x < 4; ++x)
++#pragma unroll
++                for (int tap = 0; tap < TAPS; ++tap) wt[x][tap] = __bfloat162float(sm.cw[ch + x][tap]);
++            float xs[4 + HALO][4];
++#pragma unroll
++            for (int j = 0; j < 4 + HALO; ++j) {
++                const uint2 raw = *reinterpret_cast<const uint2*>(&sm.u.raw_p[rb + j][ch]);
++                const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
++                const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
++                xs[j][0] = __low2float(lo); xs[j][1] = __high2float(lo);
++                xs[j][2] = __low2float(hi); xs[j][3] = __high2float(hi);
++            }
++            float acc[4][4], act[4][4];
++            bool slow = false;
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++#pragma unroll
++                for (int x = 0; x < 4; ++x) {
++                    acc[i][x] = 0.0f;
++#pragma unroll
++                    for (int tap = 0; tap < TAPS; ++tap) acc[i][x] = acc[i][x] + wt[x][tap] * xs[i + tap][x];
++                    const float den = 1.0f + expf(-acc[i][x]);
++                    act[i][x] = div_rn(acc[i][x], den);
++                    slow |= !div_ok(acc[i][x], den);
++                }
++            if (slow) {                                       // kda.cu's IEEE division for the rare operands
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) act[i][x] = acc[i][x] / (1.0f + expf(-acc[i][x]));
++            }
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const int r = r0 + rb + i;
++#pragma unroll
++                for (int x = 0; x < 4; ++x) act[i][x] = (r >= 0 && r < rows) ? bf(act[i][x]) : 0.0f;
++            }
++            if (part < 2) {                                   // warp-uniform
++                float ss[4];
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    ss[i] = 0.0f;
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) ss[i] = ss[i] + act[i][x] * act[i][x];
++                }
++#pragma unroll
++                for (int o = 16; o; o >>= 1)                  // warp_sum's tree, the rows interleaved
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) ss[i] += __shfl_xor_sync(0xffffffffu, ss[i], o);
++                float (*dst)[DK] = part ? sm.k : sm.q;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    const float inv = 1.0f / sqrtf(ss[i] + 1e-6f);
++                    float y[4];
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) {
++                        y[x] = act[i][x] * inv;
++                        if (part == 0) y[x] = y[x] * (1.0f / sqrtf((float)DK));
++                    }
++                    *reinterpret_cast<float4*>(&dst[rb + i][4 * lane]) = make_float4(y[0], y[1], y[2], y[3]);
++                }
++            } else {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    __nv_bfloat162 lo = __floats2bfloat162_rn(act[i][0], act[i][1]);
++                    __nv_bfloat162 hi = __floats2bfloat162_rn(act[i][2], act[i][3]);
++                    uint2 o;
++                    o.x = *reinterpret_cast<unsigned*>(&lo); o.y = *reinterpret_cast<unsigned*>(&hi);
++                    *reinterpret_cast<uint2*>(&sm.v[rb + i][4 * lane]) = o;
++                }
++            }
++        }
++        {
++            const int cc = tid & (DK - 1);
++#pragma unroll
++            for (int j = tid >> 7; j < BT; j += NT / DK) {
++                const int r = r0 + j;
++                float gv = 1.0f;
++                if (r >= 0 && r < rows) {
++                    const float a = __bfloat162float(sm.raw_a[j][cc]) + dtb;
++                    const float den = 1.0f + expf(-(rate * a));
++                    const float sg = div_ok(1.0f, den) ? div_rn(1.0f, den) : 1.0f / den;   // kda.cu's sigmoidf_
++                    gv = expf(lower * sg);
++                }
++                sm.g[j][cc] = gv;
++            }
++            if (tid < BT) {
++                const int r = r0 + tid;
++                sm.beta[tid] = (r >= 0 && r < rows) ? bf(sigmoidf_(sm.raw_b[tid])) : 0.0f;
++            }
++        }
++        __syncthreads();
++
++        // 3. L and M. Group pr = tid / 16 takes column t = pr (rows s > pr), then t = 31 - pr (31 entries in all,
++        // every group alike), in batches of 8; lane cg holds the key quads cg and cg + 16, k_t E(t -> s) multiplied
++        // row after row; a batch's 16 sums reduce over the 16 lanes by a transposing tree.
++        {
++            const int pr = tid >> 4, cg = tid & 15;
++            const int n1 = BT - 1 - pr;               // entries of column pr
++            float kt[8], e[8];
++            auto load_t = [&](int tt) {
++#pragma unroll
++                for (int u = 0; u < 2; ++u) {
++                    const float4 x = reinterpret_cast<const float4*>(sm.k[tt])[cg + 16 * u];
++                    kt[4 * u] = x.x; kt[4 * u + 1] = x.y; kt[4 * u + 2] = x.z; kt[4 * u + 3] = x.w;
++                }
++#pragma unroll
++                for (int i = 0; i < 8; ++i) e[i] = kt[i];     // k_t E(t -> s), multiplied row after row
++            };
++            {   // the diagonal of M for both columns
++                float dg[2];
++#pragma unroll
++                for (int hh = 0; hh < 2; ++hh) {
++                    const int tt = hh ? BT - 1 - pr : pr;
++                    load_t(tt);
++                    float a = 0.0f;
++#pragma unroll
++                    for (int u = 0; u < 2; ++u) {
++                        const float4 x = reinterpret_cast<const float4*>(sm.q[tt])[cg + 16 * u];
++                        a = fma_(x.x, kt[4 * u], a); a = fma_(x.y, kt[4 * u + 1], a);
++                        a = fma_(x.z, kt[4 * u + 2], a); a = fma_(x.w, kt[4 * u + 3], a);
++                    }
++                    dg[hh] = a;
++                }
++#pragma unroll
++                for (int o = 8; o; o >>= 1) {
++                    dg[0] += __shfl_xor_sync(0xffffffffu, dg[0], o);
++                    dg[1] += __shfl_xor_sync(0xffffffffu, dg[1], o);
++                }
++                if (cg == 0) {
++                    sm.u.x.mt[pr][pr] = dg[0];
++                    sm.u.x.mt[BT - 1 - pr][BT - 1 - pr] = dg[1];
++                }
++            }
++            load_t(pr);
++#pragma unroll
++            for (int b = 0; b < 4; ++b) {
++                float val[16];
++#pragma unroll
++                for (int ii = 0; ii < 8; ++ii) {
++                    const int i = 8 * b + ii;
++                    if (i == n1 && n1 < BT - 1) load_t(BT - 1 - pr);
++                    const int s2 = i < n1 ? pr + 1 + i : BT - pr + (i - n1);
++                    float ak = 0.0f, aq = 0.0f;
++                    if (i < BT - 1) {
++#pragma unroll
++                        for (int u = 0; u < 2; ++u) {
++                            const float4 gx = reinterpret_cast<const float4*>(sm.g[s2])[cg + 16 * u];
++                            const float4 kx = reinterpret_cast<const float4*>(sm.k[s2])[cg + 16 * u];
++                            const float4 qx = reinterpret_cast<const float4*>(sm.q[s2])[cg + 16 * u];
++                            const float gg[4] = {gx.x, gx.y, gx.z, gx.w}, kk[4] = {kx.x, kx.y, kx.z, kx.w};
++                            const float qq[4] = {qx.x, qx.y, qx.z, qx.w};
++#pragma unroll
++                            for (int x = 0; x < 4; ++x) {
++                                e[4 * u + x] = e[4 * u + x] * gg[x];
++                                ak = fma_(kk[x], e[4 * u + x], ak);
++                                aq = fma_(qq[x], e[4 * u + x], aq);
++                            }
++                        }
++                    }
++                    val[2 * ii] = ak;
++                    val[2 * ii + 1] = aq;
++                }
++                const float sum = tree16(val, lane, 8, 4, 2, 1);        // entry cg / 2 of the batch, L (even) or M
++                const int i = 8 * b + (cg >> 1);
++                if (i < BT - 1) {
++                    const int tt = i < n1 ? pr : BT - 1 - pr;
++                    const int s2 = i < n1 ? pr + 1 + i : BT - pr + (i - n1);
++                    if (cg & 1) {
++                        sm.u.x.mt[tt][s2] = sum;
++                        sm.u.x.mt[s2][tt] = 0.0f;                        // M[tt][s2], above the diagonal
++                    } else {
++                        sm.u.x.L[s2][tt] = sm.beta[s2] * sum;
++                    }
++                }
++            }
++        }
++        __syncthreads();
++
++        // 4. T = (I + L)^-1 by warp 0: lane l inverts column l % 16 of diagonal block l / 16 by forward
++        // substitution, then block (1, 0) = -T11 (L10 T00). Warps 1-7 per key channel: k E(s ->), then k E(s) in
++        // place, and E(31) (threads 32-159); q E(s) in place (threads 160-255, then 160-191 for the last 32 channels)
++        if (warp == 0) {
++            const int blk = lane >> 4, j = lane & 15, base = 16 * blk;
++            float col[16];
++#pragma unroll
++            for (int s2 = 0; s2 < 16; ++s2) {
++                float acc = 0.0f;
++#pragma unroll
++                for (int m = 0; m < s2; ++m) acc = fma_(sm.u.x.L[base + s2][base + m], col[m], acc);
++                col[s2] = s2 == j ? 1.0f : (s2 > j ? -acc : 0.0f);
++            }
++#pragma unroll
++            for (int s2 = 0; s2 < 16; ++s2) sm.u.x.tt[base + j][base + s2] = col[s2];
++            if (blk == 1) {                                    // block (0, 1), above the diagonal: zeros
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) sm.u.x.tt[16 + j][s2] = 0.0f;
++            }
++            __syncwarp();
++            if (blk == 0) {
++                float xr[16];                                  // (L10 T00)[:, j]
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) {
++                    float acc = 0.0f;
++#pragma unroll
++                    for (int m = 0; m < 16; ++m) acc = fma_(sm.u.x.L[16 + s2][m], col[m], acc);
++                    xr[s2] = acc;
++                }
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) {
++                    float acc = 0.0f;
++#pragma unroll
++                    for (int m = 0; m <= s2; ++m)              // T11[s2][m]
++                        acc = fma_(sm.u.x.tt[16 + m][16 + s2], xr[m], acc);
++                    sm.u.x.tt[j][16 + s2] = -acc;
++                }
++            }
++        } else {
++            const int t2 = tid - 32;
++            if (t2 < DK) {
++                const int cc = t2;
++                float rr = 1.0f;
++#pragma unroll 8
++                for (int j = BT - 1; j >= 0; --j) { sm.u.x.ke[j][cc] = sm.k[j][cc] * rr; rr = rr * sm.g[j][cc]; }
++                float pp = 1.0f;
++#pragma unroll 8
++                for (int j = 0; j < BT; ++j) { pp = pp * sm.g[j][cc]; sm.k[j][cc] = sm.k[j][cc] * pp; }
++                sm.egl[cc] = pp;
++            } else {
++                for (int cc = t2 - DK; cc < DK; cc += NT - 32 - DK) {
++                    float pp = 1.0f;
++#pragma unroll 8
++                    for (int j = 0; j < BT; ++j) { pp = pp * sm.g[j][cc]; sm.q[j][cc] = sm.q[j][cc] * pp; }
++                }
++            }
++        }
++        __syncthreads();
++
++        // the record: every value as steps 0-4 left it in shared memory, 16 bytes a store
++        Rec* rc = recs + (size_t)h * n + cl;
++        auto put = [&](void* dst, const void* src, int bytes) {
++            for (int x = tid; x < bytes / 16; x += NT)
++                reinterpret_cast<uint4*>(dst)[x] = reinterpret_cast<const uint4*>(src)[x];
++        };
++        put(rc->kq[0], sm.k, sizeof(sm.k));
++        put(rc->kq[1], sm.q, sizeof(sm.q));
++        put(rc->beta, sm.beta, sizeof(sm.beta));
++        put(rc->v, sm.v, sizeof(sm.v));
++        put(rc->tt, sm.u.x.tt, sizeof(sm.u.x.tt));
++        put(rc->mt, sm.u.x.mt, sizeof(sm.u.x.mt));
++        put(rc->kd, sm.u.x.ke, sizeof(sm.u.x.ke));
++        put(rc->egl, sm.egl, sizeof(sm.egl));
++    }
++}
++
++// state_kernel's layout for at most NVC value columns a block (a value piece: the head's last piece may hold fewer,
++// ``ncols``) and STN threads.
++//   (a) read sums: thread (g = tid % 8, column quad cq, row group rg) holds the state's columns 4 cq .. 4 cq + 3 at key
++//       quads g, g + 8, g + 16, g + 24 (chunk_kernel's s[vv][i] for kp = g) and runs RPT rows, one at a time.
++//   (b), (c) V' and the read-outs: items (row pair, column), two rows of one 4-row tile and one column an item.
++//   (d) the update: tiles of 4 columns x KT keys, one a thread.
++template <int NVC_, int STN_>
++struct Layout {
++    static constexpr int NVC = NVC_, STN = STN_;
++    static constexpr int CQ = NVC / 4;                // column quads
++    static constexpr int TG = 8 * CQ;                 // threads of a row group in (a)
++    static constexpr int RG = STN / TG;               // row groups
++    static constexpr int RPT = BT / RG;               // rows a thread in (a)
++    static constexpr int ITEMS = (BT / 2) * NVC;      // (b), (c)
++    static constexpr int KT = NVC * DK / (4 * STN);   // keys a tile in (d)
++    static constexpr int VP = NVC / 4;                // 8-byte pieces of a row's value columns (bf16)
++    static_assert(NVC % 4 == 0 && STN % TG == 0 && BT % RG == 0, "layout (a): row groups of whole 8-lane trees");
++    static_assert(KT * 4 * STN == NVC * DK && (KT == 1 || KT == 2 || KT == 4 || KT == 8), "layout (d)");
++};
++
++// (b), (c): item k of a column takes row pair k (k < 8) or 23 - k: a thread's items mix short and long chains.
++__device__ __forceinline__ int item_pair(int k) { return k < 8 ? k : 23 - k; }
++
++template <int NVC>
++struct SSmem {
++    float kq[2][BT][DK];              // A: k E(s), q E(s)
++    float beta[BT];                   // A
++    __nv_bfloat16 v[BT][NVC];         // A: this block's value columns
++    float tt[BT][BT];                 // TK: T transposed
++    float mt[BT][BT];                 // TK: M transposed
++    float kd[BT][DK];                 // TK: k E(s ->)
++    float egl[DK];                    // TK: E(31)
++    float S[NVC][DK + 4];             // the state's slice [value column, key]
++    float y[BT][NVC];                 // Y
++    float qs[BT][NVC];                // (q E) S0^T
++    float vn[BT][NVC];                // V'
++};
++
++// Group A of a record: k E(s), q E(s), beta and this block's value columns c0 .. c0 + ncols - 1 (8-byte copies:
++// a piece of 12 columns starts at 24-byte offsets).
++template <int NVC, int STN>
++__device__ __forceinline__ void stage_a(SSmem<NVC>& sm, const Rec* rc, int c0, int ncols, int tid) {
++    const float4* kq = reinterpret_cast<const float4*>(rc->kq);
++    for (int x = tid; x < 2 * BT * DK / 4; x += STN) cp16(reinterpret_cast<float4*>(sm.kq) + x, kq + x);
++    const int vp = ncols / 4;
++    for (int x = tid; x < BT * vp + BT / 4; x += STN) {
++        if (x < BT * vp) {
++            const int r = x / vp, q = x % vp;
++            cp8(&sm.v[r][4 * q], &rc->v[r][c0 + 4 * q]);
++        } else {
++            const int q = x - BT * vp;
++            cp16(&sm.beta[4 * q], &rc->beta[4 * q]);
++        }
++    }
++}
++
++// Group TK: T, M, k E(s ->), E(31).
++template <int STN, int NVC>
++__device__ __forceinline__ void stage_tk(SSmem<NVC>& sm, const Rec* rc, int tid) {
++    constexpr int NTM = 2 * BT * BT / 4, NKD = BT * DK / 4, NE = DK / 4;
++    for (int x = tid; x < NTM + NKD + NE; x += STN) {
++        if (x < NTM) {
++            if (x < BT * BT / 4)
++                cp16(reinterpret_cast<float4*>(sm.tt) + x, reinterpret_cast<const float4*>(rc->tt) + x);
++            else
++                cp16(reinterpret_cast<float4*>(sm.mt) + (x - BT * BT / 4),
++                     reinterpret_cast<const float4*>(rc->mt) + (x - BT * BT / 4));
++        } else if (x < NTM + NKD) {
++            cp16(reinterpret_cast<float4*>(sm.kd) + (x - NTM), reinterpret_cast<const float4*>(rc->kd) + (x - NTM));
++        } else {
++            cp16(reinterpret_cast<float4*>(sm.egl) + (x - NTM - NKD),
++                 reinterpret_cast<const float4*>(rc->egl) + (x - NTM - NKD));
++        }
++    }
++}
++
++// Block (head, value piece j): the head's value columns j NVC .. j NVC + ncols - 1 through the window's sub-chunks
++// c0 .. c0 + n - 1, from state_in into state_out (the same buffer is fine: a block reads its slice first). Writes the
++// read-outs of the window's rows to out as bf16, before the RMSNorm (norm_kernel). Per sub-chunk three barriers:
++// group A (staged during the previous sub-chunk's (b) - (d)), (a), barrier, group A of the next sub-chunk staged,
++// group TK waited for, barrier, (b), barrier, (c) and (d) (no shared data between them), the next group A waited
++// for, barrier, group TK of the next sub-chunk staged.
++template <int NVC, int STN>
++__global__ void __launch_bounds__(STN, 1) state_kernel(
++        int H, const float* state_in, float* state_out, const Rec* __restrict__ recs, int nrec, int c0, int n,
++        int rows, int off, __nv_bfloat16* __restrict__ out) {
++    using LY = Layout<NVC, STN>;
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    SSmem<NVC>& sm = *reinterpret_cast<SSmem<NVC>*>(smem_raw);
++    constexpr int NV = (DV + NVC - 1) / NVC;          // value pieces a head
++    const int h = blockIdx.x / NV, j = blockIdx.x % NV;
++    const int col0 = j * NVC, ncols = DV - col0 < NVC ? DV - col0 : NVC;
++    const int tid = threadIdx.x, lane = tid & 31;
++    const size_t sbase = (size_t)h * DV * DK + (size_t)col0 * DK;
++    const Rec* rh = recs + (size_t)h * nrec;
++    for (int x = tid; x < ncols * DK / 4; x += STN) {
++        const int v = x / (DK / 4), q = x % (DK / 4);
++        *reinterpret_cast<float4*>(&sm.S[v][4 * q]) = reinterpret_cast<const float4*>(state_in + sbase)[x];
++    }
++    stage_a<NVC, STN>(sm, rh, col0, ncols, tid);
++    cp_commit();
++    stage_tk<STN>(sm, rh, tid);
++    cp_commit();
++    cp_wait<1>();                                     // group A of the first sub-chunk
++    __syncthreads();
++
++    for (int cc = 0; cc < n; ++cc) {
++        const int r0 = (c0 + cc) * BT - off;          // the prompt chunk's row at the sub-chunk's row 0
++        const bool more = cc + 1 < n;
++
++        // (a) the read sums of k E(s) and q E(s) with the state (chunk_kernel's row_sums and tree8), then Y. A thread
++        // past a short piece's columns runs the sums of column quad 0 for its shuffles' partners and keeps nothing.
++        {
++            const int g = tid & 7, cqa = (tid >> 3) % LY::CQ, rg = tid / LY::TG;
++            const bool mine = 4 * cqa < ncols;
++            const int cq = mine ? cqa : 0;
++            float s[VPT][NQ][4];
++#pragma unroll
++            for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++                for (int i = 0; i < NQ; ++i) {
++                    const float4 x = *reinterpret_cast<const float4*>(&sm.S[4 * cq + vv][4 * (g + KP * i)]);
++                    s[vv][i][0] = x.x; s[vv][i][1] = x.y; s[vv][i][2] = x.z; s[vv][i][3] = x.w;
++                }
++#pragma unroll 2
++            for (int rr = 0; rr < LY::RPT; ++rr) {
++                const int r = rg * LY::RPT + rr;
++                float4 kx[NQ], qx[NQ];
++#pragma unroll
++                for (int i = 0; i < NQ; ++i) {
++                    kx[i] = reinterpret_cast<const float4*>(sm.kq[0][r])[g + KP * i];
++                    qx[i] = reinterpret_cast<const float4*>(sm.kq[1][r])[g + KP * i];
++                }
++                float a[8];                           // a[vv]: k sums, a[4 + vv]: q sums
++#pragma unroll
++                for (int x = 0; x < 8; ++x) a[x] = 0.0f;
++#pragma unroll
++                for (int i = 0; i < NQ; ++i)
++#pragma unroll
++                    for (int vv = 0; vv < VPT; ++vv) {
++                        a[vv] = fma_(kx[i].x, s[vv][i][0], a[vv]);
++                        a[vv] = fma_(kx[i].y, s[vv][i][1], a[vv]);
++                        a[vv] = fma_(kx[i].z, s[vv][i][2], a[vv]);
++                        a[vv] = fma_(kx[i].w, s[vv][i][3], a[vv]);
++                        a[4 + vv] = fma_(qx[i].x, s[vv][i][0], a[4 + vv]);
++                        a[4 + vv] = fma_(qx[i].y, s[vv][i][1], a[4 + vv]);
++                        a[4 + vv] = fma_(qx[i].z, s[vv][i][2], a[4 + vv]);
++                        a[4 + vv] = fma_(qx[i].w, s[vv][i][3], a[4 + vv]);
++                    }
++                const float sum = tree8(a, lane);     // entry g: k sum of column 4 cq + g (g < 4), else q sum
++                if (mine) {
++                    if (g < 4) {
++                        const int col = 4 * cq + g;
++                        sm.y[r][col] = (__bfloat162float(sm.v[r][col]) - sum) * sm.beta[r];
++                    } else {
++                        sm.qs[r][4 * cq + g - 4] = sum;
++                    }
++                }
++            }
++        }
++        __syncthreads();
++        if (more) stage_a<NVC, STN>(sm, rh + cc + 1, col0, ncols, tid);
++        cp_commit();
++        cp_wait<1>();                                 // group TK of this sub-chunk
++        __syncthreads();
++
++        // (b) V' = T Y: row r's chain runs t = 0 .. 4 floor(r / 4) + 3 (chunk_kernel's tiles)
++        for (int it = tid; it < LY::ITEMS; it += STN) {
++            const int v = it % NVC, rp = item_pair(it / NVC), rq = 4 * (rp >> 1);
++            if (v >= ncols) continue;
++            float a0 = 0.0f, a1 = 0.0f;
++#pragma unroll 4
++            for (int t = 0; t < rq + 4; ++t) {
++                const float2 tq = *reinterpret_cast<const float2*>(&sm.tt[t][2 * rp]);
++                const float y = sm.y[t][v];
++                a0 = fma_(tq.x, y, a0);
++                a1 = fma_(tq.y, y, a1);
++            }
++            sm.vn[2 * rp][v] = a0;
++            sm.vn[2 * rp + 1][v] = a1;
++        }
++        __syncthreads();
++
++        // (c) the read-outs O = (q E) S0^T + M V', rounded to bf16, into out (the RMSNorm follows in norm_kernel)
++        for (int it = tid; it < LY::ITEMS; it += STN) {
++            const int v = it % NVC, rp = item_pair(it / NVC), rq = 4 * (rp >> 1);
++            if (v >= ncols) continue;
++            float o0 = sm.qs[2 * rp][v], o1 = sm.qs[2 * rp + 1][v];
++#pragma unroll 4
++            for (int t = 0; t < rq + 4; ++t) {
++                const float2 mq = *reinterpret_cast<const float2*>(&sm.mt[t][2 * rp]);
++                const float vn = sm.vn[t][v];
++                o0 = fma_(mq.x, vn, o0);
++                o1 = fma_(mq.y, vn, o1);
++            }
++            const int ra = r0 + 2 * rp, col = h * DV + col0 + v;
++            if (ra >= 0 && ra < rows) out[(size_t)ra * H * DV + col] = __float2bfloat16_rn(o0);
++            if (ra + 1 >= 0 && ra + 1 < rows) out[(size_t)(ra + 1) * H * DV + col] = __float2bfloat16_rn(o1);
++        }
++
++        // (d) the state: S diag(E(31)), then S += V'^T (k E(s ->)) one row at a time in row order
++        for (int it = tid; it < LY::CQ * (DK / LY::KT); it += STN) {
++            constexpr int KT = LY::KT;
++            const int kq = it % (DK / KT), cq = it / (DK / KT), k0 = KT * kq;
++            if (4 * cq >= ncols) continue;
++            float st[VPT][KT];
++#pragma unroll
++            for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++                for (int x = 0; x < KT; ++x) st[vv][x] = sm.S[4 * cq + vv][k0 + x] * sm.egl[k0 + x];
++#pragma unroll 4
++            for (int t = 0; t < BT; ++t) {
++                const float4 vn = *reinterpret_cast<const float4*>(&sm.vn[t][4 * cq]);
++                const float vs[4] = {vn.x, vn.y, vn.z, vn.w};
++                float kd[KT];
++#pragma unroll
++                for (int x = 0; x < KT; ++x) kd[x] = sm.kd[t][k0 + x];
++#pragma unroll
++                for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++                    for (int x = 0; x < KT; ++x) st[vv][x] = fma_(vs[vv], kd[x], st[vv][x]);
++            }
++#pragma unroll
++            for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++                for (int x = 0; x < KT; ++x) sm.S[4 * cq + vv][k0 + x] = st[vv][x];
++        }
++        cp_wait<0>();                                 // group A of the next sub-chunk
++        __syncthreads();
++        if (more) stage_tk<STN>(sm, rh + cc + 1, tid);
++        cp_commit();
++    }
++    cp_wait_all();
++    for (int x = tid; x < ncols * DK / 4; x += STN) {
++        const int v = x / (DK / 4), q = x % (DK / 4);
++        reinterpret_cast<float4*>(state_out + sbase)[x] = *reinterpret_cast<const float4*>(&sm.S[v][4 * q]);
++    }
++}
++
++// One warp a (row, head), four a block: the gated RMSNorm of out's bf16 read-outs in place (chunk_kernel's step 7:
++// lane l squares its value columns 4 l .. 4 l + 3 in order, the xor 16, 8, 4, 2, 1 butterfly, then the gate).
++__global__ void __launch_bounds__(128) norm_kernel(
++        int H, int rows, const __nv_bfloat16* __restrict__ G, int g_stride, const __nv_bfloat16* __restrict__ norm_w,
++        float eps, __nv_bfloat16* __restrict__ out) {
++    const int pair = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (pair >= rows * H) return;                     // warp-uniform
++    const int r = pair / H, h = pair % H, vq = 4 * lane;
++    __nv_bfloat16* op = out + (size_t)r * H * DV + h * DV + vq;
++    const __nv_bfloat16* gp = G + (size_t)r * g_stride + h * DV + vq;
++    const bool vec_o = ((uintptr_t)op % 8 == 0), vec_g = ((uintptr_t)gp % 8 == 0);
++    __nv_bfloat16 ob[4], gb[4];
++    if (vec_o) *reinterpret_cast<uint2*>(ob) = *reinterpret_cast<const uint2*>(op);
++    else {
++#pragma unroll
++        for (int x = 0; x < 4; ++x) ob[x] = op[x];
++    }
++    if (vec_g) *reinterpret_cast<uint2*>(gb) = *reinterpret_cast<const uint2*>(gp);
++    else {
++#pragma unroll
++        for (int x = 0; x < 4; ++x) gb[x] = gp[x];
++    }
++    float o[4], ss = 0.0f;
++#pragma unroll
++    for (int x = 0; x < 4; ++x) { o[x] = __bfloat162float(ob[x]); ss = ss + o[x] * o[x]; }
++#pragma unroll
++    for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
++    const float rinv = 1.0f / sqrtf(ss / (float)DV + eps);
++#pragma unroll
++    for (int x = 0; x < 4; ++x) {
++        const float yn = o[x] * rinv;
++        const float yw = ldb(norm_w + vq + x) * yn;
++        const float den = 1.0f + expf(-__bfloat162float(gb[x]));
++        const float sg = div_ok(1.0f, den) ? div_rn(1.0f, den) : 1.0f / den;   // kda.cu's sigmoidf_
++        ob[x] = __float2bfloat16_rn(yw * sg);
++    }
++    if (vec_o) *reinterpret_cast<uint2*>(op) = *reinterpret_cast<const uint2*>(ob);
++    else {
++#pragma unroll
++        for (int x = 0; x < 4; ++x) op[x] = ob[x];
++    }
++}
++
++}  // namespace
++
++#ifndef KDA_CPU_EMU
++
++template <typename T>
++static T* ptr(const at::Tensor& x) { return x.defined() && x.numel() ? (T*)x.data_ptr() : nullptr; }
++
++int64_t kda_split_record_bytes() { return (int64_t)sizeof(Rec); }
++
++// The state kernel's shapes: (value columns a piece, threads); a head takes ceil(128 / columns) pieces.
++#define SPLIT_DISPATCH(cols, nt)                                                                                  \
++    do {                                                                                                          \
++        if ((cols) == 12 && (nt) == 192) { SPLIT(12, 192); }                                                      \
++        else if ((cols) == 12 && (nt) == 384) { SPLIT(12, 384); }                                                 \
++        else if ((cols) == 16 && (nt) == 256) { SPLIT(16, 256); }                                                 \
++        else if ((cols) == 16 && (nt) == 128) { SPLIT(16, 128); }                                                 \
++        else if ((cols) == 16 && (nt) == 512) { SPLIT(16, 512); }                                                 \
++        else if ((cols) == 32 && (nt) == 256) { SPLIT(32, 256); }                                                 \
++        else if ((cols) == 32 && (nt) == 128) { SPLIT(32, 128); }                                                 \
++        else if ((cols) == 32 && (nt) == 512) { SPLIT(32, 512); }                                                 \
++        else if ((cols) == 8 && (nt) == 128) { SPLIT(8, 128); }                                                   \
++        else { TORCH_CHECK(false, "KDA split: columns:threads 12:192, 12:384, 16:256, 16:128, 16:512, 32:256, "     \
++                                  "32:128, 32:512 or 8:128"); }                                                   \
++    } while (0)
++
++int64_t kda_split_state_smem(int64_t cols) {
++    switch (cols) {
++        case 8: return (int64_t)sizeof(SSmem<8>);
++        case 12: return (int64_t)sizeof(SSmem<12>);
++        case 16: return (int64_t)sizeof(SSmem<16>);
++        case 32: return (int64_t)sizeof(SSmem<32>);
++        default: return -1;
++    }
++}
++
++// A prompt chunk of ``rows`` rows whose first row sits ``off`` rows into its sub-chunk, in windows of at most
++// ``window`` sub-chunks: prep_kernel on a window's sub-chunks (``spb`` a block; 0: as few as fill the SMs in one
++// wave), state_kernel through them (state_in, then state_out in place; pieces of ``cols`` value columns, ``nt``
++// threads), and norm_kernel over every row at the end. ``recs`` holds window x H records.
++void kda_split_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++                    const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
++                    const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
++                    const at::Tensor& norm_w, double eps, double lower, int64_t rows, int64_t off, at::Tensor& out,
++                    at::Tensor& state_out, at::Tensor& recs, int64_t cols, int64_t nt, int64_t window,
++                    int64_t spb_want) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)a_log.numel();
++    const int nsub = (int)((rows + off + BT - 1) / BT);
++    const int prep_smem = (int)sizeof(Smem);
++    const int device = P.get_device();
++    static int prep_attr = -1, sms = 0;
++    if (prep_attr != device) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, prep_smem));
++        C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
++        prep_attr = device;
++    }
++    Rec* rp = reinterpret_cast<Rec*>(recs.data_ptr());
++    const float* sin = ptr<float>(state_in);
++    for (int c0 = 0; c0 < nsub; c0 += (int)window) {
++        const int n = nsub - c0 < (int)window ? nsub - c0 : (int)window;
++        const int spb = spb_want > 0 ? (int)spb_want : (n * H + sms - 1) / sms;     // 0: one wave
++        prep_kernel<<<dim3((unsigned)((n + spb - 1) / spb), (unsigned)H), NT, prep_smem, stream>>>(
++            H, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A), (int)a_stride,
++            ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(a_log), ptr<float>(dt_bias), (float)lower,
++            (int)rows, (int)off, c0, n, spb, rp);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++#define SPLIT(NVC, STN)                                                                                           \
++        {                                                                                                         \
++            const int smem = (int)sizeof(SSmem<NVC>);                                                             \
++            static int attr = -1;                                                                                 \
++            if (attr != device) {                                                                                 \
++                C10_CUDA_CHECK(cudaFuncSetAttribute(state_kernel<NVC, STN>,                                       \
++                                                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem));          \
++                attr = device;                                                                                    \
++            }                                                                                                     \
++            state_kernel<NVC, STN><<<(unsigned)(H * ((DV + NVC - 1) / NVC)), STN, smem, stream>>>(                \
++                H, sin, ptr<float>(state_out), rp, n, c0, n, (int)rows, (int)off, ptr<__nv_bfloat16>(out));       \
++        }
++        SPLIT_DISPATCH(cols, nt);
++#undef SPLIT
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        sin = ptr<float>(state_out);
++    }
++    const int pairs = (int)rows * H;
++    norm_kernel<<<(unsigned)((pairs + 3) / 4), 128, 0, stream>>>(H, (int)rows, ptr<__nv_bfloat16>(G), (int)g_stride,
++                                                                ptr<__nv_bfloat16>(norm_w), (float)eps,
++                                                                ptr<__nv_bfloat16>(out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++#endif  // KDA_CPU_EMU
+diff --git tensorfold/families/glm5_next/cuda/kda_split.py tensorfold/families/glm5_next/cuda/kda_split.py
+new file mode 100644
+index 0000000..f4fac12
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kda_split.py
+@@ -0,0 +1,162 @@
++"""TF_GLM_KDA_SPLIT (patch 0160): the chunked KDA prompt recurrence (TF_GLM_KDA_CHUNKED=1, kda_chunk.cu) on the whole
++GPU, with kda_chunk.cu's bits (kda_split.cu).
++
++kda_chunk.cu runs one block of 256 threads a head through a prompt chunk's 32-row sub-chunks in order, its 128 x 128
++state in registers (255 a thread): 16 heads a rank keep 16 SMs busy. kda_split.cu computes the same values in three
++kernels: every sub-chunk's state-independent work at once (block (sub-chunk, head): the conv, norms, decays, beta,
++L, M, T, decayed keys and queries; kda_chunk.cu's code for it), then the sequential part split over the value
++columns (block (head, value piece): read sums, V', read-outs and the state update for a piece's columns), then the
++gated RMSNorm (a warp a row and head). Every element keeps kda_chunk.cu's operations, order and roundings, so the
++setting changes speed only (tests/K2 checks the bits on the CPU, gpu_test.sh against kda_chunk.cu on the GPU).
++
++TF_GLM_KDA_SPLIT: 0 (off, the default); ``auto`` (or 1): pieces of 16 value columns (8 a head, 256 threads) when the
++heads' pieces fit the GPU's SMs (16 heads: 128 blocks on 188 SMs; the fastest shape measured on RTX PRO 6000 at
++1,024-4,096 rows), else 32 (4 a head); or a shape ``COLS[:THREADS]`` from SHAPES (more threads: the same work a block
++in more warps; 32:512 holds half the SMs of 16:256 for a similar time, for runs beside other streams). Every shape
++gives the same bits.
++TF_GLM_KDA_SPLIT_PREP: sub-chunks a prep block handles in turn (default 0: as few as fill the SMs in one wave).
++TF_GLM_KDA_SPLIT_ROWS: rows a pass covers (default 2,048, a multiple of 32): the records of a pass (~66 KB a 32-row
++sub-chunk and head: ~68 MB at 2,048 rows and 16 heads, allocated at the first prompt chunk) are written by the first
++kernel and read by the second; longer chunks take several passes (the same bits).
++"""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++DV = 128
++CHUNK = 32                      # rows of a sub-chunk (kda_chunk.cu's BT)
++# value columns a piece -> threads a state block (the first: the default for those columns); kda_split.cu's dispatch
++SHAPES = {12: (192, 384), 16: (256, 128, 512), 32: (256, 128, 512), 8: (128,)}
++
++
++def setting(value: str | None = None) -> tuple[int, int] | None:
++    """TF_GLM_KDA_SPLIT as (columns a piece, threads), (0, 0) for auto, or None (off)."""
++
++    value = (os.environ.get("TF_GLM_KDA_SPLIT", "") if value is None else value).strip().lower() or "0"
++    if value == "0":
++        return None
++    if value in ("1", "auto"):
++        return (0, 0)
++    cols, colon, nt = value.partition(":")
++    if cols.isdecimal() and int(cols) in SHAPES and (not colon or (nt.isdecimal() and int(nt) in SHAPES[int(cols)])):
++        return int(cols), int(nt) if colon else SHAPES[int(cols)][0]
++    shapes = ", ".join(f"{c}:{t}" for c, ts in SHAPES.items() for t in ts)
++    raise ValueError(f"TF_GLM_KDA_SPLIT: 0 (off), auto (1), or columns[:threads] from {shapes}, not {value!r}")
++
++
++def prep_chunks(value: str | None = None) -> int:
++    """TF_GLM_KDA_SPLIT_PREP: sub-chunks a prep block handles in turn (0, the default: as few as fill the SMs in one
++    wave, e.g. 6 for 64 sub-chunks of 16 heads on 188 SMs; 1: a block a sub-chunk)."""
++
++    value = (os.environ.get("TF_GLM_KDA_SPLIT_PREP", "") if value is None else value).strip() or "0"
++    if not value.isdecimal() or int(value) > 1024:
++        raise ValueError(f"TF_GLM_KDA_SPLIT_PREP: sub-chunks a prep block, 0 (one wave) to 1,024, not {value!r}")
++    return int(value)
++
++
++def window_rows(value: str | None = None) -> int:
++    value = (os.environ.get("TF_GLM_KDA_SPLIT_ROWS", "") if value is None else value).strip() or "2048"
++    if not value.isdecimal() or int(value) % CHUNK or not CHUNK <= int(value) <= 65536:
++        raise ValueError(f"TF_GLM_KDA_SPLIT_ROWS: a multiple of 32 from 32 to 65,536, not {value!r}")
++    return int(value)
++
++
++SPLIT = setting()
++WINDOW = window_rows() // CHUNK          # sub-chunks a pass
++PREP = prep_chunks()
++
++
++def pieces(cols: int) -> int:
++    return -(-DV // cols)
++
++
++def auto_shape(heads: int, device) -> tuple[int, int]:
++    """The shape ``auto`` takes for ``heads`` heads on ``device``: 16 columns a piece (256 threads) when heads x 8
++    state blocks fit the SMs (one block an SM), else 32 (256 threads)."""
++
++    device = torch.device(device)
++    sms = _sms(device.index if device.index is not None else torch.cuda.current_device())
++    return (16, 256) if heads * pieces(16) <= sms else (32, 256)
++
++
++def shape(heads: int, device) -> tuple[int, int]:
++    """(columns a piece, threads) for ``heads`` heads on ``device``: the setting's, or ``auto_shape``."""
++
++    if SPLIT is None:
++        raise RuntimeError("TF_GLM_KDA_SPLIT is off")
++    return SPLIT if SPLIT[0] else auto_shape(heads, device)
++
++
++@lru_cache(maxsize=None)
++def _sms(index: int) -> int:
++    return torch.cuda.get_device_properties(index).multi_processor_count
++
++
++def describe() -> str:
++    how = "auto: pieces of 16 value columns when their state blocks fit the SMs, else 32" if SPLIT == (0, 0) else \
++        f"pieces of {SPLIT[0]} value columns, {SPLIT[1]} threads a state block"
++    prep = "one wave" if not PREP else f"{PREP} sub-chunks a block"
++    return (f"TF_GLM_KDA_SPLIT: the KDA prompt recurrence on the whole GPU ({how}; prep {prep}; passes of "
++            f"{WINDOW * CHUNK} rows), kda_chunk.cu's bits")
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_kda_split", sources=[str(here / "kda_split.cpp"), str(here / "kda_split.cu")],
++                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
++
++
++def prepare() -> None:
++    """Build the extension now (engine start) rather than at the first prompt chunk."""
++
++    _ext()
++
++
++_records: dict = {}
++
++
++def records(heads: int, device) -> torch.Tensor:
++    """The pass records for ``heads`` heads on ``device`` (allocated once; prompt chunks run one at a time a device,
++    on one stream: the engine's main stream or, under TF_GLM_KDA_OVERLAP, the recurrence stream)."""
++
++    device = torch.device(device)
++    if device.type == "cuda" and device.index is None:
++        device = torch.device("cuda", torch.cuda.current_device())
++    key = (heads, device)
++    r = _records.get(key)
++    if r is None:
++        r = _records[key] = torch.empty(WINDOW * heads * int(_ext().record_bytes()), dtype=torch.uint8,
++                                        device=device)
++    return r
++
++
++def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
++          conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
++          norm_w: torch.Tensor, eps: float, lower: float, rows: int, out: torch.Tensor, state_out: torch.Tensor,
++          pos: int = 0, *, cols: int | None = None, nt: int | None = None, window: int | None = None,
++          prep: int | None = None) -> torch.Tensor:
++    """kda_chunked.chain's call and bits (kda_chunk.cu's), split: projection rows p, gate rows a and g, conv state
++    [3, 3 H 128] (read), state_in -> state_out [H, 128, 128], ``pos`` the first row's absolute position. Writes
++    out[:rows] (bf16 [rows, H * 128]). ``cols`` / ``nt`` / ``window`` (sub-chunks) / ``prep`` (sub-chunks a prep
++    block) override the settings (tests)."""
++
++    rows = int(rows)
++    H = a_log.numel()
++    if cols is None:
++        cols, nt = shape(H, p.device)
++    window = int(window or WINDOW)
++    recs = records(H, p.device)
++    if recs.numel() < window * H * int(_ext().record_bytes()):          # a test's larger window
++        recs = torch.empty(window * H * int(_ext().record_bytes()), dtype=torch.uint8, device=p.device)
++    _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
++                 dt_bias, norm_w, float(eps), float(lower), rows, int(pos) % CHUNK, out, state_out, recs, int(cols),
++                 int(nt or SHAPES[int(cols)][0]), window, int(PREP if prep is None else prep))
++    return out[:rows]

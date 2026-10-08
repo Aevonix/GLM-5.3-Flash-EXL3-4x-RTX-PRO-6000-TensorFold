@@ -1,0 +1,2418 @@
+diff --git tensorfold/families/glm5_next/cuda/exl3_k1.cpp tensorfold/families/glm5_next/cuda/exl3_k1.cpp
+new file mode 100644
+index 0000000..442b8cc
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_k1.cpp
+@@ -0,0 +1,93 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++int64_t exl3_k1_block_members(int64_t cfg, bool q);
++int64_t exl3_k1_max_blocks();
++int64_t exl3_k1_grid(int64_t cfg, bool q);
++void exl3_k1_rot_quant_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t);
++void exl3_k1_schedule_cuda(const at::Tensor&, const at::Tensor&, const c10::optional<at::Tensor>&, int64_t, int64_t,
++                           int64_t, int64_t, int64_t, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
++void exl3_k1_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                  const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, const at::Tensor&,
++                  const at::Tensor&, const at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&, at::Tensor&,
++                  at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, double, int64_t, int64_t, int64_t, bool,
++                  const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&, int64_t);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), "k1: ", name,
++                ": expected a contiguous CUDA tensor of the right dtype");
++}
++
++// The tile list of a plan (items [n, 3] / counts [2], or CSR offsets [E + 1] when given): blocks of up to BN members;
++// lag: the down tiles of the block at list position j follow the gate/up tiles of position j + lag.
++void schedule(const at::Tensor& items, const at::Tensor& counts, c10::optional<at::Tensor> offsets, int64_t E,
++              int64_t BN, int64_t NCB, int64_t NOG, int64_t lag, at::Tensor blocks, at::Tensor tiles, at::Tensor ctrl,
++              at::Tensor done) {
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&items, &counts, &blocks, &tiles, &ctrl, &done})
++        check(*t, at::kInt, "schedule: int32 buffer");
++    if (offsets.has_value()) check(*offsets, at::kInt, "offsets");
++    const at::cuda::CUDAGuard guard(items.device());
++    exl3_k1_schedule_cuda(items, counts, offsets, E, BN, NCB, NOG, lag, blocks, tiles, ctrl, done);
++}
++
++// Xd and Y of a prompt chunk's routed pairs: the prompt kernels' arithmetic (exl3.cu ``prompt``, shared rows).
++void run(const at::Tensor& xh, const at::Tensor& tg, const at::Tensor& tu, const at::Tensor& td,
++         const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
++         at::Tensor xd, at::Tensor y, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
++         c10::optional<at::Tensor> offsets, at::Tensor blocks, at::Tensor tiles, at::Tensor ctrl, at::Tensor done,
++         int64_t D, int64_t NI, int64_t slots, double limit, int64_t cfg, int64_t OB, int64_t lag, bool q,
++         c10::optional<at::Tensor> xq, c10::optional<at::Tensor> xs, int64_t max_ctas) {
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&xh, &svh_g, &svh_u, &suh_d, &svh_d})
++        check(*t, at::kHalf, "fp16 input");
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&tg, &tu, &td, &items, &counts, &members,
++                                                                         &blocks, &tiles, &ctrl, &done})
++        check(*t, at::kInt, "int32 input");
++    check(xd, at::kHalf, "xd");
++    check(y, at::kFloat, "y");
++    if (offsets.has_value()) check(*offsets, at::kInt, "offsets");
++    const int64_t E = tg.size(0);
++    TORCH_CHECK(tg.dim() == 4 && tg.size(1) == D / 16 && tg.size(2) == NI / 16 && tg.size(3) == 32 &&
++                    tu.sizes() == tg.sizes() && td.dim() == 4 && td.size(0) == E && td.size(1) == NI / 16 &&
++                    td.size(2) == D / 16 && td.size(3) == 32,
++                "k1: trellis words [E, K/16, N/16, 32] (4-bit tiles)");
++    TORCH_CHECK(svh_g.numel() == E * NI && svh_u.numel() == E * NI && suh_d.numel() == E * NI &&
++                    svh_d.numel() == E * D, "k1: scale shapes");
++    TORCH_CHECK(xh.dim() == 2 && xh.size(1) == D, "k1: xh [rows, D]");
++    // the call's pairs (its rows x slots) are what the kernels write: a prompt lane's Y and Xd are views of its own
++    // rows while the plan (members) keeps the window's capacity (TF_GLM_PREFILL_LANES, TF_GLM_MOE_GLUE)
++    const int64_t pairs = xh.size(0) * slots;
++    TORCH_CHECK(pairs <= members.numel(), "k1: more rows than the plan holds");
++    TORCH_CHECK(xd.numel() >= pairs * NI && y.numel() >= pairs * D, "k1: xd / y too small for ", pairs, " pairs");
++    TORCH_CHECK(slots > 0, "k1: slots");
++    if (q) {
++        TORCH_CHECK(xq.has_value() && xs.has_value(), "k1q: xq and xs");
++        check(*xq, at::kChar, "xq");
++        check(*xs, at::kFloat, "xs");
++        TORCH_CHECK(xq->dim() == 2 && xq->size(1) == D && xs->numel() >= xq->size(0), "k1q: xq [rows, D], xs [rows]");
++    }
++    const at::cuda::CUDAGuard guard(xh.device());
++    exl3_k1_cuda(xh, tg, tu, td, svh_g, svh_u, suh_d, svh_d, xd, y, items, counts, members, offsets, blocks, tiles,
++                 ctrl, done, D, NI, slots, limit, cfg, OB, lag, q, xq, xs, max_ctas);
++}
++
++// K1q's rows (quality-changing): xq [rows, D] int8 in the decode's slot order and xs [rows] fp32 scales, from the
++// normed bf16 rows and the layer's shared gate/up suh.
++void rot_quant(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor xq, at::Tensor xs,
++               int64_t rows, int64_t D) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "k1q: x bf16 CUDA");
++    check(suh, at::kHalf, "suh");
++    check(xq, at::kChar, "xq");
++    check(xs, at::kFloat, "xs");
++    TORCH_CHECK(suh.numel() == D && xq.numel() >= rows * D && xs.numel() >= rows, "k1q: rot_quant shapes");
++    const at::cuda::CUDAGuard guard(x.device());
++    exl3_k1_rot_quant_cuda(x, x_stride, suh, xq, xs, rows, D);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("run", &run);
++    m.def("schedule", &schedule);
++    m.def("block_members", &exl3_k1_block_members);
++    m.def("max_blocks", &exl3_k1_max_blocks);
++    m.def("grid", &exl3_k1_grid);
++    m.def("rot_quant", &rot_quant);
++}
+diff --git tensorfold/families/glm5_next/cuda/exl3_k1.cu tensorfold/families/glm5_next/cuda/exl3_k1.cu
+new file mode 100644
+index 0000000..d72deba
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_k1.cu
+@@ -0,0 +1,874 @@
++// K1: prompt chunks' EXL3 routed experts (GLM-5.3-Flash) with the prompt kernels' bits (exl3.cu), decoded once a
++// block of up to 128 members and run as one persistent launch for gate/up and down.
++//
++// The same arithmetic as exl3.cu's prompt kernels (prompt_gateup_kernel / prompt_down_kernel), so every output keeps
++// its bits: each output element is one fp32 chain of mma.m16n8k16.f32.f16.f16.f32 over the ascending k tiles from +0,
++// with A = the decoded W^T tile (decode_tile_p and its fragment order, a0 = b0[0], a1 = b1[0], a2 = b0[1],
++// a3 = b1[1]) and B = the member's rows of Xh (gate/up) or Xd (down) through ldmatrix; the gate/up and down
++// epilogues are exl3.cu's formulas in its order (fwht128, the bf16 roundings, expf, the fp16 rounding of Xd, the
++// fp32 Y). A row's outputs depend on its own values only, whatever else the chunk holds.
++//
++// What changes is data movement and scheduling:
++// - a tile is (one expert's block of up to BN members, 16 m tiles): a trellis tile is decoded once for up to 128
++//   members (the prompt kernels: once a pass of 64), straight into the A fragment of the one warp that owns it;
++// - the inner loop is specialised on the block's 16-member groups (no branch a group and k tile), and the mma
++//   instruction is not volatile, so loads, decode and mma interleave freely;
++// - one persistent grid takes gate/up and down tiles from one list built on the GPU from the plan (no host sync):
++//   blocks ranked by their expert's members, interleaved from both ends (the heaviest, the lightest, the next
++//   heaviest, ...), an expert's blocks together; a block's down tiles come `lag` list positions after its gate/up
++//   tiles and wait for them (a counter a block, release / acquire), so the projections overlap and neither ends in
++//   its own tail. A down tile runs OB output blocks of 256 columns in one cp.async pipeline, which keeps loading
++//   through each block's epilogue (the epilogue has its own shared memory).
++//
++// Shapes: D (model width) % 256 == 0, NI (the rank's expert width) % 128 == 0; trellis words int32
++// [E, K/16, N/16, 32] (4-bit tiles); experts that share one gate/up suh (one rotated row a token, Xh [rows, D]).
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++#include <type_traits>
++
++namespace {
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++
++// ---- exl3.cu's arithmetic, verbatim ---------------------------------------------------------------------------------
++
++// Two values of the "mcg" codebook from two 16-bit states, as a half2 (first state in .x): exl3.cu's mcg2, with
++// (x & 0x8FFF8FFF) ^ 0x3B603B60 as one lop3 whose mask comes in a register (M, a kernel argument: the compiler
++// otherwise rematerialises the constant before every lop3). The same function of x, so the same bits.
++__device__ __forceinline__ uint32_t lop_mask_xor(uint32_t x, uint32_t M) {
++    uint32_t y;
++    asm("lop3.b32 %0, %1, %2, 0x3B603B60, 0x6a;\n" : "=r"(y) : "r"(x), "r"(M));   // (x & M) ^ 0x3B603B60
++    return y;
++}
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1, uint32_t M) {
++    const uint32_t x0 = lop_mask_xor(s0 * 0xCBAC1FEDu, M);
++    const uint32_t x1 = lop_mask_xor(s1 * 0xCBAC1FEDu, M);
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// The prompt kernels' lane decode (exl3.cu decode_tile_p): this lane's eight values of a 4-bit tile as the B
++// fragments of the tile's two n8 halves.
++__device__ __forceinline__ void decode_tile_p(uint32_t w, int lane, uint32_t M, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    const uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    const uint32_t s = __funnelshift_r(w, p, 20);
++    const uint32_t t = w >> 4;
++    b0[0] = mcg2(__byte_perm(s, 0u, 0x4421), (s >> 4) & 0xffffu, M);       // (s >> 8) & 0xffff, (s >> 4) & 0xffff
++    b0[1] = mcg2(s & 0xffffu, w >> 16, M);
++    b1[0] = mcg2(__byte_perm(t, 0u, 0x4421), __byte_perm(w, 0u, 0x4421), M);   // (w >> 12) & 0xffff, (w >> 8) & 0xffff
++    b1[1] = mcg2(__byte_perm(t, 0u, 0x4410), w & 0xffffu, M);               // (w >> 4) & 0xffff, w & 0xffff
++}
++
++// d += a @ b (fp16 inputs, fp32 accumulators). Not volatile: a pure function of its registers, so the compiler may
++// move it among the loads and the decode; its operands and its order on each accumulator are what the code says.
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++        "{%0,%1,%2,%3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++// Fast Walsh-Hadamard transform of 128 values held 4 per lane (lane L: values 4L..4L+3), exl3.cu's butterfly order.
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// ---- K1q: 8-bit gate/up (TF_GLM_EXPERT_PROMPT_KERNEL=k1q*: quality-changing, deterministic, batch-invariant) ------
++// The codebook's values lie in (-4, 4) (each fp16 half of the mcg hash has exponent field 12..15), so one fixed scale
++// serves every weight: q = round(31.75 v), |q| <= 127. In fp16, fma(v, 31.75, 1536) is exact before its one rounding
++// and lands in [1024, 2048), where the ulp is 1: the result is 1536 + q, whose low byte is q in two's complement.
++// A row's int8 values (one fp32 scale a token) are stored with each 16-value group in the order the lane decode leaves
++// the weights (logical k 2t, 2t+1, 2t+8, 2t+9 in slots 4t..4t+3), so two decoded k tiles are an m16n8k32 A fragment
++// as they stand and ldmatrix gives the matching B fragments; int32 sums do not depend on the order of k.
++constexpr float Q8_WEIGHT = 31.75f;
++
++// Four codebook values (two half2: lo.x, lo.y, hi.x, hi.y) as four int8 round(31.75 v), in that order.
++__device__ __forceinline__ uint32_t q8x4(uint32_t lo2, uint32_t hi2) {
++    const half2 S = __halves2half2(__ushort_as_half(0x4FF0), __ushort_as_half(0x4FF0));   // 31.75
++    const half2 B = __halves2half2(__ushort_as_half(0x6600), __ushort_as_half(0x6600));   // 1536
++    const half2 a = __hfma2(*reinterpret_cast<const half2*>(&lo2), S, B);
++    const half2 b = __hfma2(*reinterpret_cast<const half2*>(&hi2), S, B);
++    return __byte_perm(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b), 0x6420);
++}
++
++// d += a @ b, int8 inputs, int32 sums (exact).
++__device__ __forceinline__ void imma16832(int (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++// ---- data movement --------------------------------------------------------------------------------------------------
++
++__device__ __forceinline__ void cp_async16(unsigned smem, const void* gmem, bool ok) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(gmem), "r"(ok ? 16 : 0));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++
++// A block's finished gate/up tiles: published with release semantics after every thread's Xd stores and a fence,
++// read with acquire semantics before a down tile loads that Xd (through L2: cp.async.cg).
++__device__ __forceinline__ void count_release_add(int* c, int v) {
++    asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(c), "r"(v) : "memory");
++}
++// The wait is bounded: 30 s without the count means a broken list (a down tile before its own gate/up tiles), and
++// the kernel traps (a CUDA error the engine raises) rather than hangs.
++__device__ __forceinline__ void count_wait(const int* c, int target) {
++    unsigned long long t0;
++    asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t0));
++    for (;;) {
++        int v;
++        asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(c) : "memory");
++        if (v >= target) break;
++        __nanosleep(200);
++        unsigned long long t;
++        asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
++        if (t - t0 > 30000000000ull) __trap();
++    }
++}
++
++// ---- configuration --------------------------------------------------------------------------------------------------
++
++// NW warps a block (each owns MT = 16 / NW of the tile's 16 m tiles, for all of the block's members), up to NGM groups
++// of 16 members (BN = 16 NGM), DW stages of trellis words and DX stages of member rows (32 k values a stage),
++// epilogue passes of EPM members, CTAS blocks an SM. The first TW threads load the words (WPT 16-byte pieces each),
++// the others the member rows (XPT pieces each): each side has its own cp.async group sequence, so the words run DW - 1
++// stages ahead (DRAM) and the rows DX - 1 (L2), each waited for at its own depth.
++template <int NW_, int NGM_, int DW_, int DX_, int EPM_, int CTAS_, int WPT_>
++struct Cfg {
++    static constexpr int NW = NW_, MT = 16 / NW_, NGM = NGM_, BN = 16 * NGM_, DW = DW_, DX = DX_, EPM = EPM_;
++    static constexpr int CTAS = CTAS_, T = NW_ * 32;
++    static constexpr int BK = 32, PKT = BK / 16, PXS = BK + 8;          // stage row stride +16 B: ldmatrix rows apart
++    static constexpr int W_PIECES = 16 * PKT * 8;                       // 16-byte pieces of a stage's words
++    static constexpr int WPT = WPT_, TW = W_PIECES / WPT_, TX = T - TW;
++    static constexpr int XPT = BN * (BK / 8) / TX;                      // pieces of a stage's member rows a thread
++    static constexpr int X_BYTES = BN * PXS * 2;                        // a stage's member rows
++    static constexpr int PXSQ = BK + 16;                                // K1q: an int8 row's stride (bytes)
++    static constexpr int XPTQ = BN * (BK / 16) / TX;                    // K1q: int8 row pieces a thread
++    static_assert(BN * PXSQ <= X_BYTES && XPTQ * TX == BN * (BK / 16) && (XPTQ == 1 || XPTQ == 2), "K1q rows");
++    static constexpr int W_BYTES = 16 * PKT * 32 * 4;                   // a stage's trellis words (16 m tiles)
++    static constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;              // epilogue row strides (floats)
++    static constexpr int EP_GU = 2 * EPM * GU_ES * 4, EP_DN = EPM * DN_ES * 4;
++    static constexpr int EP_BYTES = EP_GU > EP_DN ? EP_GU : EP_DN;
++    static constexpr int SMEM = DW * W_BYTES + DX * X_BYTES + EP_BYTES;
++    static_assert(TW % 32 == 0 && TX % 32 == 0 && TW + TX == T, "whole warps on each side");
++    static_assert(XPT * TX == BN * (BK / 8) && (XPT == 1 || XPT == 2 || XPT == 4), "row pieces split evenly");
++    static_assert(WPT == 1 || WPT == 2, "word pieces a thread");
++    static_assert(16 % NW == 0 && NW * MT == 16, "16 m tiles over the warps");
++    static_assert(EPM % 8 == 0 && BN % EPM == 0, "epilogue passes of whole n8 tiles");
++    static_assert(DW >= 2 && DX >= 2, "two stages at least");
++    // sm_12x: 100 KB of shared memory an SM, 1 KB of it reserved a block, 99 KB at most a block (the static arrays,
++    // up to 3 KB, included): CTAS blocks must fit side by side
++    static_assert(CTAS * (SMEM + 3 * 1024 + 1024) <= 100 * 1024 && SMEM + 3 * 1024 <= 99 * 1024, "shared memory");
++};
++
++using CfgWide = Cfg<16, 8, 8, 3, 32, 1, 1>;   // "k1-w16": 16 warps, 1 m tile each, up to 128 members; 1 block an SM
++using CfgPair = Cfg<8, 4, 3, 3, 16, 2, 2>;    // "k1-64": 8 warps, 2 m tiles each, up to 64 members; 2 blocks an SM
++                                              // (3 word stages: two blocks' shared memory within an SM's 100 KB)
++using CfgDeep = Cfg<8, 8, 8, 3, 32, 1, 2>;    // "k1": 8 warps, 2 m tiles each, up to 128 members (up to 255
++                                              // registers a thread: no rematerialised constants); 1 block an SM
++
++struct Params {
++    const half* xh;              // [rows, D]: one rotated input row a token (gate/up)
++    const uint32_t* tg;          // gate trellis [E, D/16, NI/16, 32]
++    const uint32_t* tu;          // up
++    const uint32_t* td;          // down [E, NI/16, D/16, 32]
++    const half* svh_g;           // [E, NI]
++    const half* svh_u;
++    const half* suh_d;           // [E, NI]
++    const half* svh_d;           // [E, D]
++    half* xd;                    // [P, NI]: gate/up writes, down reads
++    float* y;                    // [P, D]
++    const int* members;          // [P]: the plan's pairs grouped by expert
++    const int* blocks;           // [blocks, 3]: (expert, first member, members)
++    const int* tiles;            // [tiles]: block << 8 | down << 7 | column block (gate/up) or output group (down)
++    int* ctrl;                   // [0] next tile, [1] tiles, [2] blocks, [3] blocks the plan needs
++    int* done;                   // [blocks]: finished gate/up tiles
++    int D, NI, slots, OB;
++    float limit;
++    uint32_t mask;               // 0x8FFF8FFF (the mcg codebook's mask), in a register rather than an immediate
++    const int8_t* xq;            // K1q: [rows, D] int8 rows (16-value groups in the decode's order)
++    const float* xs;             // K1q: [rows] their scales
++};
++
++// ---- one tile -------------------------------------------------------------------------------------------------------
++
++// This warp's MT m tiles x all of the block's members for one stage (PKT k tiles), exl3.cu's prompt mainloop body.
++template <class C, int NG>
++__device__ __forceinline__ void stage_mma(const unsigned char* xst, const unsigned char* wst,
++                                          float (&acc)[C::MT][2 * NG][4], bool up_last, int warp, int lane,
++                                          uint32_t M) {
++    const half* xs = reinterpret_cast<const half*>(xst);
++    const uint32_t* ws = reinterpret_cast<const uint32_t*>(wst);
++    const int lrow = (lane & 7) + ((lane >> 4) & 1) * 8, lcol = ((lane >> 3) & 1) * 8;
++#pragma unroll
++    for (int kk = 0; kk < C::PKT; ++kk) {
++        uint32_t a[C::MT][4];
++#pragma unroll
++        for (int i = 0; i < C::MT; ++i) {
++            uint32_t b0[2], b1[2];
++            decode_tile_p(ws[((warp * C::MT + i) * C::PKT + kk) * 32 + lane], lane, M, b0, b1);
++            a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
++        }
++#pragma unroll
++        for (int j = 0; j < NG; ++j) {
++            uint32_t r[4];
++            ldsm_x4(r, xs + (j * 16 + lrow) * C::PXS + kk * 16 + lcol);
++            const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
++#pragma unroll
++            for (int i = 0; i < C::MT; ++i) {
++                mma16816(acc[i][2 * j], a[i], bl);
++                if (j + 1 < NG || up_last) mma16816(acc[i][2 * j + 1], a[i], bh);   // members 8..15 of the group
++            }
++        }
++    }
++}
++
++// K1q: this warp's MT m tiles x the block's members for one stage of 32 k values: two decoded k tiles an m tile become
++// one int8 A fragment (q8x4), then a 16-member group at a time the int8 rows' ldmatrix fragments are B, one m16n8k32
++// an n8 tile. The last group's upper n8 tile runs whether or not it has members (their rows are zero-filled and their
++// sums never stored): no branch in the loop.
++template <class C, int NG>
++__device__ __forceinline__ void stage_mma_q(const unsigned char* xst, const unsigned char* wst,
++                                            int (&acc)[C::MT][2 * NG][4], int warp, int lane, uint32_t M) {
++    const uint32_t* ws = reinterpret_cast<const uint32_t*>(wst);
++    const int lrow = (lane & 7) + ((lane >> 4) & 1) * 8, lcol = ((lane >> 3) & 1) * 16;
++    uint32_t a[C::MT][4];
++#pragma unroll
++    for (int i = 0; i < C::MT; ++i)
++#pragma unroll
++        for (int kk = 0; kk < 2; ++kk) {
++            uint32_t b0[2], b1[2];
++            decode_tile_p(ws[((warp * C::MT + i) * C::PKT + kk) * 32 + lane], lane, M, b0, b1);
++            a[i][2 * kk] = q8x4(b0[0], b0[1]);          // row g:     k 2t, 2t+1, 2t+8, 2t+9 of k tile kk
++            a[i][2 * kk + 1] = q8x4(b1[0], b1[1]);      // row g + 8: the same k
++        }
++#pragma unroll
++    for (int j = 0; j < NG; ++j) {
++        uint32_t r[4];
++        ldsm_x4(r, xst + (j * 16 + lrow) * C::PXSQ + lcol);
++        const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
++#pragma unroll
++        for (int i = 0; i < C::MT; ++i) {
++            imma16832(acc[i][2 * j], a[i], bl);
++            imma16832(acc[i][2 * j + 1], a[i], bh);
++        }
++    }
++}
++
++// Gate/up epilogue of column block cb (exl3.cu's prompt_gateup_kernel epilogue, EPM members a pass): Xd rows.
++template <class C, int NG, bool Q8, class Acc>
++__device__ __forceinline__ void epilogue_gu(const Params& p, const Acc (&acc)[C::MT][2 * NG][4], int e, int cb,
++                                            int cnt, const int* rows_sh, const float* dq_sh, float* E) {
++    constexpr int MT = C::MT, NW = C::NW, EPM = C::EPM, ES = C::GU_ES, U = EPM / 8;
++    constexpr int PASSES = (2 * NG + U - 1) / U;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int q0 = warp * MT, mat = q0 >> 3, col0 = (q0 & 7) * 16;   // a warp's m tiles are all gate or all up
++    const int N = p.NI, n = cb * 128 + 4 * lane;
++    float* Em = E + mat * EPM * ES;
++#pragma unroll
++    for (int ps = 0; ps < PASSES; ++ps) {
++        if (ps * EPM >= cnt) break;
++        __syncthreads();                                   // E's previous readers are done
++#pragma unroll
++        for (int i = 0; i < MT; ++i)
++#pragma unroll
++            for (int u = 0; u < U; ++u) {
++                const int jn = ps * U + u;
++                if (jn < 2 * NG) {
++                    const int tok = u * 8 + 2 * t, col = col0 + i * 16 + g;
++                    if constexpr (Q8) {                  // K1q: int32 sums times the member's scale / 31.75
++                        const float d0 = dq_sh[ps * EPM + tok], d1 = dq_sh[ps * EPM + tok + 1];
++                        Em[tok * ES + col] = __int2float_rn(acc[i][jn][0]) * d0;
++                        Em[(tok + 1) * ES + col] = __int2float_rn(acc[i][jn][1]) * d1;
++                        Em[tok * ES + col + 8] = __int2float_rn(acc[i][jn][2]) * d0;
++                        Em[(tok + 1) * ES + col + 8] = __int2float_rn(acc[i][jn][3]) * d1;
++                    } else {
++                        Em[tok * ES + col] = acc[i][jn][0];
++                        Em[(tok + 1) * ES + col] = acc[i][jn][1];
++                        Em[tok * ES + col + 8] = acc[i][jn][2];
++                        Em[(tok + 1) * ES + col + 8] = acc[i][jn][3];
++                    }
++                }
++            }
++        __syncthreads();
++        for (int m = warp; m < EPM && ps * EPM + m < cnt; m += NW) {
++            const int pr = rows_sh[ps * EPM + m];
++            float gv[4], uv[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                gv[j] = E[m * ES + 4 * lane + j];
++                uv[j] = E[(EPM + m) * ES + 4 * lane + j];
++            }
++            fwht128(gv, lane);
++            fwht128(uv, lane);
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(p.svh_g[(size_t)e * N + n + j])), p.limit);
++                float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(p.svh_u[(size_t)e * N + n + j])),
++                                       -p.limit),
++                                 p.limit);
++                float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                v[j] = act * __half2float(p.suh_d[(size_t)e * N + n + j]);
++            }
++            fwht128(v, lane);
++            const half2 o01 = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++            const half2 o23 = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++            uint2 packed;
++            packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++            packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++            *reinterpret_cast<uint2*>(p.xd + (size_t)pr * N + n) = packed;
++        }
++    }
++}
++
++// Down epilogue of output block ob (256 columns; exl3.cu's prompt_down_kernel epilogue, EPM members a pass): Y rows,
++// stored streaming (they are read once, by the combine, after the call).
++template <class C, int NG>
++__device__ __forceinline__ void epilogue_dn(const Params& p, const float (&acc)[C::MT][2 * NG][4], int e, int ob,
++                                            int cnt, const int* rows_sh, float* E) {
++    constexpr int MT = C::MT, NW = C::NW, EPM = C::EPM, ES = C::DN_ES, U = EPM / 8;
++    constexpr int PASSES = (2 * NG + U - 1) / U;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int col0 = warp * MT * 16;
++    const int D = p.D;
++#pragma unroll
++    for (int ps = 0; ps < PASSES; ++ps) {
++        if (ps * EPM >= cnt) break;
++        __syncthreads();
++#pragma unroll
++        for (int i = 0; i < MT; ++i)
++#pragma unroll
++            for (int u = 0; u < U; ++u) {
++                const int jn = ps * U + u;
++                if (jn < 2 * NG) {
++                    const int tok = u * 8 + 2 * t, col = col0 + i * 16 + g;
++                    E[tok * ES + col] = acc[i][jn][0];
++                    E[(tok + 1) * ES + col] = acc[i][jn][1];
++                    E[tok * ES + col + 8] = acc[i][jn][2];
++                    E[(tok + 1) * ES + col + 8] = acc[i][jn][3];
++                }
++            }
++        __syncthreads();
++        for (int m = warp; m < EPM && ps * EPM + m < cnt; m += NW) {
++            const int pr = rows_sh[ps * EPM + m];
++#pragma unroll
++            for (int blk = 0; blk < 2; ++blk) {
++                const int n = ob * 256 + blk * 128 + 4 * lane;
++                float v[4];
++#pragma unroll
++                for (int j = 0; j < 4; ++j) v[j] = E[m * ES + blk * 128 + 4 * lane + j];
++                fwht128(v, lane);
++                const uint2 sv = *reinterpret_cast<const uint2*>(p.svh_d + (size_t)e * D + n);
++                const half2 s01 = *reinterpret_cast<const half2*>(&sv.x), s23 = *reinterpret_cast<const half2*>(&sv.y);
++                __stcs(reinterpret_cast<float4*>(p.y + (size_t)pr * D + n),
++                       make_float4(v[0] * HAD_SCALE * __low2float(s01), v[1] * HAD_SCALE * __high2float(s01),
++                                   v[2] * HAD_SCALE * __low2float(s23), v[3] * HAD_SCALE * __high2float(s23)));
++            }
++        }
++    }
++}
++
++// A tile of one block of cnt members (NG = ceil(cnt / 16) groups): gate/up column block `sub` (one segment, K = D),
++// or down output group `sub` (OB segments of 256 output columns, K = NI each), in one pipeline whose loads run on
++// through each segment's epilogue. Q8 (K1q, gate/up only): int8 rows and weights, int32 sums.
++template <class C, int NG, bool Q8>
++__device__ __forceinline__ void run_tile(const Params& p, int dn, int e, int sub, int cnt, const int* rows_sh,
++                                         const int* xrow_sh, const float* dq_sh, unsigned char* smem) {
++    constexpr int DW = C::DW, DX = C::DX, PKT = C::PKT, BK = C::BK, MT = C::MT;
++    using Acc = typename std::conditional<Q8, int, float>::type;
++    if constexpr (Q8) dn = 0;
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int K = dn ? p.NI : p.D;
++    const int CPS = K / BK;                              // stages a segment
++    const int nseg = dn ? p.OB : 1;
++    const int total = nseg * CPS;
++    const int NTILES = (dn ? p.D : p.NI) >> 4, KT = K >> 4;
++    unsigned char* wring = smem;
++    unsigned char* xring = smem + DW * C::W_BYTES;
++    float* E = reinterpret_cast<float*>(smem + DW * C::W_BYTES + DX * C::X_BYTES);
++    const unsigned wring_s = (unsigned)__cvta_generic_to_shared(wring);
++    const unsigned xring_s = (unsigned)__cvta_generic_to_shared(xring);
++
++    // this thread's pieces: words (tid < TW: WPT adjacent 16-byte pieces of tile q, k tile kk) or member rows
++    // (adjacent 16-byte pieces of member xi); src offsets in elements from a base, dst offsets in bytes into a stage
++    const bool wthr = tid < C::TW;
++    const int widx = tid * C::WPT;
++    const int wq = (widx >> 4) & 15, wkk = (widx >> 3) & (PKT - 1), wpart = widx & 7;   // (in range on every thread)
++    constexpr int XPT = Q8 ? C::XPTQ : C::XPT;
++    const int xidx = (tid - C::TW) * XPT;
++    const int xi = (Q8 ? xidx >> 1 : xidx >> 2) & (C::BN - 1), xpart = Q8 ? xidx & 1 : xidx & 3;
++    const int xr = wthr ? -1 : xrow_sh[xi];
++    const bool xok = xr >= 0;
++    const unsigned xo = (unsigned)(xok ? xr : 0) * (unsigned)K + (unsigned)(xpart * (Q8 ? 16 : 8));
++    const unsigned dst = wthr ? (unsigned)((wq * PKT + wkk) * 32 + wpart * 4) * 4
++                              : (Q8 ? (unsigned)(xi * C::PXSQ + xpart * 16) : (unsigned)(xi * C::PXS + xpart * 8) * 2);
++    const unsigned wstep = (unsigned)(PKT * NTILES * 32);
++    auto wseg = [&](int s) -> const uint32_t* {
++        const uint32_t* T0;
++        int nt;
++        if (dn) {
++            T0 = p.td;
++            nt = (sub * p.OB + s) * 16 + wq;
++        } else {
++            T0 = (wq >> 3) ? p.tu : p.tg;
++            nt = sub * 8 + (wq & 7);
++        }
++        return T0 + (((size_t)e * KT + wkk) * NTILES + nt) * 32 + wpart * 4;
++    };
++    const uint32_t* wb = wseg(0);
++    int lc = 0, ls = 0;                                  // the next load's stage within its segment, and segment
++    auto load = [&](int slot) {                          // this thread's pieces of the next stage
++        if (wthr) {
++            const uint32_t* src = wb + (size_t)((unsigned)lc * wstep);
++            const unsigned d = wring_s + (unsigned)(slot * C::W_BYTES) + dst;
++#pragma unroll
++            for (int k = 0; k < C::WPT; ++k) cp_async16(d + 16 * k, src + 4 * k, true);
++        } else {
++            const unsigned d = xring_s + (unsigned)(slot * C::X_BYTES) + dst;
++            if constexpr (Q8) {
++                const int8_t* src = p.xq + (xo + (unsigned)(lc * BK));          // BK int8 values = BK bytes a stage
++#pragma unroll
++                for (int k = 0; k < XPT; ++k) cp_async16(d + 16 * k, src + 16 * k, xok);
++            } else {
++                const half* src = (dn ? p.xd : p.xh) + (xo + (unsigned)(lc * BK));
++#pragma unroll
++                for (int k = 0; k < XPT; ++k) cp_async16(d + 16 * k, src + 8 * k, xok);
++            }
++        }
++        if (++lc == CPS) {
++            lc = 0;
++            if (++ls < nseg && wthr) wb = wseg(ls);
++        }
++    };
++    const int depth = wthr ? DW : DX;                    // stages this thread loads ahead
++
++    for (int s = 0; s < depth - 1; ++s) {
++        if (s < total) load(s);
++        cp_async_commit();
++    }
++    Acc acc[MT][2 * NG][4];
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < 2 * NG; ++j)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][j][c] = Acc(0);
++    const bool up_last = cnt > (NG - 1) * 16 + 8;
++    int wsl = 0, xsl = 0, c = 0, seg = 0;                // stage gc's slots, its stage within the segment, segment
++    for (int gc = 0; gc < total; ++gc) {
++        if (wthr)
++            cp_async_wait<DW - 2>();
++        else
++            cp_async_wait<DX - 2>();
++        __syncthreads();                                 // stage gc landed for all; stage gc - 1's readers are done
++        if (gc + depth - 1 < total) {
++            const int sl = wthr ? wsl : xsl;
++            load(sl == 0 ? depth - 1 : sl - 1);          // stage gc + depth - 1 into the slot stage gc - 1 left
++        }
++        cp_async_commit();
++        if constexpr (Q8)
++            stage_mma_q<C, NG>(xring + xsl * C::X_BYTES, wring + wsl * C::W_BYTES, acc, warp, lane, p.mask);
++        else
++            stage_mma<C, NG>(xring + xsl * C::X_BYTES, wring + wsl * C::W_BYTES, acc, up_last, warp, lane, p.mask);
++        if (++wsl == DW) wsl = 0;
++        if (++xsl == DX) xsl = 0;
++        if constexpr (!Q8) {
++            if (++c == CPS) {                            // a segment's last stage: its epilogue (loads run on)
++                c = 0;
++                if (dn)
++                    epilogue_dn<C, NG>(p, acc, e, sub * p.OB + seg, cnt, rows_sh, E);
++                else
++                    epilogue_gu<C, NG, false>(p, acc, e, sub, cnt, rows_sh, dq_sh, E);
++#pragma unroll
++                for (int i = 0; i < MT; ++i)
++#pragma unroll
++                    for (int j = 0; j < 2 * NG; ++j)
++#pragma unroll
++                        for (int q = 0; q < 4; ++q) acc[i][j][q] = Acc(0);
++                ++seg;
++            }
++        }
++    }
++    // K1q's gate/up tile is one segment: its epilogue after the loop (inside it, the int32 sums' reads at the
++    // segment's end make the compiler keep the mma's results out of place and copy them back every stage)
++    if constexpr (Q8) epilogue_gu<C, NG, true>(p, acc, e, sub, cnt, rows_sh, dq_sh, E);
++    cp_async_wait<0>();
++    __syncthreads();                                     // the rings, E and the member rows are free
++}
++
++// K1q's gate/up blocks hold as many members as K1's (its epilogue runs after the loop, so the int32 sums stay in
++// place and nothing spills; K1_Q_MAXNG caps them at compile time if a compiler ever needs it).
++#ifndef K1_Q_MAXNG
++#define K1_Q_MAXNG 8
++#endif
++template <class C>
++constexpr int q_maxng() { return C::NGM < K1_Q_MAXNG ? C::NGM : K1_Q_MAXNG; }
++template <class C, bool Q8, int NG = 1>
++__device__ __forceinline__ void run_groups(int ng, const Params& p, int dn, int e, int sub, int cnt, const int* rows_sh,
++                                           const int* xrow_sh, const float* dq_sh, unsigned char* smem) {
++    if constexpr (NG < (Q8 ? q_maxng<C>() : C::NGM)) {
++        if (ng > NG) {
++            run_groups<C, Q8, NG + 1>(ng, p, dn, e, sub, cnt, rows_sh, xrow_sh, dq_sh, smem);
++            return;
++        }
++    }
++    run_tile<C, NG, Q8>(p, dn, e, sub, cnt, rows_sh, xrow_sh, dq_sh, smem);
++}
++
++// The persistent grid: tiles in list order through an atomic counter (the next one claimed a tile ahead). Q (K1q):
++// gate/up tiles take the int8 path; down tiles are K1's in either case.
++template <class C, bool Q>
++__global__ void __launch_bounds__(C::T, C::CTAS) k1_kernel(const Params p) {
++    extern __shared__ __align__(128) unsigned char smem[];
++    __shared__ int rows_sh[C::BN];      // the members' pair indices (-1 past the block's members)
++    __shared__ int xrow_sh[C::BN];      // the X row each member reads: its token (gate/up) or pair (down)
++    __shared__ float dq_sh[Q ? C::BN : 1];   // K1q: a member's row scale / 31.75
++    __shared__ int tile_sh[2];
++    const int tid = threadIdx.x;
++    const int ntiles = p.ctrl[1];
++    const int ncb = p.NI >> 7;          // gate/up tiles a block
++    if (tid == 0) tile_sh[0] = atomicAdd(p.ctrl, 1);
++    for (int it = 0;; ++it) {
++        __syncthreads();
++        const int t = tile_sh[it & 1];
++        if (t >= ntiles) break;
++        if (tid == 0) tile_sh[(it + 1) & 1] = atomicAdd(p.ctrl, 1);
++        const int code = p.tiles[t];
++        const int b = code >> 8, dn = (code >> 7) & 1, sub = code & 127;
++        const int e = p.blocks[3 * b], first = p.blocks[3 * b + 1], cnt = p.blocks[3 * b + 2];
++        if (dn && tid == 0) count_wait(p.done + b, ncb);
++        if (tid < C::BN) {
++            const int q = tid < cnt ? p.members[first + tid] : -1;
++            rows_sh[tid] = q;
++            xrow_sh[tid] = q < 0 ? -1 : (dn ? q : q / p.slots);
++            if constexpr (Q) dq_sh[tid] = (q < 0 || dn) ? 0.f : p.xs[q / p.slots] / Q8_WEIGHT;
++        }
++        __syncthreads();
++        if (Q && !dn)
++            run_groups<C, true>((cnt + 15) >> 4, p, dn, e, sub, cnt, rows_sh, xrow_sh, dq_sh, smem);
++        else
++            run_groups<C, false>((cnt + 15) >> 4, p, dn, e, sub, cnt, rows_sh, xrow_sh, dq_sh, smem);
++        if (!dn) {
++            __threadfence();                             // this thread's Xd stores, before the count
++            __syncthreads();
++            if (tid == 0) count_release_add(p.done + b, 1);
++        }
++    }
++}
++
++// K1q's rows: one block of 8 warps a row. v = fwht128((x * suh) a 128 block) / sqrt(128) in fp32 (rot_rows'
++// arithmetic before its fp16 rounding); the row's scale s = max|v| / 127; q = rint(v * (127 / max|v|)) as int8,
++// each 16-value group in the decode's slot order (logical k 2t, 2t+1, 2t+8, 2t+9 in slots 4t..4t+3). A row's values
++// depend on that row alone.
++__global__ void __launch_bounds__(256) k1q_rot_quant_kernel(const __nv_bfloat16* __restrict__ x, int x_stride,
++                                                            const half* __restrict__ suh, int8_t* __restrict__ xq,
++                                                            float* __restrict__ xs, int D) {
++    const int row = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int nblk = D >> 7;                             // at most 64 (D <= 8192)
++    float v[8][4];
++    float amax = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int blk = warp + 8 * i;
++        if (blk < nblk) {
++            const __nv_bfloat16* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
++            const half* sr = suh + blk * 128 + 4 * lane;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) v[i][j] = __bfloat162float(xr[j]) * __half2float(sr[j]);
++            fwht128(v[i], lane);
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                v[i][j] = v[i][j] * HAD_SCALE;
++                amax = fmaxf(amax, fabsf(v[i][j]));
++            }
++        }
++    }
++#pragma unroll
++    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++    __shared__ float wmax[8];
++    if (lane == 0) wmax[warp] = amax;
++    __syncthreads();
++    float m = wmax[0];
++#pragma unroll
++    for (int w = 1; w < 8; ++w) m = fmaxf(m, wmax[w]);
++    const float inv = m > 0.f ? 127.f / m : 0.f;
++    if (threadIdx.x == 0) xs[row] = m / 127.f;
++    const int lq = lane & 3;
++    const int s0 = ((lq & 1) << 3) | ((lq >> 1) << 1);   // logical 4 lq + j -> slots s0, s0 + 1, s0 + 4, s0 + 5
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int blk = warp + 8 * i;
++        if (blk < nblk) {
++            int q[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) q[j] = max(-127, min(127, __float2int_rn(v[i][j] * inv)));
++            unsigned char* base = reinterpret_cast<unsigned char*>(xq) + (size_t)row * D + blk * 128 + (lane >> 2) * 16;
++            *reinterpret_cast<unsigned short*>(base + s0) = (unsigned short)((q[0] & 0xff) | ((q[1] & 0xff) << 8));
++            *reinterpret_cast<unsigned short*>(base + s0 + 4) = (unsigned short)((q[2] & 0xff) | ((q[3] & 0xff) << 8));
++        }
++    }
++}
++
++// ---- the tile list --------------------------------------------------------------------------------------------------
++
++constexpr int SCHED_THREADS = 1024;
++constexpr int MAX_BLOCKS = 4096;
++
++// Block-wide exclusive scan of one int a thread; *total = the sum (all threads).
++__device__ __forceinline__ int block_scan(int v, int* wsum, int* total) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    int x = v;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, x, o);
++        if (lane >= o) x += u;
++    }
++    __syncthreads();                                     // wsum's previous readers are done
++    if (lane == 31) wsum[warp] = x;
++    __syncthreads();
++    if (warp == 0) {
++        int w = wsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, w, o);
++            if (lane >= o) w += u;
++        }
++        wsum[lane] = w;
++    }
++    __syncthreads();
++    *total = wsum[31];
++    return (warp ? wsum[warp - 1] : 0) + x - v;
++}
++
++// Where the tiles of the block at list position `pos` (of n) go: its NCB gate/up tiles at gate_up_start, its NOG down
++// tiles at down_start. Down tiles of position j follow the gate/up tiles of position j + lag (the tail when that is
++// past the end), so a down tile is claimed about lag blocks after its own gate/up tiles.
++__host__ __device__ __forceinline__ int gate_up_start(int pos, int lag, int NCB, int NOG) {
++    return pos * NCB + (pos > lag ? pos - lag : 0) * NOG;
++}
++__host__ __device__ __forceinline__ int down_start(int pos, int n, int lag, int NCB, int NOG) {
++    return pos + lag < n ? (pos + lag + 1) * NCB + pos * NOG : n * NCB + pos * NOG;
++}
++
++// One block: the plan's experts (items in expert order, the shared expert's id E last and left out; or CSR offsets
++// [E + 1]) as blocks of up to BN members, and the tile list. Blocks are ranked by their expert's first block's n8 tiles
++// (descending; an expert's blocks together, in order), then interleaved from both ends (the heaviest, the lightest,
++// the next heaviest, ...) so DRAM-bound and tensor-bound tiles run side by side and the list ends with middling ones.
++__global__ void __launch_bounds__(SCHED_THREADS) k1_schedule_kernel(
++    const int* __restrict__ items, const int* __restrict__ counts, int cap_items, const int* __restrict__ offsets,
++    int E, int BN, int NCB, int NOG, int lag, int cap_blocks, int* __restrict__ blocks, int* __restrict__ tiles,
++    int* __restrict__ ctrl, int* __restrict__ done) {
++    __shared__ int key_sh[MAX_BLOCKS];
++    __shared__ int wsum[32];
++    const int tid = threadIdx.x;
++    const int n_cand = offsets ? E : min(counts[0], cap_items);
++    const int per = (n_cand + SCHED_THREADS - 1) / SCHED_THREADS;
++    const int lo = min(n_cand, tid * per), hi = min(n_cand, lo + per);
++    auto run = [&](int i, int& e, int& first, int& c) -> bool {   // candidate i starts a routed expert's members
++        if (offsets) {
++            e = i;
++            first = offsets[i];
++            c = offsets[i + 1] - first;
++            return c > 0;
++        }
++        e = items[3 * i];
++        if (e < 0 || e >= E || (i > 0 && items[3 * (i - 1)] == e)) return false;
++        first = items[3 * i + 1];
++        c = 0;
++        for (int j = i; j < n_cand && items[3 * j] == e; ++j) c += items[3 * j + 2];
++        return c > 0;
++    };
++    int nb = 0;
++    for (int i = lo; i < hi; ++i) {
++        int e, f, c;
++        if (run(i, e, f, c)) nb += (c + BN - 1) / BN;
++    }
++    int want;
++    int base = block_scan(nb, wsum, &want);
++    // the host sizes cap_blocks with the bound every plan meets (min(pairs, experts) + pairs / BN, exl3_k1.py
++    // max_blocks); ctrl[3] keeps the count a plan needed, for tests
++    const int n = min(want, min(cap_blocks, MAX_BLOCKS));
++    for (int i = lo; i < hi; ++i) {
++        int e, f, c;
++        if (!run(i, e, f, c)) continue;
++        const int key = (min(c, BN) + 7) >> 3;
++        for (int k = 0; k * BN < c && base < n; ++k, ++base) {
++            blocks[3 * base] = e;
++            blocks[3 * base + 1] = f + k * BN;
++            blocks[3 * base + 2] = min(BN, c - k * BN);
++            key_sh[base] = key;
++        }
++    }
++    __syncthreads();
++    // rank = blocks of larger keys + blocks of the same key before it (a scan over the blocks a key value)
++    const int bper = (n + SCHED_THREADS - 1) / SCHED_THREADS;
++    const int blo = min(n, tid * bper), bhi = min(n, blo + bper);
++    const int half_n = (n + 1) >> 1;
++    int above = 0;
++    for (int k = (BN + 7) >> 3; k >= 1; --k) {
++        int mine = 0;
++        for (int b = blo; b < bhi; ++b) mine += key_sh[b] == k;
++        int tot;
++        int r = above + block_scan(mine, wsum, &tot);
++        for (int b = blo; b < bhi; ++b) {
++            if (key_sh[b] != k) continue;
++            const int pos = r < half_n ? 2 * r : 2 * (n - 1 - r) + 1;
++            const int g0 = gate_up_start(pos, lag, NCB, NOG), d0 = down_start(pos, n, lag, NCB, NOG);
++            for (int cb = 0; cb < NCB; ++cb) tiles[g0 + cb] = (b << 8) | cb;
++            for (int og = 0; og < NOG; ++og) tiles[d0 + og] = (b << 8) | 128 | og;
++            ++r;
++        }
++        above += tot;
++    }
++    for (int b = tid; b < n; b += SCHED_THREADS) done[b] = 0;
++    if (tid == 0) {
++        ctrl[0] = 0;
++        ctrl[1] = n * (NCB + NOG);
++        ctrl[2] = n;
++        ctrl[3] = want;                                  // > ctrl[2]: blocks past the capacity (tests check it)
++    }
++}
++
++template <class C, bool Q>
++int grid_of() {
++    static int grid = [] {
++        cudaFuncSetAttribute(k1_kernel<C, Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
++        int per_sm = 0;
++        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k1_kernel<C, Q>, C::T, C::SMEM);
++        per_sm = per_sm < 1 ? 1 : (per_sm > C::CTAS ? C::CTAS : per_sm);
++        return per_sm * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    }();
++    return grid;
++}
++
++}  // namespace
++
++// Configurations: 0 = CfgDeep ("k1"), 1 = CfgPair ("k1-64"), 2 = CfgWide ("k1-w16"); q: K1q's int8 gate/up.
++int64_t exl3_k1_block_members(int64_t cfg, bool q) {
++    if (q) return 16 * (cfg == 1 ? q_maxng<CfgPair>() : cfg == 2 ? q_maxng<CfgWide>() : q_maxng<CfgDeep>());
++    return cfg == 1 ? CfgPair::BN : cfg == 2 ? CfgWide::BN : CfgDeep::BN;
++}
++
++int64_t exl3_k1_max_blocks() { return MAX_BLOCKS; }
++
++// The persistent grid of a configuration on this device (its blocks a call).
++int64_t exl3_k1_grid(int64_t cfg, bool q) {
++    if (q) return cfg == 1 ? grid_of<CfgPair, true>() : cfg == 2 ? grid_of<CfgWide, true>() : grid_of<CfgDeep, true>();
++    return cfg == 1 ? grid_of<CfgPair, false>() : cfg == 2 ? grid_of<CfgWide, false>() : grid_of<CfgDeep, false>();
++}
++
++// The tile list alone (tests read it): blocks [cap_blocks, 3], tiles [cap_blocks * (NCB + NOG)], ctrl [4],
++// done [cap_blocks]. lag: list positions between a block's gate/up tiles and its down tiles.
++void exl3_k1_schedule_cuda(const at::Tensor& items, const at::Tensor& counts, const c10::optional<at::Tensor>& offsets,
++                           int64_t E, int64_t BN, int64_t NCB, int64_t NOG, int64_t lag, at::Tensor& blocks,
++                           at::Tensor& tiles, at::Tensor& ctrl, at::Tensor& done) {
++    const int64_t cap_blocks = done.numel();
++    TORCH_CHECK(cap_blocks <= MAX_BLOCKS, "k1: at most ", MAX_BLOCKS, " member blocks");
++    TORCH_CHECK(blocks.numel() >= 3 * cap_blocks && tiles.numel() >= cap_blocks * (NCB + NOG) && ctrl.numel() >= 4,
++                "k1: schedule buffers too small");
++    TORCH_CHECK(NCB >= 1 && NCB <= 128 && NOG >= 1 && NOG <= 128 && BN >= 8 && BN <= 128, "k1: schedule shape");
++    const int* off = nullptr;
++    if (offsets.has_value()) {
++        TORCH_CHECK(offsets->numel() >= E + 1, "k1: offsets [E + 1]");
++        off = offsets->data_ptr<int>();
++    }
++    TORCH_CHECK(lag >= 0, "k1: lag >= 0");
++    k1_schedule_kernel<<<1, SCHED_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
++        items.data_ptr<int>(), counts.data_ptr<int>(), (int)(items.numel() / 3), off, (int)E, (int)BN, (int)NCB,
++        (int)NOG, (int)(lag > MAX_BLOCKS ? MAX_BLOCKS : lag), (int)cap_blocks, blocks.data_ptr<int>(),
++        tiles.data_ptr<int>(), ctrl.data_ptr<int>(), done.data_ptr<int>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// K1q's rows: xq [rows, D] int8 (decode slot order), xs [rows] fp32 scales, from bf16 x and the layer's shared suh.
++void exl3_k1_rot_quant_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor& xq,
++                            at::Tensor& xs, int64_t rows, int64_t D) {
++    TORCH_CHECK(D % 128 == 0 && D <= 8192, "k1q: D a multiple of 128, at most 8,192");
++    if (rows <= 0) return;
++    k1q_rot_quant_kernel<<<(unsigned)rows, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride,
++        reinterpret_cast<const half*>(suh.data_ptr()), xq.data_ptr<int8_t>(), xs.data_ptr<float>(), (int)D);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// Xd [P, NI] (fp16) and Y [P, D] (fp32) of every routed pair of the plan; the shared expert's pairs are left alone.
++// q: K1q (gate/up from xq / xs in int8; xh unused).
++void exl3_k1_cuda(const at::Tensor& xh, const at::Tensor& tg, const at::Tensor& tu, const at::Tensor& td,
++                  const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
++                  at::Tensor& xd, at::Tensor& y, const at::Tensor& items, const at::Tensor& counts,
++                  const at::Tensor& members, const c10::optional<at::Tensor>& offsets, at::Tensor& blocks,
++                  at::Tensor& tiles, at::Tensor& ctrl, at::Tensor& done, int64_t D, int64_t NI, int64_t slots,
++                  double limit, int64_t cfg, int64_t OB, int64_t lag, bool q, const c10::optional<at::Tensor>& xq,
++                  const c10::optional<at::Tensor>& xs, int64_t max_ctas) {
++    TORCH_CHECK(D % 256 == 0 && NI % 128 == 0 && NI >= 128, "k1: D % 256 and NI % 128");
++    TORCH_CHECK(OB >= 1 && (D / 256) % OB == 0, "k1: OB divides D / 256");
++    TORCH_CHECK(cfg >= 0 && cfg <= 2, "k1: configuration 0 (k1), 1 (k1-64) or 2 (k1-w16)");
++    TORCH_CHECK(!q || (xq.has_value() && xs.has_value()), "k1q: xq and xs");
++    const int64_t E = tg.size(0);
++    const int64_t BN = exl3_k1_block_members(cfg, q);
++    const int64_t NCB = NI / 128, NOG = (D / 256) / OB;
++    int64_t grid = exl3_k1_grid(cfg, q);
++    if (max_ctas > 0 && max_ctas < grid) grid = max_ctas;   // leave SMs to another stream (scheduling only)
++    if (lag < 0) lag = (3 * grid + NCB - 1) / NCB;
++    exl3_k1_schedule_cuda(items, counts, offsets, E, BN, NCB, NOG, lag, blocks, tiles, ctrl, done);
++    Params prm;
++    prm.xh = reinterpret_cast<const half*>(xh.data_ptr());
++    prm.tg = reinterpret_cast<const uint32_t*>(tg.data_ptr());
++    prm.tu = reinterpret_cast<const uint32_t*>(tu.data_ptr());
++    prm.td = reinterpret_cast<const uint32_t*>(td.data_ptr());
++    prm.svh_g = reinterpret_cast<const half*>(svh_g.data_ptr());
++    prm.svh_u = reinterpret_cast<const half*>(svh_u.data_ptr());
++    prm.suh_d = reinterpret_cast<const half*>(suh_d.data_ptr());
++    prm.svh_d = reinterpret_cast<const half*>(svh_d.data_ptr());
++    prm.xd = reinterpret_cast<half*>(xd.data_ptr());
++    prm.y = y.data_ptr<float>();
++    prm.members = members.data_ptr<int>();
++    prm.blocks = blocks.data_ptr<int>();
++    prm.tiles = tiles.data_ptr<int>();
++    prm.ctrl = ctrl.data_ptr<int>();
++    prm.done = done.data_ptr<int>();
++    prm.D = (int)D;
++    prm.NI = (int)NI;
++    prm.slots = (int)slots;
++    prm.OB = (int)OB;
++    prm.limit = (float)limit;
++    prm.mask = 0x8FFF8FFFu;
++    prm.xq = q ? xq->data_ptr<int8_t>() : nullptr;
++    prm.xs = q ? xs->data_ptr<float>() : nullptr;
++    auto stream = at::cuda::getCurrentCUDAStream();
++#define K1_GO(CFG, Q_) k1_kernel<CFG, Q_><<<(unsigned)grid, CFG::T, CFG::SMEM, stream>>>(prm)
++    if (q) {
++        if (cfg == 1) K1_GO(CfgPair, true); else if (cfg == 2) K1_GO(CfgWide, true); else K1_GO(CfgDeep, true);
++    } else {
++        if (cfg == 1) K1_GO(CfgPair, false); else if (cfg == 2) K1_GO(CfgWide, false); else K1_GO(CfgDeep, false);
++    }
++#undef K1_GO
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/exl3_k1.py tensorfold/families/glm5_next/cuda/exl3_k1.py
+new file mode 100644
+index 0000000..1373980
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_k1.py
+@@ -0,0 +1,162 @@
++"""K1 prompt kernels for GLM's routed EXL3 experts (TF_GLM_EXPERT_PROMPT_KERNEL, exl3_k1.cu): decoded once a block of
++up to 128 members, gate/up and down in one persistent launch.
++
++Settings:
++- TF_GLM_EXPERT_PROMPT_KERNEL: unset / ``0`` (off: exl3.cu's prompt kernels);
++  - ``k1`` (8 warps, 2 m tiles each, blocks of up to 128 members, one block an SM), ``k1-64`` (blocks of up to 64, two
++    blocks an SM) or ``k1-w16`` (16 warps, 1 m tile each): exl3.cu's prompt arithmetic, the prompt kernels' bits;
++  - ``k1q``, ``k1q-64``, ``k1q-w16``: QUALITY-CHANGING. The gate/up matmuls in int8 (the rotated rows with one scale a
++    token, the codebook values as round(31.75 v)) with exact int32 sums, then the same epilogue; the down matmul as
++    K1's. Deterministic and batch-invariant (a row's scale is its own), but not the prompt kernels' bits: rebuild the
++    gate references and run the quality checks before serving with it.
++- TF_GLM_K1_OB: down output blocks (256 columns) a down tile runs in one pipeline: 1, 2, 4 (default), 8 or 16.
++- TF_GLM_K1_LAG: list positions between a block's gate/up tiles and its down tiles; ``auto`` (default: three grids'
++  worth) or a number (a large one puts every down tile after every gate/up tile).
++- TF_GLM_K1_CTAS: at most this many blocks in the persistent grid (default 0: every SM's), to leave SMs to work on
++  another stream beside the routed experts (TF_GLM_MOE_GLUE's side stream).
++TF_GLM_K1_OB, TF_GLM_K1_LAG and TF_GLM_K1_CTAS change scheduling only (the same bits for every value).
++
++Used for prompt windows of layers whose experts share one gate/up suh (one rotated row a token), 4-bit trellis words
++[E, K/16, N/16, 32], D % 256 == 0 and NI % 128 == 0; anything else keeps exl3.cu's prompt kernels."""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++SETTING = "TF_GLM_EXPERT_PROMPT_KERNEL"
++# name -> (configuration index of exl3_k1.cu, int8 gate/up)
++CONFIGS = {"k1": (0, False), "k1-64": (1, False), "k1-w16": (2, False),
++           "k1q": (0, True), "k1q-64": (1, True), "k1q-w16": (2, True)}
++OB_VALUES = (1, 2, 4, 8, 16)
++
++
++def setting(value: str | None = None) -> tuple[int, bool] | None:
++    """(configuration index, int8 gate/up) of TF_GLM_EXPERT_PROMPT_KERNEL, or None when off or set to another
++    kernel's value (``k12...``: exl3_k12.py's, when its patch is applied too)."""
++
++    v = (os.environ.get(SETTING, "") if value is None else value).strip().lower()
++    if v in ("", "0", "off", "none") or v.startswith("k12"):
++        return None
++    if v not in CONFIGS:
++        raise ValueError(f"{SETTING}: 0 (off), {', '.join(CONFIGS)}; not {v!r}")
++    return CONFIGS[v]
++
++
++def down_blocks(value: str | None = None) -> int:
++    """TF_GLM_K1_OB: 256-column output blocks a down tile runs (the same bits for every value)."""
++
++    v = (os.environ.get("TF_GLM_K1_OB", "") if value is None else value).strip() or "4"
++    if not v.isdecimal() or int(v) not in OB_VALUES:
++        raise ValueError(f"TF_GLM_K1_OB: one of {OB_VALUES}, not {v!r}")
++    return int(v)
++
++
++def max_ctas(value: str | None = None) -> int:
++    """TF_GLM_K1_CTAS: 0 (every SM's blocks) or a cap on the persistent grid (the same bits for every value)."""
++
++    v = (os.environ.get("TF_GLM_K1_CTAS", "") if value is None else value).strip() or "0"
++    if not v.isdecimal():
++        raise ValueError(f"TF_GLM_K1_CTAS: a non-negative number, not {v!r}")
++    return int(v)
++
++
++def lag(value: str | None = None) -> int:
++    """TF_GLM_K1_LAG: -1 (auto) or a non-negative number of list positions (the same bits for every value)."""
++
++    v = (os.environ.get("TF_GLM_K1_LAG", "") if value is None else value).strip().lower() or "auto"
++    if v == "auto":
++        return -1
++    if not v.isdecimal():
++        raise ValueError(f"TF_GLM_K1_LAG: auto or a non-negative number, not {v!r}")
++    return int(v)
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_exl3_k1_v1", sources=[str(here / "exl3_k1.cpp"), str(here / "exl3_k1.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def supported(ex, D: int, NI: int) -> bool:
++    """Shapes and layout the K1 kernels take (else the caller keeps exl3.cu's prompt kernels)."""
++
++    if ex.shared_suh is None or D % 256 or NI % 128 or NI < 128 or D > 8192:
++        return False
++    E = ex.count
++    for t, k, n in ((ex.gt, D, NI), (ex.ut, D, NI), (ex.dt, NI, D)):
++        if t.dtype != torch.int32 or tuple(t.shape) != (E, k // 16, n // 16, 32) or not t.is_contiguous():
++            return False
++    return all(s.dtype == torch.float16 and s.is_contiguous() for s in (ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d))
++
++
++def max_blocks(pairs: int, experts: int, members: int) -> int:
++    """Blocks of up to ``members`` a plan of ``pairs`` can need: one an expert in use plus one a full block."""
++
++    return min(pairs, experts) + pairs // members
++
++
++class K1Scratch:
++    """The tile list's buffers for a window of ``rows`` x ``slots`` pairs (a few KB), and for K1q the int8 rows and
++    their scales (rows x D bytes)."""
++
++    def __init__(self, rows: int, slots: int, experts: int, D: int, NI: int, cfg: int, q: bool, ob: int,
++                 device) -> None:
++        ext = _ext()
++        self.cfg, self.q, self.ob = cfg, q, ob
++        pairs = rows * slots
++        self.members = int(ext.block_members(cfg, q))
++        cap = max_blocks(pairs, experts, self.members)
++        if cap > int(ext.max_blocks()):
++            raise ValueError(f"K1: a window of {pairs} pairs can need {cap} member blocks, more than "
++                             f"{int(ext.max_blocks())}; use smaller prompt chunks")
++        ncb, nog = NI // 128, (D // 256) // ob
++        i32 = dict(dtype=torch.int32, device=device)
++        self.blocks = torch.zeros((cap, 3), **i32)
++        self.tiles = torch.zeros((cap * (ncb + nog),), **i32)
++        self.ctrl = torch.zeros((4,), **i32)
++        self.done = torch.zeros((cap,), **i32)
++        self.xq = torch.zeros((rows, D), dtype=torch.int8, device=device) if q else None
++        self.xs = torch.zeros((rows,), dtype=torch.float32, device=device) if q else None
++
++    def nbytes(self) -> int:
++        ts = (self.blocks, self.tiles, self.ctrl, self.done, self.xq, self.xs)
++        return sum(t.numel() * t.element_size() for t in ts if t is not None)
++
++
++def scratch(s, ex, cfg: int, q: bool, ob: int) -> K1Scratch:
++    """The K1 scratch kept on an exl3_mm.Scratch (made on first use, remade when the configuration changes)."""
++
++    k1 = getattr(s, "k1", None)
++    key = (cfg, q, ob, ex.count, ex.dims, ex.width)
++    if k1 is None or k1.key != key:
++        k1 = K1Scratch(s.rows, s.slots, ex.count, ex.dims, ex.width, cfg, q, ob, s.xg.device)
++        k1.key = key
++        s.k1 = k1
++    return k1
++
++
++def routed(x: torch.Tensor, plan, ex, s, y: torch.Tensor, R: int, limit: float, config: tuple[int, bool]) -> None:
++    """Xd (s.xd) and Y (fp32 [pairs, D]) of the plan's routed pairs from the normed bf16 rows x [R, D]: K1 rotates the
++    rows as rot_rows (s.xg), K1q quantises them (its scratch's xq / xs)."""
++
++    from .exl3_mm import _ext as _exl3_ext
++
++    cfg, q = config
++    ob = down_blocks()
++    k1 = scratch(s, ex, cfg, q, ob)
++    D = ex.dims
++    ext = _ext()
++    if q:
++        ext.rot_quant(x, x.stride(0), ex.shared_suh, k1.xq, k1.xs, R, D)
++    else:
++        _exl3_ext().rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
++    ext.run(s.xg[:R], ex.gt, ex.ut, ex.dt, ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d, s.xd, y, plan.items, plan.counts,
++            plan.members, None, k1.blocks, k1.tiles, k1.ctrl, k1.done, D, ex.width, s.slots, float(limit), cfg, ob,
++            lag(), q, k1.xq, k1.xs, max_ctas())
+diff --git tensorfold/families/glm5_next/cuda/exl3_k12.cpp tensorfold/families/glm5_next/cuda/exl3_k12.cpp
+new file mode 100644
+index 0000000..882a565
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_k12.cpp
+@@ -0,0 +1,53 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++int64_t exl3_k12_configs();
++void exl3_k12_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t,
++                          int64_t, int64_t, int64_t, double, int64_t, const c10::optional<at::Tensor>&,
++                          const c10::optional<at::Tensor>&, int64_t);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), "k12: ", name,
++                ": expected a contiguous CUDA tensor of the right dtype");
++}
++
++// Xd and Y of a prompt chunk's routed pairs from the rotated rows xh [rows, D] (one a token, the layer's shared
++// gate/up suh): exl3.cu ``prompt``'s outputs for shared rows and 64-member items, the same bits. blocks: int32 scratch
++// of at least 4 max_items + 2 for the configurations on blocks of 80 or 128 members (3 to 6).
++void prompt(const at::Tensor& xh, const at::Tensor& tg, const at::Tensor& tu, const at::Tensor& td,
++            const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, const at::Tensor& svh_g,
++            const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor xd, at::Tensor y,
++            int64_t D, int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots,
++            c10::optional<at::Tensor> order, c10::optional<at::Tensor> blocks, int64_t cfg) {
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&xh, &svh_g, &svh_u, &suh_d, &svh_d})
++        check(*t, at::kHalf, "fp16 input");
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&tg, &tu, &td, &items, &counts, &members})
++        check(*t, at::kInt, "int32 input");
++    check(xd, at::kHalf, "xd");
++    check(y, at::kFloat, "y");
++    if (order.has_value()) check(*order, at::kInt, "order");
++    if (blocks.has_value()) check(*blocks, at::kInt, "blocks");
++    TORCH_CHECK(tg.dim() == 4 && tg.size(1) == D / 16 && tg.size(2) == N / 16 && tg.size(3) == 32 &&
++                    tu.sizes() == tg.sizes() && td.dim() == 4 && td.size(0) == tg.size(0) && td.size(1) == N / 16 &&
++                    td.size(2) == D / 16 && td.size(3) == 32,
++                "k12: trellis words [E, K/16, N/16, 32] (4-bit tiles)");
++    TORCH_CHECK(E <= tg.size(0) && svh_g.numel() >= E * N && svh_u.numel() >= E * N && suh_d.numel() >= E * N &&
++                    svh_d.numel() >= E * D, "k12: scale shapes");
++    TORCH_CHECK(xh.dim() == 2 && xh.size(1) == D, "k12: xh [rows, D]");
++    // the call's pairs (its rows x slots) are what the kernels write: a prompt lane's Y and Xd are views of its own
++    // rows while the plan (members) keeps the window's capacity (TF_GLM_PREFILL_LANES, TF_GLM_MOE_GLUE)
++    const int64_t pairs = xh.size(0) * slots;
++    TORCH_CHECK(pairs <= members.numel(), "k12: more rows than the plan holds");
++    TORCH_CHECK(xd.numel() >= pairs * N && y.numel() >= pairs * D, "k12: xd / y too small for ", pairs, " pairs");
++    TORCH_CHECK(items.numel() >= 3 * max_items && slots > 0, "k12: items [max_items, 3], slots");
++    const at::cuda::CUDAGuard guard(xh.device());
++    exl3_k12_prompt_cuda(xh, tg, tu, td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
++                         max_items, limit, slots, order, blocks, cfg);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("prompt", &prompt);
++    m.def("configs", &exl3_k12_configs);
++}
+diff --git tensorfold/families/glm5_next/cuda/exl3_k12.cu tensorfold/families/glm5_next/cuda/exl3_k12.cu
+new file mode 100644
+index 0000000..ad1cf68
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_k12.cu
+@@ -0,0 +1,999 @@
++// GLM-5.3-Flash's routed EXL3 experts in prompt chunks: the K12 kernels (TF_GLM_EXPERT_PROMPT_KERNEL=k12...).
++//
++// The bits of exl3.cu's prompt kernels (prompt_gateup_kernel / prompt_down_kernel): the same plan items (an item = up
++// to 64 members of one expert), the same blocks (16 m tiles: 128 gate + 128 up columns, or 256 down columns), every
++// output one fp32 chain of mma.m16n8k16 over the ascending k tiles from zero, and the same epilogue formulas in the
++// same order. What changes is how the main loop feeds the tensor pipe (that kernel keeps it busy 53-62% of cycles:
++// a stage's code is cut into nine basic blocks by per-block branches, the decode and the mma of a warp run in turns,
++// and a third of the integer work re-creates the codebook mask):
++//  - the item's member count picks a main loop compiled for its number of 8-member column blocks (NBA), so a stage
++//    is one basic block with no branch, no padding mma and no predicate;
++//  - a warp keeps two A fragment sets: the next k tile's trellis decode is issued among the current k tile's mma,
++//    and across the stage barrier (the next stage's words are waited for one stage early);
++//  - a lane reads its neighbour's word from shared memory instead of a shuffle, and the codebook mask is an argument
++//    (a register), not a constant the compiler rebuilds;
++//  - the epilogue reads its per-column scales once a block.
++// Variant ``ws`` (warp-specialised): two producer warps decode every tile of a k tile once into shared memory, eight
++// consumer warps only load fragments and issue mma; the same chains, so the same bits.
++//
++// Trellis decode after exl3.cu (format after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp).
++
++#include <cooperative_groups.h>
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++namespace {
++
++namespace cg = cooperative_groups;
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++constexpr uint32_t MCG_MASK = 0x8FFF8FFFu;          // the codebook mask (a kernel argument: a register)
++
++// (x & m) ^ 0x3B603B60 in one LOP3 with m in a register.
++__device__ __forceinline__ uint32_t lop_mask_xor(uint32_t x, uint32_t m) {
++    uint32_t y;
++    asm("lop3.b32 %0, %1, %2, 0x3B603B60, 0x6a;\n" : "=r"(y) : "r"(x), "r"(m));
++    return y;
++}
++
++// exl3.cu's mcg2: two codebook values from two 16-bit states, as a half2 (first state in .x).
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1, uint32_t m) {
++    const uint32_t x0 = lop_mask_xor(s0 * 0xCBAC1FEDu, m);
++    const uint32_t x1 = lop_mask_xor(s1 * 0xCBAC1FEDu, m);
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// A tile's mma A fragment for this lane from its word w and the word of lane - 1 (p): exl3.cu decode_tile_p's values
++// (b0, b1) in its A order, a0 = b0[0], a1 = b1[0], a2 = b0[1], a3 = b1[1].
++__device__ __forceinline__ void decode_a(uint32_t w, uint32_t p, uint32_t m, uint32_t (&a)[4]) {
++    const uint32_t s = __funnelshift_r(w, p, 20);
++    const uint32_t t = w >> 4;
++    a[0] = mcg2(__byte_perm(s, 0u, 0x4421), (s >> 4) & 0xffffu, m);   // (s >> 8) & 0xffff, (s >> 4) & 0xffff
++    a[1] = mcg2(__byte_perm(t, 0u, 0x4421), __byte_perm(w, 0u, 0x4421), m);
++    a[2] = mcg2(s & 0xffffu, w >> 16, m);
++    a[3] = mcg2(__byte_perm(t, 0u, 0x4410), w & 0xffffu, m);
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int bytes) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], uint32_t s) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++__device__ __forceinline__ void ldsm_x2(uint32_t (&r)[2], uint32_t s) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(s));
++}
++__device__ __forceinline__ uint32_t lds32(uint32_t s) {
++    uint32_t v;
++    asm volatile("ld.shared.u32 %0, [%1];\n" : "=r"(v) : "r"(s));
++    return v;
++}
++__device__ __forceinline__ uint4 lds128(uint32_t s) {
++    uint4 v;
++    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(s));
++    return v;
++}
++__device__ __forceinline__ void sts128(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
++    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" ::"r"(s), "r"(a), "r"(b), "r"(c), "r"(d));
++}
++// Named barriers of a "ws" block (id 0 is __syncthreads').
++template <int ID, int THREADS>
++__device__ __forceinline__ void bar_sync() {
++    asm volatile("bar.sync %0, %1;\n" ::"n"(ID), "n"(THREADS) : "memory");
++}
++template <int ID, int THREADS>
++__device__ __forceinline__ void bar_arrive() {
++    asm volatile("bar.arrive %0, %1;\n" ::"n"(ID), "n"(THREADS) : "memory");
++}
++
++// exl3.cu's fwht128: the same butterflies in the same order, the same bits. A cross-lane butterfly, v + o in the
++// lower lane and o - v in the upper one, is one FFMA, fmaf(s, v, o) with s = +1 or -1: s v is exact, so the FFMA
++// rounds o + v or o - v once, as the add does (exl3.cu's code compiles to an FSEL of -v and an FADD).
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++        const float s = (lane & m) ? -1.f : 1.f;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = fmaf(s, v[j], o);
++        }
++    }
++}
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++struct Params {
++    const half* x;              // gate/up: the rotated rows [rows, D] (one a token); down: Xd [pairs, NI]
++    const uint32_t* t0;         // trellis words [E, K/16, N/16, 32]: gate (gate/up) or down
++    const uint32_t* t1;         // up (gate/up)
++    const int* items;           // the plan: items [n, 3] (expert, first member, count), counts [2], members
++    const int* counts;
++    const int* members;
++    const int* order;           // the launch order (nullptr: plan order)
++    const half* svh_g;
++    const half* svh_u;
++    const half* suh_d;
++    const half* svh_d;
++    half* xd;                   // [pairs, NI]
++    float* y;                   // [pairs, D]
++    int K, N, E, slots;         // K, N: this kernel's matmul (gate/up: D, NI; down: NI, D)
++    float limit;
++    uint32_t mask;              // MCG_MASK
++};
++
++// A block's shape. MATS: 2 for gate/up (the first TILES / 2 m tiles are the gate's), 1 for down or for one matrix of
++// a gate/up pair of blocks (k12_gateup_c2_kernel). A warp holds MT m tiles for all PM members; a stage holds PKT k
++// tiles (PBK = 16 PKT values) of the members' rows and of the TILES tiles' words; PS stages. WS: the
++// warp-specialised variant (NW consumer warps plus PW producer warps). Blocks: 16 m tiles x 64 members (exl3.cu's
++// items), 16 m tiles x 80 members, or 8 m tiles (128 columns, one Hadamard block) x 128 members (blocks of an
++// expert's members cut from its first: k12_blocks_kernel).
++template <int MATS_, int MT_, int NW_, int PM_, int PKT_, int PS_, bool WS_ = false, int PW_ = 0>
++struct Cfg {
++    static constexpr int MATS = MATS_, MT = MT_, NW = NW_, PM = PM_, PKT = PKT_, PS = PS_, PW = PW_;
++    static constexpr bool WS = WS_;
++    static constexpr int TILES = MT * NW, TPM = TILES / MATS, NB = PM / 8, PBK = PKT * 16, PXS = PBK + 8;
++    static constexpr int TC = NW * 32, T = TC + PW * 32;      // consumer threads, all threads
++    static constexpr int X_BYTES = PM * PXS * 2, W_BYTES = TILES * PKT * 32 * 4;
++    static constexpr int STAGE_BYTES = X_BYTES + W_BYTES;
++    // ws: decoded A fragments, ASLOTS k tiles in flight, a k tile = TILES tiles x 32 lanes x 16 bytes
++    static constexpr int ASLOTS = 2, A_BYTES = WS ? ASLOTS * TILES * 512 : 0;
++    static constexpr int RD_MAX = WS ? 4 : NB;                 // ws: items of up to RD_MAX blocks run register-direct
++    static constexpr int MAIN_BYTES = PS * STAGE_BYTES + A_BYTES;
++    static constexpr int ES = TPM * 16 + 4;                   // the epilogue's fp32 row stride (exl3.cu's 132 / 260)
++    static constexpr int EP_BYTES = MATS * (PM / 2) * ES * 4;  // half the members' sums, every matrix
++    static constexpr int SMEM = MAIN_BYTES > EP_BYTES ? MAIN_BYTES : EP_BYTES;
++    static constexpr int XPIECES = PM * PBK / 8, WPIECES = TILES * PKT * 8;
++    static constexpr int XPT = (XPIECES + TC - 1) / TC;       // member-row pieces a (consumer) thread loads a stage
++    static constexpr int CTAS = 2;                             // blocks an SM (the register cap of launch bounds)
++    static_assert(PS >= 3 && PS <= 4, "a stage of lookahead needs three or four stages");
++    static_assert(PKT % 2 == 0, "two A fragment sets: an even number of k tiles a stage");
++    static_assert((TILES == 16 && PM == 64) || (TILES == 16 && PM == 80 && !WS) ||
++                      (TILES == 8 && PM == 128 && MATS == 1 && !WS),
++                  "blocks of 16 m tiles x 64 or 80 members, or 8 m tiles x 128 members");
++    static_assert(CTAS * (SMEM + 1024 + 2 * PM * 4) <= 100 * 1024, "shared memory for two blocks an SM");
++    static_assert(!WS || (PW > 0 && TILES % PW == 0), "producer warps share the tiles evenly");
++};
++
++// m tile q of block cb: its matrix and its n tile (exl3.cu prompt_tile).
++template <class C>
++__device__ __forceinline__ void tile_of(int q, int cb, int& mat, int& nt) {
++    mat = q / C::TPM;
++    nt = cb * C::TPM + q % C::TPM;
++}
++
++// This thread's cp.async pieces of a stage: member-row pieces (consumer threads) and word pieces (WT word loaders).
++template <class C, int NBA, int WT>
++struct Loads {
++    static constexpr int WPT = (C::WPIECES + WT - 1) / WT;
++    const half* xs[C::XPT];
++    uint32_t xd[C::XPT];
++    int xb[C::XPT];
++    bool xon[C::XPT];
++    const uint32_t* ws[WPT];
++    uint32_t wd[WPT];
++    bool won[WPT];
++    size_t wstep;
++
++    // xt / wt: this thread's index among the row loaders / the word loaders (-1: none; its pointers then stay inside
++    // the tensors, unused)
++    __device__ __forceinline__ void init(const Params& p, const int* xrows, int e, int cb, int xt, int wt,
++                                         uint32_t sbase) {
++        const int K = p.K, KT = K >> 4, NT = p.N >> 4;
++#pragma unroll
++        for (int j = 0; j < C::XPT; ++j) {
++            const int idx = (xt < 0 ? 0 : xt) + j * C::TC, i = idx / (C::PBK / 8), part = idx % (C::PBK / 8);
++            const bool in = xt >= 0 && idx < C::XPIECES;
++            const int r = in ? xrows[i] : -1;
++            xs[j] = p.x + (size_t)(r < 0 ? 0 : r) * K + part * 8;
++            xb[j] = r >= 0 ? 16 : 0;                             // rows past the count: zeros (exl3.cu's)
++            xon[j] = in && i < NBA * 8;                         // rows no mma reads are not loaded
++            xd[j] = sbase + (uint32_t)(i * C::PXS + part * 8) * 2;
++        }
++#pragma unroll
++        for (int j = 0; j < WPT; ++j) {
++            const int idx = (wt < 0 ? 0 : wt) + j * WT, q = idx / (C::PKT * 8), kk = (idx / 8) % C::PKT, part = idx % 8;
++            won[j] = wt >= 0 && idx < C::WPIECES;
++            int mat, nt;
++            tile_of<C>(won[j] ? q : 0, cb, mat, nt);
++            ws[j] = (mat ? p.t1 : p.t0) + (((size_t)e * KT + kk) * NT + nt) * 32 + part * 4;
++            wd[j] = sbase + C::X_BYTES + (uint32_t)((q * C::PKT + kk) * 32 + part * 4) * 4;
++        }
++        wstep = (size_t)C::PKT * NT * 32;
++    }
++    __device__ __forceinline__ void issue_x(int c, int slot) const {
++        const uint32_t off = (uint32_t)slot * C::STAGE_BYTES;
++#pragma unroll
++        for (int j = 0; j < C::XPT; ++j)
++            if (xon[j]) cp_async16(xd[j] + off, xs[j] + (size_t)c * C::PBK, xb[j]);
++    }
++    __device__ __forceinline__ void issue_w(int c, int slot) const {
++        const uint32_t off = (uint32_t)slot * C::STAGE_BYTES;
++#pragma unroll
++        for (int j = 0; j < WPT; ++j)
++            if (won[j]) cp_async16(wd[j] + off, ws[j] + (size_t)c * wstep, 16);
++    }
++    __device__ __forceinline__ void issue(int c, int slot) const {
++        issue_x(c, slot);
++        issue_w(c, slot);
++    }
++};
++
++// Register-direct main loop: warp w holds m tiles w MT .. w MT + MT - 1 for the item's NBA 8-member column blocks.
++// acc[i][b] = the fp32 chain of m tile i, members 8b .. 8b + 7, over k tiles 0, 1, ..., K/16 - 1 (exl3.cu's). Run by
++// the TC consumer threads (all of a register-direct block; in a warp-specialised block, its small items, while the
++// producer warps wait at the epilogue's barrier): stage turns on barrier 0, or 6 among the consumers.
++template <class C, int NBA>
++__device__ __forceinline__ void mainloop_rd(const Params& p, const int* xrows, int e, int cb, unsigned char* smem,
++                                            float (&acc)[C::MT][NBA][4]) {
++    constexpr int MT = C::MT, PKT = C::PKT, PS = C::PS, PXS = C::PXS, NP = (NBA + 1) / 2;
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int chunks = p.K / C::PBK;
++    const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem);
++    const uint32_t m = p.mask;
++    auto stage_sync = [] {
++        if constexpr (C::WS) bar_sync<6, C::TC>(); else __syncthreads();
++    };
++
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int b = 0; b < NBA; ++b)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][b][c] = 0.f;
++
++    Loads<C, NBA, C::TC> ld;
++    ld.init(p, xrows, e, cb, tid, tid, sbase);
++#pragma unroll
++    for (int s = 0; s < PS - 1; ++s) {
++        if (s < chunks) ld.issue(s, s);
++        cp_async_commit();
++    }
++    // per-lane offsets: ldmatrix rows (members) and columns (k), this warp's words and the lane - 1 word
++    const uint32_t xlane = (uint32_t)((((lane & 7) + ((lane >> 4) & 1) * 8) * PXS + ((lane >> 3) & 1) * 8) * 2);
++    const uint32_t wl0 = (uint32_t)(C::X_BYTES + (warp * MT * PKT * 32 + lane) * 4);
++    const uint32_t wl1 = (uint32_t)(C::X_BYTES + (warp * MT * PKT * 32 + ((lane + 31) & 31)) * 4);
++
++    cp_async_wait<PS - 2>();
++    stage_sync();                                      // stage 0
++    uint32_t A[2][MT][4];
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++        decode_a(lds32(sbase + wl0 + i * PKT * 128), lds32(sbase + wl1 + i * PKT * 128), m, A[0][i]);
++
++    uint32_t sc = sbase, sn = sbase + C::STAGE_BYTES;  // this stage's and the next stage's buffers
++    int fill = PS - 1;                                 // the buffer the next load goes to
++    for (int c = 0; c < chunks; ++c) {
++        cp_async_wait<PS - 3>();                       // stage c + 1 landed: its first words decode in this one
++        stage_sync();                                  // and every warp is past stage c - 1
++        if (c + PS - 1 < chunks) ld.issue(c + PS - 1, fill);
++        cp_async_commit();
++        fill = fill + 1 == PS ? 0 : fill + 1;
++        const uint32_t xs = sc + xlane;
++#pragma unroll
++        for (int kk = 0; kk < PKT; ++kk) {
++            // the next k tile's A set (free since the previous k tile's mma) decodes while this one's mma issue
++            const int cur = kk & 1, nxt = cur ^ 1;
++            const uint32_t src = kk + 1 < PKT ? sc + (uint32_t)((kk + 1) * 128) : sn;   // the next k tile's words
++#pragma unroll
++            for (int i = 0; i < MT; ++i)
++                decode_a(lds32(src + wl0 + i * PKT * 128), lds32(src + wl1 + i * PKT * 128), m, A[nxt][i]);
++#pragma unroll
++            for (int jp = 0; jp < NP; ++jp) {
++                const uint32_t xa = xs + (uint32_t)((jp * 16 * PXS + kk * 16) * 2);
++                if (2 * jp + 1 < NBA) {
++                    uint32_t r[4];
++                    ldsm_x4(r, xa);
++#pragma unroll
++                    for (int i = 0; i < MT; ++i) {
++                        mma16816(acc[i][2 * jp], A[cur][i], r[0], r[1]);
++                        mma16816(acc[i][2 * jp + 1], A[cur][i], r[2], r[3]);
++                    }
++                } else {
++                    uint32_t r[2];
++                    ldsm_x2(r, xa);
++#pragma unroll
++                    for (int i = 0; i < MT; ++i) mma16816(acc[i][2 * jp], A[cur][i], r[0], r[1]);
++                }
++            }
++        }
++        sc = sn;
++        sn = sn + C::STAGE_BYTES == sbase + PS * C::STAGE_BYTES ? sbase : sn + C::STAGE_BYTES;
++    }
++}
++
++// Warp-specialised main loop. Producer warps (tid >= TC) load the words and decode each k tile's TILES tiles once
++// into A slots (lane-major 16-byte fragments); consumer warps load the member rows and run the mma, reading their
++// fragments with one 16-byte load a tile. Each side turns its own stages (barrier 5: producers, 6: consumers); slot
++// s of the A ring: barrier 1 + s full (producers arrive, consumers wait), 3 + s free (consumers arrive, producers
++// wait). A k tile's fragments are the decode_a values the register-direct loop feeds the same mma, so the same bits.
++template <class C, int NBA>
++__device__ __forceinline__ void mainloop_ws(const Params& p, const int* xrows, int e, int cb, unsigned char* smem,
++                                            float (&acc)[C::MT][NBA][4]) {
++    constexpr int MT = C::MT, PKT = C::PKT, PS = C::PS, PXS = C::PXS, NP = (NBA + 1) / 2;
++    constexpr int TPW = C::TILES / C::PW;              // tiles a producer warp decodes a k tile
++    constexpr int SLOT = C::TILES * 512, T = C::T, TP = C::PW * 32, TC = C::TC;
++    static_assert(C::ASLOTS == 2, "two A slots: k tile k uses slot k & 1 (an even PKT keeps it kk & 1)");
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const bool producer = tid >= TC;
++    const int chunks = p.K / C::PBK, ksteps = chunks * PKT;
++    const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem);
++    const uint32_t abase = sbase + PS * C::STAGE_BYTES;
++    const uint32_t m = p.mask;
++
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int b = 0; b < NBA; ++b)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][b][c] = 0.f;
++
++    Loads<C, NBA, TP> ld;
++    ld.init(p, xrows, e, cb, producer ? -1 : tid, producer ? tid - TC : -1, sbase);
++    if (producer) {
++#pragma unroll
++        for (int s = 0; s < PS - 1; ++s) {
++            if (s < chunks) ld.issue_w(s, s);
++            cp_async_commit();
++        }
++        const int pw = warp - C::NW;
++        const uint32_t wl0 = (uint32_t)(C::X_BYTES + (pw * TPW * PKT * 32 + lane) * 4);
++        const uint32_t wl1 = (uint32_t)(C::X_BYTES + (pw * TPW * PKT * 32 + ((lane + 31) & 31)) * 4);
++        const uint32_t al = abase + (uint32_t)((pw * TPW * 32 + lane) * 16);
++        int sb = 0;
++        for (int c = 0; c < chunks; ++c) {
++            cp_async_wait<PS - 2>();                   // stage c's words (this thread's pieces)
++            bar_sync<5, TP>();                         // every producer's pieces; every producer past stage c - 1
++            if (c + PS - 1 < chunks) ld.issue_w(c + PS - 1, sb == 0 ? PS - 1 : sb - 1);
++            cp_async_commit();
++            const uint32_t wc = sbase + (uint32_t)sb * C::STAGE_BYTES;
++#pragma unroll
++            for (int kk = 0; kk < PKT; ++kk) {
++                const int s = kk & 1;
++                uint32_t w[TPW], q[TPW];
++#pragma unroll
++                for (int i = 0; i < TPW; ++i) {
++                    w[i] = lds32(wc + wl0 + (uint32_t)((i * PKT + kk) * 128));
++                    q[i] = lds32(wc + wl1 + (uint32_t)((i * PKT + kk) * 128));
++                }
++                if (c * PKT + kk >= 2) {               // slot s held k tile k - 2: wait until it is read
++                    if (s) bar_sync<4, T>(); else bar_sync<3, T>();
++                }
++#pragma unroll
++                for (int i = 0; i < TPW; ++i) {
++                    uint32_t a[4];
++                    decode_a(w[i], q[i], m, a);
++                    sts128(al + (uint32_t)(s * SLOT + i * 512), a[0], a[1], a[2], a[3]);
++                }
++                if (s) bar_arrive<2, T>(); else bar_arrive<1, T>();
++            }
++            sb = sb + 1 == PS ? 0 : sb + 1;
++        }
++    } else {
++#pragma unroll
++        for (int s = 0; s < PS - 1; ++s) {
++            if (s < chunks) ld.issue_x(s, s);
++            cp_async_commit();
++        }
++        const uint32_t xlane = (uint32_t)((((lane & 7) + ((lane >> 4) & 1) * 8) * PXS + ((lane >> 3) & 1) * 8) * 2);
++        const uint32_t al = abase + (uint32_t)((warp * MT * 32 + lane) * 16);
++        int sb = 0;
++        for (int c = 0; c < chunks; ++c) {
++            cp_async_wait<PS - 2>();                   // stage c's member rows
++            bar_sync<6, TC>();
++            if (c + PS - 1 < chunks) ld.issue_x(c + PS - 1, sb == 0 ? PS - 1 : sb - 1);
++            cp_async_commit();
++            const uint32_t xs = sbase + (uint32_t)sb * C::STAGE_BYTES + xlane;
++#pragma unroll
++            for (int kk = 0; kk < PKT; ++kk) {
++                const int s = kk & 1;
++                if (s) bar_sync<2, T>(); else bar_sync<1, T>();   // slot s holds k tile c PKT + kk
++                uint32_t a[MT][4];
++#pragma unroll
++                for (int i = 0; i < MT; ++i) {
++                    const uint4 v = lds128(al + (uint32_t)(s * SLOT + i * 512));
++                    a[i][0] = v.x; a[i][1] = v.y; a[i][2] = v.z; a[i][3] = v.w;
++                }
++                if (c * PKT + kk + 2 < ksteps) {       // fragments in registers: slot s is free for k tile + 2
++                    if (s) bar_arrive<4, T>(); else bar_arrive<3, T>();
++                }
++#pragma unroll
++                for (int jp = 0; jp < NP; ++jp) {
++                    const uint32_t xa = xs + (uint32_t)((jp * 16 * PXS + kk * 16) * 2);
++                    if (2 * jp + 1 < NBA) {
++                        uint32_t r[4];
++                        ldsm_x4(r, xa);
++#pragma unroll
++                        for (int i = 0; i < MT; ++i) {
++                            mma16816(acc[i][2 * jp], a[i], r[0], r[1]);
++                            mma16816(acc[i][2 * jp + 1], a[i], r[2], r[3]);
++                        }
++                    } else {
++                        uint32_t r[2];
++                        ldsm_x2(r, xa);
++#pragma unroll
++                        for (int i = 0; i < MT; ++i) mma16816(acc[i][2 * jp], a[i], r[0], r[1]);
++                    }
++                }
++            }
++            sb = sb + 1 == PS ? 0 : sb + 1;
++        }
++    }
++}
++
++// The item's main loop, then every thread of the block past it (the stages become the epilogue's rows). A
++// warp-specialised block runs items of up to RD_MAX column blocks register-direct (decode-bound: all eight warps
++// decode), its producer warps idle until the epilogue.
++template <class C, int NBA>
++__device__ __forceinline__ void mainloop(const Params& p, const int* xrows, int e, int cb, unsigned char* smem,
++                                         float (&acc)[C::MT][NBA][4]) {
++    if constexpr (C::WS && NBA > C::RD_MAX)
++        mainloop_ws<C, NBA>(p, xrows, e, cb, smem, acc);
++    else if ((int)threadIdx.x < C::TC)
++        mainloop_rd<C, NBA>(p, xrows, e, cb, smem, acc);
++    cp_async_wait<0>();
++    __syncthreads();
++}
++
++// acc (this warp's m tiles, the 8-member blocks of half hf) -> E[member - PM / 2 hf][col], exl3.cu prompt_spill's
++// places; col0: this warp's first column within E's columns.
++template <class C, int NBA>
++__device__ __forceinline__ void spill(float* E, int ES, int col0, const float (&acc)[C::MT][NBA][4], int hf) {
++    constexpr int HB = C::NB / 2;
++    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++#pragma unroll
++    for (int i = 0; i < C::MT; ++i)
++#pragma unroll
++        for (int q = 0; q < HB; ++q) {
++            const int nb = hf * HB + q;
++            if (nb < NBA) {
++                const int tok = q * 8 + 2 * t, col = col0 + i * 16 + g;
++                E[(size_t)tok * ES + col] = acc[i][nb][0];
++                E[(size_t)(tok + 1) * ES + col] = acc[i][nb][1];
++                E[(size_t)tok * ES + col + 8] = acc[i][nb][2];
++                E[(size_t)(tok + 1) * ES + col + 8] = acc[i][nb][3];
++            }
++        }
++}
++
++// Gate/up of one item (exl3.cu prompt_gateup_kernel's epilogue): Xd[pair][cb 128 ..] = fp16 of the down input
++// rotation of GLM's limited SwiGLU of the rotated, scaled gate and up sums. Consumer warps spill, every warp of the
++// block works rows.
++template <class C, int NBA>
++__device__ __forceinline__ void gateup_item(const Params& p, int e, int cb, int cnt, const int* pairs,
++                                            const int* xrows, unsigned char* smem) {
++    constexpr int PH = C::PM / 2, NWALL = C::T / 32;
++    static_assert(C::MATS == 2, "a gate/up block holds both matrices (a one-matrix block: gateup_c2_item)");
++    float acc[C::MT][NBA][4];
++    mainloop<C, NBA>(p, xrows, e, cb, smem, acc);
++    float* Eg = reinterpret_cast<float*>(smem);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const bool consumer = (int)threadIdx.x < C::TC;
++    int mat, nt;
++    tile_of<C>(consumer ? warp * C::MT : 0, cb, mat, nt);
++    const int col0 = (nt - cb * C::TPM) * 16;
++    const int N = p.N, n = cb * 128 + 4 * lane;
++    float sg[4], su[4], sd[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        sg[j] = __half2float(p.svh_g[(size_t)e * N + n + j]);
++        su[j] = __half2float(p.svh_u[(size_t)e * N + n + j]);
++        sd[j] = __half2float(p.suh_d[(size_t)e * N + n + j]);
++    }
++    const float limit = p.limit;
++#pragma unroll
++    for (int hf = 0; hf < 2; ++hf) {
++        if (hf * PH >= cnt) break;
++        if (hf) __syncthreads();                       // the first half's rows are read
++        if (consumer) spill<C, NBA>(Eg + (size_t)mat * PH * C::ES, C::ES, col0, acc, hf);
++        __syncthreads();
++        for (int i = warp; i < PH && hf * PH + i < cnt; i += NWALL) {
++            const int pr = pairs[hf * PH + i];
++            float gv[4], uv[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                gv[j] = Eg[(size_t)i * C::ES + 4 * lane + j];
++                uv[j] = Eg[(size_t)(PH + i) * C::ES + 4 * lane + j];
++            }
++            fwht128(gv, lane);
++            fwht128(uv, lane);
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float gg = fminf(bf16r(gv[j] * HAD_SCALE * sg[j]), limit);
++                float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * su[j]), -limit), limit);
++                float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                v[j] = act * sd[j];
++            }
++            fwht128(v, lane);
++            const half2 o01 = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++            const half2 o23 = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++            uint2 packed;
++            packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++            packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++            *reinterpret_cast<uint2*>(p.xd + (size_t)pr * N + n) = packed;
++        }
++    }
++}
++
++// Down of one item (exl3.cu prompt_down_kernel's epilogue): Y[pair][the block's columns] fp32 = the rotated sums x
++// svh, a 128-column Hadamard block at a time (two a 256-column block, one a 128-column block).
++template <class C, int NBA>
++__device__ __forceinline__ void down_item(const Params& p, int e, int cb, int cnt, const int* pairs,
++                                          unsigned char* smem) {
++    constexpr int PH = C::PM / 2, NWALL = C::T / 32, NBLK = C::TPM * 16 / 128, COLS = C::TPM * 16;
++    float acc[C::MT][NBA][4];
++    mainloop<C, NBA>(p, pairs, e, cb, smem, acc);
++    float* Ed = reinterpret_cast<float*>(smem);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const bool consumer = (int)threadIdx.x < C::TC;
++    const int D = p.N;
++    float sv[NBLK][4];
++#pragma unroll
++    for (int blk = 0; blk < NBLK; ++blk) {
++        const uint2 s = *reinterpret_cast<const uint2*>(p.svh_d + (size_t)e * D + cb * COLS + blk * 128 + 4 * lane);
++        const half2 s01 = *reinterpret_cast<const half2*>(&s.x), s23 = *reinterpret_cast<const half2*>(&s.y);
++        sv[blk][0] = __low2float(s01);
++        sv[blk][1] = __high2float(s01);
++        sv[blk][2] = __low2float(s23);
++        sv[blk][3] = __high2float(s23);
++    }
++#pragma unroll
++    for (int hf = 0; hf < 2; ++hf) {
++        if (hf * PH >= cnt) break;
++        if (hf) __syncthreads();
++        if (consumer) spill<C, NBA>(Ed, C::ES, warp * C::MT * 16, acc, hf);
++        __syncthreads();
++        for (int i = warp; i < PH && hf * PH + i < cnt; i += NWALL) {
++            const int pr = pairs[hf * PH + i];
++#pragma unroll
++            for (int blk = 0; blk < NBLK; ++blk) {
++                const int n = cb * COLS + blk * 128 + 4 * lane;
++                float v[4];
++#pragma unroll
++                for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * C::ES + blk * 128 + 4 * lane + j];
++                fwht128(v, lane);
++                *reinterpret_cast<float4*>(p.y + (size_t)pr * D + n) =
++                    make_float4(v[0] * HAD_SCALE * sv[blk][0], v[1] * HAD_SCALE * sv[blk][1],
++                                v[2] * HAD_SCALE * sv[blk][2], v[3] * HAD_SCALE * sv[blk][3]);
++            }
++        }
++    }
++}
++
++// Gate/up of a 128-member block as a pair of blocks in a cluster (k12_gateup_c2_kernel): rank 0 holds the gate's
++// 128 columns of the block's Hadamard block, rank 1 the up's, each for all 128 members (one decoded tile feeds 16
++// mma). The epilogue, a half (64 members) at a time: each rank spills its sums, then works half the half's rows,
++// reading the gate row from rank 0's shared memory and the up row from rank 1's (distributed shared memory), with
++// exl3.cu's formulas: the same values in, the same arithmetic, the same bits.
++template <class C, int NBA>
++__device__ __forceinline__ void gateup_c2_item(const Params& p, int e, int cb, int cnt, int rank, const int* pairs,
++                                               const int* xrows, unsigned char* smem) {
++    constexpr int PH = C::PM / 2, ES = C::ES, RH = PH / 2;
++    float acc[C::MT][NBA][4];
++    mainloop<C, NBA>(p, xrows, e, cb, smem, acc);
++    cg::cluster_group cl = cg::this_cluster();
++    float* Eown = reinterpret_cast<float*>(smem);
++    const float* Eg = cl.map_shared_rank(Eown, 0);
++    const float* Eu = cl.map_shared_rank(Eown, 1);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int N = p.N, n = cb * 128 + 4 * lane;
++    float sg[4], su[4], sd[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        sg[j] = __half2float(p.svh_g[(size_t)e * N + n + j]);
++        su[j] = __half2float(p.svh_u[(size_t)e * N + n + j]);
++        sd[j] = __half2float(p.suh_d[(size_t)e * N + n + j]);
++    }
++    const float limit = p.limit;
++#pragma unroll
++    for (int hf = 0; hf < 2; ++hf) {
++        if (hf * PH >= cnt) break;                     // both ranks: the same count, the same cluster barriers
++        if (hf) cl.sync();                             // the partner has read this block's first half
++        spill<C, NBA>(Eown, ES, warp * C::MT * 16, acc, hf);
++        cl.sync();                                     // both ranks' sums of this half are in place
++        for (int i = rank * RH + warp; i < (rank + 1) * RH && hf * PH + i < cnt; i += C::NW) {
++            const int pr = pairs[hf * PH + i];
++            float gv[4], uv[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                gv[j] = Eg[(size_t)i * ES + 4 * lane + j];
++                uv[j] = Eu[(size_t)i * ES + 4 * lane + j];
++            }
++            fwht128(gv, lane);
++            fwht128(uv, lane);
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float gg = fminf(bf16r(gv[j] * HAD_SCALE * sg[j]), limit);
++                float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * su[j]), -limit), limit);
++                float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                v[j] = act * sd[j];
++            }
++            fwht128(v, lane);
++            const half2 o01 = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++            const half2 o23 = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++            uint2 packed;
++            packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++            packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++            *reinterpret_cast<uint2*>(p.xd + (size_t)pr * N + n) = packed;
++        }
++    }
++    cl.sync();                                         // the partner has read this block's last half: exit
++}
++
++// The item of this block (exl3.cu's grid: x = column block, y = launch slot); false: nothing to do.
++template <class C>
++__device__ __forceinline__ bool item_of(const Params& p, int& e, int& first, int& cnt) {
++    if ((int)blockIdx.y >= p.counts[0]) return false;
++    const int item = p.order ? p.order[blockIdx.y] : (int)blockIdx.y;
++    if (item < 0) return false;                        // the order leaves the shared expert's items out
++    e = p.items[3 * item];
++    first = p.items[3 * item + 1];
++    cnt = p.items[3 * item + 2];
++    return e < p.E;                                    // the shared expert
++}
++
++// The item's main loop and epilogue compiled for its number of 8-member column blocks (1 .. NB).
++#define K12_CASES(CALL)                                                                                           \
++    if constexpr (C::NB == 16) {                                                                                  \
++        switch ((cnt + 7) >> 3) {                                                                                 \
++            case 1: CALL(1); break;                                                                               \
++            case 2: CALL(2); break;                                                                               \
++            case 3: CALL(3); break;                                                                               \
++            case 4: CALL(4); break;                                                                               \
++            case 5: CALL(5); break;                                                                               \
++            case 6: CALL(6); break;                                                                               \
++            case 7: CALL(7); break;                                                                               \
++            case 8: CALL(8); break;                                                                               \
++            case 9: CALL(9); break;                                                                               \
++            case 10: CALL(10); break;                                                                             \
++            case 11: CALL(11); break;                                                                             \
++            case 12: CALL(12); break;                                                                             \
++            case 13: CALL(13); break;                                                                             \
++            case 14: CALL(14); break;                                                                             \
++            case 15: CALL(15); break;                                                                             \
++            default: CALL(16); break;                                                                             \
++        }                                                                                                         \
++    } else if constexpr (C::NB == 10) {                                                                           \
++        switch ((cnt + 7) >> 3) {                                                                                 \
++            case 1: CALL(1); break;                                                                               \
++            case 2: CALL(2); break;                                                                               \
++            case 3: CALL(3); break;                                                                               \
++            case 4: CALL(4); break;                                                                               \
++            case 5: CALL(5); break;                                                                               \
++            case 6: CALL(6); break;                                                                               \
++            case 7: CALL(7); break;                                                                               \
++            case 8: CALL(8); break;                                                                               \
++            case 9: CALL(9); break;                                                                               \
++            default: CALL(10); break;                                                                             \
++        }                                                                                                         \
++    } else {                                                                                                      \
++        static_assert(C::NB == 8, "8, 10 or 16 column blocks");                                                   \
++        switch ((cnt + 7) >> 3) {                                                                                 \
++            case 1: CALL(1); break;                                                                               \
++            case 2: CALL(2); break;                                                                               \
++            case 3: CALL(3); break;                                                                               \
++            case 4: CALL(4); break;                                                                               \
++            case 5: CALL(5); break;                                                                               \
++            case 6: CALL(6); break;                                                                               \
++            case 7: CALL(7); break;                                                                               \
++            default: CALL(8); break;                                                                              \
++        }                                                                                                         \
++    }
++
++template <class C>
++__global__ void __launch_bounds__(C::T, C::CTAS) k12_gateup_kernel(const Params p) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ int pairs_sh[C::PM], xrows_sh[C::PM];
++    int e, first, cnt;
++    if (!item_of<C>(p, e, first, cnt)) return;
++    if ((int)threadIdx.x < C::PM) {
++        const int q = (int)threadIdx.x < cnt ? p.members[first + threadIdx.x] : -1;
++        pairs_sh[threadIdx.x] = q;
++        xrows_sh[threadIdx.x] = q < 0 ? -1 : q / p.slots;
++    }
++    __syncthreads();
++    const int cb = blockIdx.x;
++#define K12_GU(NBA_) gateup_item<C, NBA_>(p, e, cb, cnt, pairs_sh, xrows_sh, smem)
++    K12_CASES(K12_GU)
++#undef K12_GU
++}
++
++template <class C>
++__global__ void __launch_bounds__(C::T, C::CTAS) k12_down_kernel(const Params p) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ int pairs_sh[C::PM];
++    int e, first, cnt;
++    if (!item_of<C>(p, e, first, cnt)) return;
++    if ((int)threadIdx.x < C::PM) pairs_sh[threadIdx.x] = (int)threadIdx.x < cnt ? p.members[first + threadIdx.x] : -1;
++    __syncthreads();
++    const int cb = blockIdx.x;
++#define K12_DN(NBA_) down_item<C, NBA_>(p, e, cb, cnt, pairs_sh, smem)
++    K12_CASES(K12_DN)
++#undef K12_DN
++}
++
++// Gate/up of 128-member blocks: grid (2 x N / 128, blocks), a cluster of the two blocks of one column block (x = 2 cb
++// + rank: rank 0 the gate's 8 m tiles, rank 1 the up's). Both blocks of a cluster read the same list slot, so they
++// return together or run together.
++template <class C>
++__global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(C::T, C::CTAS) k12_gateup_c2_kernel(const Params p) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ int pairs_sh[C::PM], xrows_sh[C::PM];
++    int e, first, cnt;
++    if (!item_of<C>(p, e, first, cnt)) return;
++    if ((int)threadIdx.x < C::PM) {
++        const int q = (int)threadIdx.x < cnt ? p.members[first + threadIdx.x] : -1;
++        pairs_sh[threadIdx.x] = q;
++        xrows_sh[threadIdx.x] = q < 0 ? -1 : q / p.slots;
++    }
++    __syncthreads();
++    const int rank = (int)(blockIdx.x & 1), cb = (int)(blockIdx.x >> 1);
++    Params q = p;
++    q.t0 = rank ? p.t1 : p.t0;                         // this block's matrix
++#define K12_GU2(NBA_) gateup_c2_item<C, NBA_>(q, e, cb, cnt, rank, pairs_sh, xrows_sh, smem)
++    K12_CASES(K12_GU2)
++#undef K12_GU2
++}
++
++// Blocks of up to BM members (80 or 128) from a 64-member plan, in plan order: each expert's member range (its items
++// are consecutive, its members contiguous) cut from its first member, blocks[b] = (expert, first member, count),
++// bcount[0] = the routed blocks (the shared expert's items, the plan's last, left out); the same blocks as a plan of
++// BM-member items. One block of 1024 threads.
++__global__ void __launch_bounds__(1024) k12_blocks_kernel(const int* __restrict__ items,
++                                                          const int* __restrict__ counts, int* __restrict__ blocks,
++                                                          int* __restrict__ bcount, int cap, int E, int BM) {
++    __shared__ int wsum[32];
++    __shared__ int routed;
++    const int all = min(counts[0], cap);
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    if (tid == 0) routed = 0;
++    __syncthreads();
++    for (int i = tid; i < all; i += 1024)              // items are in expert order: the routed ones come first
++        if (items[3 * i] < E && (i + 1 == all || items[3 * (i + 1)] >= E)) routed = i + 1;
++    __syncthreads();
++    const int n = routed;
++    const int per = (n + 1023) / 1024;
++    const int lo = min(n, tid * per), hi = min(n, lo + per);
++    // an expert's run of items starts at i: its members, and its blocks
++    auto members_from = [&](int i) {
++        const int e = items[3 * i];
++        int c = 0;
++        for (int j = i; j < n && items[3 * j] == e; ++j) c += items[3 * j + 2];
++        return c;
++    };
++    auto starts_run = [&](int i) { return i == 0 || items[3 * (i - 1)] != items[3 * i]; };
++    int nb = 0;
++    for (int i = lo; i < hi; ++i)
++        if (starts_run(i)) nb += (members_from(i) + BM - 1) / BM;
++    int c = nb;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, c, o);
++        if (lane >= o) c += u;
++    }
++    if (lane == 31) wsum[warp] = c;
++    __syncthreads();
++    if (warp == 0) {
++        int w = wsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, w, o);
++            if (lane >= o) w += u;
++        }
++        wsum[lane] = w;
++    }
++    __syncthreads();
++    int b = (warp ? wsum[warp - 1] : 0) + c - nb;      // blocks before lo
++    for (int i = lo; i < hi; ++i) {
++        if (!starts_run(i)) continue;
++        const int e = items[3 * i], first = items[3 * i + 1], m = members_from(i);
++        for (int j = 0; j * BM < m; ++j, ++b) {
++            blocks[3 * b] = e;
++            blocks[3 * b + 1] = first + j * BM;
++            blocks[3 * b + 2] = min(BM, m - j * BM);
++        }
++    }
++    if (tid == 0) bcount[0] = wsum[31];
++}
++
++// exl3.cu prompt_order_kernel (the same launch order: single-item and multi-item experts' items merged evenly).
++__global__ void __launch_bounds__(1024) k12_order_kernel(const int* __restrict__ items,
++                                                         const int* __restrict__ counts, int* __restrict__ order,
++                                                         int cap, int E) {
++    __shared__ int wsum[32];
++    __shared__ int routed;
++    const int all = min(counts[0], cap);
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    if (tid == 0) routed = 0;
++    __syncthreads();
++    for (int i = tid; i < all; i += 1024)
++        if (items[3 * i] < E && (i + 1 == all || items[3 * (i + 1)] >= E)) routed = i + 1;
++    __syncthreads();
++    const int n = routed;
++    const int per = (n + 1023) / 1024;
++    const int lo = min(n, tid * per), hi = min(n, lo + per);
++    auto heavy = [&](int i) {
++        const int e = items[3 * i];
++        return (i > 0 && items[3 * (i - 1)] == e) || (i + 1 < n && items[3 * (i + 1)] == e);
++    };
++    int h = 0;
++    for (int i = lo; i < hi; ++i) h += heavy(i);
++    int v = h;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, v, o);
++        if (lane >= o) v += u;
++    }
++    if (lane == 31) wsum[warp] = v;
++    __syncthreads();
++    if (warp == 0) {
++        int w = wsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, w, o);
++            if (lane >= o) w += u;
++        }
++        wsum[lane] = w;
++    }
++    __syncthreads();
++    const int nh = wsum[31], nl = n - nh;
++    int rh = (warp ? wsum[warp - 1] : 0) + v - h;
++    for (int i = lo; i < hi; ++i) {
++        if (heavy(i)) {
++            const int r = rh++;
++            const long long X = (2LL * r + 1) * nl;
++            const int cl = X > nh ? (int)min((long long)nl, (X - nh + 2LL * nh - 1) / (2LL * nh)) : 0;
++            order[r + cl] = i;
++        } else {
++            const int l = i - rh;
++            const long long Y = (2LL * l + 1) * nh;
++            const int ch = Y >= nl ? (int)min((long long)nh, (Y - nl) / (2LL * nl) + 1) : 0;
++            order[l + ch] = i;
++        }
++    }
++    for (int i = n + tid; i < all; i += 1024) order[i] = -1;
++}
++
++// The configurations (exl3_k12.py CONFIGS), a (gate/up, down) pair of kernels each:
++//   0 k12      register-direct, four stages               1 k12-s3  register-direct, three stages
++//   2 k12-ws   warp-specialised (8 consumer + 2 producer warps), three stages
++//   3 k12-m128 128-member blocks: gate/up as cluster pairs (8 m tiles of one matrix x 128 members), down 128 x 128
++//   4 k12-g128 the 128-member gate/up, k12's down          5 k12-d128 k12's gate/up, the 128-member down
++//   6 k12-p80  k12's blocks (16 m tiles, 2 a warp) on blocks of up to 80 members: one block for an expert of up to
++//              80 rows (no 1-16-member remainder item), a decoded tile feeds up to 10 mma
++using GuRd4 = Cfg<2, 2, 8, 64, 2, 4>;
++using DnRd4 = Cfg<1, 2, 8, 64, 2, 4>;
++using GuRd3 = Cfg<2, 2, 8, 64, 2, 3>;
++using DnRd3 = Cfg<1, 2, 8, 64, 2, 3>;
++using GuWs3 = Cfg<2, 2, 8, 64, 2, 3, true, 2>;
++using DnWs3 = Cfg<1, 2, 8, 64, 2, 3, true, 2>;
++using Gu128 = Cfg<1, 1, 8, 128, 2, 3>;
++using Dn128 = Cfg<1, 1, 8, 128, 2, 3>;
++using GuP80 = Cfg<2, 2, 8, 80, 2, 4>;
++using DnP80 = Cfg<1, 2, 8, 80, 2, 4>;
++
++template <class G>
++void launch_gu(const Params& p, int64_t N, int64_t slots_y, cudaStream_t stream) {
++    static bool once = [] {
++        cudaFuncSetAttribute(k12_gateup_kernel<G>, cudaFuncAttributeMaxDynamicSharedMemorySize, G::SMEM);
++        return true;
++    }();
++    (void)once;
++    k12_gateup_kernel<G><<<dim3((unsigned)(N / 128), (unsigned)slots_y), G::T, G::SMEM, stream>>>(p);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template <class G>
++void launch_gu_c2(const Params& p, int64_t N, int64_t slots_y, cudaStream_t stream) {
++    static bool once = [] {
++        cudaFuncSetAttribute(k12_gateup_c2_kernel<G>, cudaFuncAttributeMaxDynamicSharedMemorySize, G::SMEM);
++        return true;
++    }();
++    (void)once;
++    k12_gateup_c2_kernel<G><<<dim3((unsigned)(2 * N / 128), (unsigned)slots_y), G::T, G::SMEM, stream>>>(p);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template <class Dn>
++void launch_dn(const Params& p, int64_t D, int64_t slots_y, cudaStream_t stream) {
++    static bool once = [] {
++        cudaFuncSetAttribute(k12_down_kernel<Dn>, cudaFuncAttributeMaxDynamicSharedMemorySize, Dn::SMEM);
++        return true;
++    }();
++    (void)once;
++    k12_down_kernel<Dn><<<dim3((unsigned)(D / (Dn::TPM * 16)), (unsigned)slots_y), Dn::T, Dn::SMEM, stream>>>(p);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++int64_t exl3_k12_configs() { return 7; }
++
++// Xd [pairs, N] and Y [pairs, D] of a prompt plan's routed pairs, exl3.cu exl3_prompt_cuda's outputs for shared rows
++// (xh = the rotated rows, one a token) and 64-member items. blk_buf (configurations 3-6): int32, at least
++// 4 max_items + 2: the blocks (128 members, or 80 for 6), their count and their launch order.
++void exl3_k12_prompt_cuda(const at::Tensor& xh, const at::Tensor& tg, const at::Tensor& tu, const at::Tensor& td,
++                          const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
++                          const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d,
++                          const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D, int64_t N, int64_t E,
++                          int64_t max_items, double limit, int64_t slots, const c10::optional<at::Tensor>& order_buf,
++                          const c10::optional<at::Tensor>& blk_buf, int64_t cfg) {
++    TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % 32 == 0 && N % 32 == 0 && N >= 64,
++                "k12: D a multiple of 256, N of 128");
++    TORCH_CHECK(cfg >= 0 && cfg < exl3_k12_configs(), "k12: configuration 0 to 6, not ", cfg);
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const bool gu_blk = cfg == 3 || cfg == 4 || cfg == 6, dn_blk = cfg == 3 || cfg == 5 || cfg == 6;  // on blocks
++    const int BM = cfg == 6 ? 80 : 128;
++    auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
++    auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
++    Params gu{h(xh), w(tg), w(tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(), nullptr,
++              h(svh_g), h(svh_u), h(suh_d), h(svh_d), reinterpret_cast<half*>(xd.data_ptr()), y.data_ptr<float>(),
++              (int)D, (int)N, (int)E, (int)slots, (float)limit, MCG_MASK};
++    Params blk = gu;                                   // the same, reading the 128-member blocks
++    if (!gu_blk || !dn_blk) {                          // a kernel on the plan's items: their launch order
++        if (order_buf.has_value()) {
++            TORCH_CHECK(order_buf->numel() >= max_items, "k12: order buffer too small");
++            int* o = order_buf->data_ptr<int>();
++            k12_order_kernel<<<1, 1024, 0, stream>>>(items.data_ptr<int>(), counts.data_ptr<int>(), o,
++                                                     (int)max_items, (int)E);
++            C10_CUDA_KERNEL_LAUNCH_CHECK();
++            gu.order = o;
++        }
++    }
++    if (gu_blk || dn_blk) {
++        TORCH_CHECK(blk_buf.has_value() && blk_buf->scalar_type() == at::kInt && blk_buf->is_contiguous() &&
++                        blk_buf->numel() >= 4 * max_items + 2, "k12: blocks buffer of 4 max_items + 2 int32");
++        int* b = blk_buf->data_ptr<int>();
++        int* bcount = b + 3 * max_items;
++        k12_blocks_kernel<<<1, 1024, 0, stream>>>(items.data_ptr<int>(), counts.data_ptr<int>(), b, bcount,
++                                                  (int)max_items, (int)E, BM);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        blk.items = b;
++        blk.counts = bcount;
++        blk.order = nullptr;
++        if (order_buf.has_value()) {                   // the same launch order rule over the blocks
++            int* bo = bcount + 2;
++            k12_order_kernel<<<1, 1024, 0, stream>>>(b, bcount, bo, (int)max_items, (int)E);
++            C10_CUDA_KERNEL_LAUNCH_CHECK();
++            blk.order = bo;
++        }
++    }
++    auto down = [&](Params p) {
++        p.x = reinterpret_cast<const half*>(xd.data_ptr());
++        p.t0 = p.t1 = w(td);
++        p.K = (int)N;
++        p.N = (int)D;
++        return p;
++    };
++    switch (cfg) {
++        case 0: launch_gu<GuRd4>(gu, N, max_items, stream); launch_dn<DnRd4>(down(gu), D, max_items, stream); break;
++        case 1: launch_gu<GuRd3>(gu, N, max_items, stream); launch_dn<DnRd3>(down(gu), D, max_items, stream); break;
++        case 2: launch_gu<GuWs3>(gu, N, max_items, stream); launch_dn<DnWs3>(down(gu), D, max_items, stream); break;
++        case 3: launch_gu_c2<Gu128>(blk, N, max_items, stream); launch_dn<Dn128>(down(blk), D, max_items, stream); break;
++        case 4: launch_gu_c2<Gu128>(blk, N, max_items, stream); launch_dn<DnRd4>(down(gu), D, max_items, stream); break;
++        case 5: launch_gu<GuRd4>(gu, N, max_items, stream); launch_dn<Dn128>(down(blk), D, max_items, stream); break;
++        default: launch_gu<GuP80>(blk, N, max_items, stream); launch_dn<DnP80>(down(blk), D, max_items, stream); break;
++    }
++}
+diff --git tensorfold/families/glm5_next/cuda/exl3_k12.py tensorfold/families/glm5_next/cuda/exl3_k12.py
+new file mode 100644
+index 0000000..37e5d74
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_k12.py
+@@ -0,0 +1,117 @@
++"""K12 prompt kernels for GLM's routed EXL3 experts (TF_GLM_EXPERT_PROMPT_KERNEL=k12..., exl3_k12.cu): exl3.cu's
++prompt kernels' bits (the same items, blocks, fp32 chains and epilogue formulas) with a main loop built to keep the
++tensor pipe fed (one basic block a stage, compiled for the item's 8-member column blocks; the next k tile's decode
++between the current k tile's mma; the neighbour word from shared memory; the codebook mask in a register).
++
++Settings:
++- TF_GLM_EXPERT_PROMPT_KERNEL: unset / ``0`` (off: exl3.cu's prompt kernels);
++  - ``k12``: register-direct (every warp decodes its own tiles), four cp.async stages;
++  - ``k12-s3``: the same, three stages;
++  - ``k12-ws``: warp-specialised: two producer warps decode each k tile's 16 tiles once into shared memory, eight
++    consumer warps only load fragments and run the mma (items of up to 32 members run register-direct);
++  - ``k12-m128``: blocks of up to 128 members (an expert's items paired), so a decoded tile feeds up to 16 mma: gate
++    and up as a cluster of two blocks (8 m tiles of one matrix each, the epilogue's rows exchanged through
++    distributed shared memory), down in 128-column x 128-member blocks; ``k12-g128`` / ``k12-d128``: only the gate/up
++    / only the down kernel of k12-m128 (the other k12's);
++  - ``k12-p80``: k12's kernels on blocks of up to 80 members (an expert of up to 80 rows in one block, no small
++    remainder item; a decoded tile feeds up to 10 mma);
++  all exact: every output has the prompt kernels' bits (the same fp32 chain of mma over the ascending k tiles, the
++  same epilogue arithmetic). Values of other kernels (not starting with ``k12``) are left to them.
++
++Used for prompt windows (64-member plans) of layers whose experts share one gate/up suh (one rotated row a token),
++4-bit trellis words [E, K/16, N/16, 32], D % 256 == 0 and NI % 128 == 0; anything else keeps exl3.cu's kernels."""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++SETTING = "TF_GLM_EXPERT_PROMPT_KERNEL"
++# name -> configuration index of exl3_k12.cu (exl3_k12_prompt_cuda's cfg)
++CONFIGS = {"k12": 0, "k12-s3": 1, "k12-ws": 2, "k12-m128": 3, "k12-g128": 4, "k12-d128": 5, "k12-p80": 6}
++BLOCKS = (3, 4, 5, 6)               # configurations on blocks of 128 or 80 members (a scratch of 4 max_items + 2 int32)
++
++
++def setting(value: str | None = None) -> int | None:
++    """The K12 configuration TF_GLM_EXPERT_PROMPT_KERNEL names, or None (off, or another kernel's value)."""
++
++    v = (os.environ.get(SETTING, "") if value is None else value).strip().lower()
++    if not v.startswith("k12"):
++        return None
++    if v not in CONFIGS:
++        raise ValueError(f"{SETTING}: K12 configurations are {', '.join(CONFIGS)}; not {v!r}")
++    return CONFIGS[v]
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_exl3_k12_v1", sources=[str(here / "exl3_k12.cpp"), str(here / "exl3_k12.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++_NOTES: set[str] = set()
++
++
++def note(msg: str) -> None:
++    """One line a process for each distinct message (the setting in use, or why a layer keeps exl3.cu's kernels)."""
++
++    if msg not in _NOTES:
++        _NOTES.add(msg)
++        print(f"[tensorfold] {SETTING}={os.environ.get(SETTING, '')}: {msg}", flush=True)
++
++
++def unused_reason(ex, D: int, NI: int, shx: bool, tile: int) -> str | None:
++    """None when the K12 kernels take this prompt window, else why exl3.cu's prompt kernels run it."""
++
++    if not shx:
++        return "exl3.cu's prompt kernels for this layer (its rows are not rotated once a token: TF_GLM_EXL3_ROWROT=0 " \
++               "or experts without one shared gate/up suh)"
++    if tile != 64:
++        return f"exl3.cu's prompt kernels (plans of {tile} members, TF_GLM_EXL3_PASS; K12 takes 64)"
++    if not supported(ex, D, NI):
++        return f"exl3.cu's prompt kernels for this layer (D {D}, width {NI} or the trellis layout not supported)"
++    return None
++
++
++def supported(ex, D: int, NI: int) -> bool:
++    """Shapes and layout the K12 kernels take (else the caller keeps exl3.cu's prompt kernels)."""
++
++    if ex.shared_suh is None or D % 256 or NI % 128 or NI < 128:
++        return False
++    E = ex.count
++    for t, k, n in ((ex.gt, D, NI), (ex.ut, D, NI), (ex.dt, NI, D)):
++        if t.dtype != torch.int32 or tuple(t.shape) != (E, k // 16, n // 16, 32) or not t.is_contiguous():
++            return False
++    return all(s.dtype == torch.float16 and s.is_contiguous() for s in (ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d))
++
++
++def routed(x: torch.Tensor, plan, ex, s, y: torch.Tensor, R: int, limit: float, cfg: int) -> None:
++    """Xd (s.xd) and Y (fp32 [pairs, D]) of a 64-member prompt plan's routed pairs from the normed bf16 rows x [R, D]:
++    the rows rotated once (exl3.cu rot_rows into s.xg), then the K12 gate/up and down kernels."""
++
++    from tensorfold.cuda import experts as grouped
++
++    from .exl3_mm import _ext as _exl3_ext
++    from .exl3_mm import item_order
++
++    if plan.tile != 64:
++        raise ValueError(f"K12 takes 64-member prompt plans, not {plan.tile}")
++    D, NI = ex.dims, ex.width
++    cap = grouped.max_items(R * s.slots, plan.experts, plan.tile)
++    blocks = None
++    if cfg in BLOCKS:                                # kept on the Scratch, grown to the largest window's bound
++        blocks = getattr(s, "k12_blocks", None)
++        if blocks is None or blocks.numel() < 4 * cap + 2:
++            full = grouped.max_items(s.rows * s.slots, plan.experts, plan.tile)
++            blocks = torch.zeros((4 * max(cap, full) + 2,), dtype=torch.int32, device=s.xg.device)
++            s.k12_blocks = blocks
++    _exl3_ext().rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
++    _ext().prompt(s.xg[:R], ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u, ex.suh_d,
++                  ex.svh_d, s.xd, y, D, NI, ex.count, cap, float(limit), s.slots, s.order if item_order() else None,
++                  blocks, cfg)
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index d5abc3a..570392d 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -204,6 +204,30 @@ def prompt_pass() -> int:
+     return value
+ 
+ 
++@lru_cache(maxsize=1)
++def _dump_counts_path() -> str:
++    """TF_GLM_DUMP_COUNTS=<path>: a diagnostic (off by default). Every prompt window's routed call appends one line
++    to <path>.<pid>: its rows, then each expert's member count (the routing histogram the expert kernels see;
++    tests/K13/bench_k13.py --replay runs those calls). It syncs the GPU each call: for one-off dumps only."""
++
++    return os.environ.get("TF_GLM_DUMP_COUNTS", "")
++
++
++def _dump_counts(pick: torch.Tensor, R: int, E: int) -> None:
++    counts = torch.bincount(pick[:R].reshape(-1).long(), minlength=E + 1)[:E].tolist()   # the shared id E left out
++    with open(f"{_dump_counts_path()}.{os.getpid()}", "a") as f:
++        f.write(f"{R} " + " ".join(map(str, counts)) + "\n")
++
++
++@lru_cache(maxsize=1)
++def _k12_config():
++    """TF_GLM_EXPERT_PROMPT_KERNEL's K12 configuration (exl3_k12.setting), read once a process."""
++
++    from . import exl3_k12
++
++    return exl3_k12.setting()
++
++
+ def prompt_stages() -> int:
+     """The prompt kernels' cp.async pipeline depth: 3 (GB10's), or a launch table's ``exl3_prompt`` entry "all"
+     (TF_GLM_TUNE): 2 to 4, loads only, the same bits."""
+@@ -251,10 +275,23 @@ class Scratch:
+         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
+                                 dtype=torch.int32, device=device)
+         self.rows, self.slots = rows, slots
++        if prompt and _k12_config() is not None:     # TF_GLM_EXPERT_PROMPT_KERNEL read (and checked) at start
++            from . import exl3_k12
++            exl3_k12.note("K12 prompt expert kernels (exact: the prompt kernels' bits)")
+         # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
+         self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
+ 
+ 
++@lru_cache(maxsize=1)
++def _k1_config() -> tuple[int, bool] | None:
++    """TF_GLM_EXPERT_PROMPT_KERNEL (exl3_k1.py): the K1 prompt kernels' (configuration, int8 gate/up), or None (off,
++    the default)."""
++
++    from . import exl3_k1
++
++    return exl3_k1.setting()
++
++
+ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Experts, s: Scratch, y: torch.Tensor,
+            R: int, limit: float) -> None:
+     """Y[row * slots + slot] (fp32) for rows 0..R-1's routed slots, from normed bf16 x and ``experts.route``'s plan."""
+@@ -263,7 +300,24 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+     slots, P = s.slots, s.rows * s.slots
+     D, NI = ex.dims, ex.width
+     if plan.tile in (64, 128):                       # a prompt window: the Y^T kernels, an item a pass
++        if _dump_counts_path():                      # TF_GLM_DUMP_COUNTS: the call's per-expert member counts
++            _dump_counts(pick, R, ex.count)
+         shx = ex.shared_suh is not None and row_rotation()
++        k1 = _k1_config() if shx else None
++        if k1 is not None:                           # TF_GLM_EXPERT_PROMPT_KERNEL (exl3_k1.py)
++            from . import exl3_k1
++
++            if exl3_k1.supported(ex, D, NI):
++                exl3_k1.routed(x, plan, ex, s, y, R, limit, k1)
++                return
++        k12 = _k12_config()
++        if k12 is not None:                          # TF_GLM_EXPERT_PROMPT_KERNEL=k12... (exl3_k12.py): the same bits
++            from . import exl3_k12
++            why = exl3_k12.unused_reason(ex, D, NI, shx, plan.tile)
++            if why is None:
++                exl3_k12.routed(x, plan, ex, s, y, R, limit, k12)
++                return
++            exl3_k12.note(why)
+         if shx:                                      # one rotated input a row, read by all its pairs' gate and up
+             ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
+             xg = xu = s.xg

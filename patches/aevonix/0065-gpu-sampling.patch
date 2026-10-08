@@ -1,0 +1,552 @@
+0065-gpu-sampling: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: cuda/gpu_sample.cpp, cuda/gpu_sample.cu, cuda/gpu_sample.py, families/glm5_next/cuda/decode.py, families/glm5_next/cuda/multi.py, families/glm5_next/cuda/multi_tune.py.
+
+diff --git tensorfold/cuda/gpu_sample.cpp tensorfold/cuda/gpu_sample.cpp
+new file mode 100644
+index 0000000..0de1290
+--- /dev/null
++++ tensorfold/cuda/gpu_sample.cpp
+@@ -0,0 +1,23 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void gpu_sample_rows_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, at::Tensor&, int64_t);
++
++// got: all-gathered candidate packs (fp32, contiguous; rank q's part at q * rank_stride); table [rows, 9] int64
++// (gpu_sample.py builds it); out [rows, 2] int32 (token, certified).
++void sample_rows(const at::Tensor& got, int64_t rank_stride, int64_t world, const at::Tensor& table, at::Tensor out,
++                 int64_t rows) {
++    TORCH_CHECK(got.is_cuda() && got.scalar_type() == at::kFloat && got.is_contiguous(), "sample_rows: got fp32");
++    TORCH_CHECK(table.is_cuda() && table.scalar_type() == at::kLong && table.is_contiguous() && table.dim() == 2 &&
++                table.size(1) == 9 && table.size(0) >= rows, "sample_rows: table [rows, 9] int64");
++    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kInt && out.is_contiguous() && out.numel() >= 2 * rows,
++                "sample_rows: out [rows, 2] int32");
++    TORCH_CHECK(world >= 1 && rank_stride >= 0 && (world == 1 || got.numel() >= world * rank_stride),
++                "sample_rows: world / rank stride");
++    c10::cuda::CUDAGuard guard(got.device());
++    gpu_sample_rows_cuda(got, rank_stride, world, table, out, rows);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("sample_rows", &sample_rows);
++}
+diff --git tensorfold/cuda/gpu_sample.cu tensorfold/cuda/gpu_sample.cu
+new file mode 100644
+index 0000000..320eba9
+--- /dev/null
++++ tensorfold/cuda/gpu_sample.cu
+@@ -0,0 +1,149 @@
++// The keyed top-k draw (tensorfold.engine.exact_sampling.choose_rows) and the greedy pick on the GPU, certified.
++//
++// Everything that decides a token is either exact on the GPU or certified by a margin:
++//   exact: the merge of every rank's candidates by (value descending, id ascending), the top-k cut, the scaling
++//     value / max(T, 1e-6) (IEEE double division), the splitmix64 uniform of (seed, position, id) (integer mixing, an
++//     exact product by 2^-53 and one rounded add), the min_p threshold (one double add) and its comparisons;
++//   certified: the two decisions that go through log / exp, which the host computes with numpy's float64 functions
++//     and the GPU with CUDA's (each within a few ulps of the exact value, not always the same ulp): the argmax of
++//     scaled - log(-log(u)) is taken only when the best score leads the next by more than 2 x DS x max(1, |scores|)
++//     (DS = 2^-40, far above the difference of two few-ulp logs), and the top_p cut only when no cumulative
++//     probability lies within DP = 2^-34 of top_p. A row that misses either margin (or holds a NaN) is flagged
++//     uncertain and the host draws it with the exact host rule; a flagged row's token is never used.
++// So a certified token equals the host rule's token bit for bit, and every other token comes from the host rule.
++//
++// Layout: candidates of rank q for row r are got[q * rank_stride + off_r + j] (values, fp32) and
++// got[q * rank_stride + off_r + n_r + j] (token ids, int32 bits), j < n_r: the all-gathered pack the samplers build.
++// table [rows, COLS] int64: off, n, mode (0 greedy, 1 keyed top-k), top_k (0: all), seed, position, then the bits of
++// the doubles max(T, 1e-6), top_p, ln(min_p) (-inf: off). out [rows, 2] int32: token, certified (1) or not (0).
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cstdint>
++#include <math_constants.h>
++
++namespace {
++
++constexpr int COLS = 9;
++constexpr int MAXC = 1024;          // candidates a row (world x n)
++constexpr int THREADS = 256;
++constexpr double DS = 0x1.0p-40;    // score margin (relative)
++constexpr double DP = 0x1.0p-34;    // top_p margin (absolute)
++
++__device__ __forceinline__ unsigned long long mix(unsigned long long x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++
++// exact_sampling.uniform: (seed, position, id) -> a double in (0, 1], the same bits
++__device__ __forceinline__ double keyed_uniform(unsigned long long seed, long long position, long long id) {
++    unsigned long long x = mix(seed + 0x9E3779B97F4A7C15ull);
++    x = mix(x ^ ((unsigned long long)position * 0xD1B54A32D192ED03ull));
++    x = mix(x ^ (unsigned long long)id);
++    return __dadd_rn(__dmul_rn((double)(x >> 11), 0x1.0p-53), 0x1.0p-54);
++}
++
++__global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __restrict__ got, long long rank_stride,
++                                                             int world, const long long* __restrict__ table,
++                                                             int* __restrict__ out) {
++    const int r = blockIdx.x;
++    const long long* t = table + (size_t)r * COLS;
++    const long long off = t[0];
++    const int n = (int)t[1], mode = (int)t[2], top_k = (int)t[3];
++    const unsigned long long seed = (unsigned long long)t[4];
++    const long long position = t[5];
++    const double temp = __longlong_as_double(t[6]), top_p = __longlong_as_double(t[7]);
++    const double min_log = __longlong_as_double(t[8]);
++    const int W = world * n;
++    __shared__ float sv[MAXC];
++    __shared__ int sid[MAXC];
++    __shared__ float ov[MAXC];
++    __shared__ int oid[MAXC];
++    __shared__ double sc[MAXC];
++    __shared__ double score[MAXC];
++    __shared__ int bad;
++    if (threadIdx.x == 0) bad = (W < 1 || W > MAXC);
++    __syncthreads();
++    if (bad) {
++        if (threadIdx.x == 0) { out[2 * r] = -1; out[2 * r + 1] = 0; }
++        return;
++    }
++    for (int i = threadIdx.x; i < W; i += blockDim.x) {
++        const int q = i / n, j = i % n;
++        const float* base = got + (size_t)q * rank_stride + off;
++        sv[i] = base[j];
++        sid[i] = __float_as_int(base[n + j]);
++    }
++    __syncthreads();
++    // np.lexsort((ids, -values)): value descending (IEEE order, -0 == +0), then id ascending; ids are distinct
++    for (int i = threadIdx.x; i < W; i += blockDim.x) {
++        const float v = sv[i];
++        const int id = sid[i];
++        if (v != v) bad = 1;                                   // NaN: the host rule decides
++        int rank = 0;
++        for (int j = 0; j < W; ++j) {
++            const float u = sv[j];
++            rank += (u > v) || (u == v && sid[j] < id);
++        }
++        if (rank < W) { ov[rank] = v; oid[rank] = id; }
++    }
++    __syncthreads();
++    if (mode == 0) {                                           // greedy: the first in that order
++        if (threadIdx.x == 0) { out[2 * r] = oid[0]; out[2 * r + 1] = bad ? 0 : 1; }
++        return;
++    }
++    const int k = max(1, min(top_k > 0 ? top_k : W, W));
++    for (int i = threadIdx.x; i < k; i += blockDim.x) {
++        const double s = __ddiv_rn((double)ov[i], temp);
++        sc[i] = s;
++        score[i] = __dsub_rn(s, log(-log(keyed_uniform(seed, position, (long long)oid[i]))));
++    }
++    __syncthreads();
++    if (threadIdx.x != 0) return;
++    int certain = !bad;
++    int keep = k;
++    if (top_p > 0.0 && top_p < 1.0) {                          // (cumsum(probs) < top_p).sum() + 1
++        const double top = sc[0];
++        double sum = 0.0;
++        for (int i = 0; i < k; ++i) sum += exp(sc[i] - top);
++        double cum = 0.0;
++        int below = 0;
++        for (int i = 0; i < k; ++i) {
++            cum += exp(sc[i] - top) / sum;
++            if (fabs(cum - top_p) <= DP) certain = 0;
++            below += cum < top_p;
++        }
++        keep = below + 1;
++    }
++    const double thr = __dadd_rn(sc[0], min_log);             // min_p off: -inf, nothing below it
++    int best = -1;
++    double s1 = -CUDART_INF, s2 = -CUDART_INF;
++    for (int i = 0; i < k && i < keep; ++i) {
++        if (sc[i] < thr) continue;
++        const double s = score[i];
++        if (best < 0 || s > s1) { s2 = s1; s1 = s; best = i; }
++        else if (s > s2) s2 = s;
++    }
++    if (best < 0) { best = 0; certain = 0; }
++    if (!isfinite(s1)) certain = 0;
++    if (s2 > -CUDART_INF) {
++        const double scale = fmax(1.0, fmax(fabs(s1), fabs(s2)));
++        if (!(s1 - s2 > 2.0 * DS * scale)) certain = 0;
++    }
++    out[2 * r] = oid[best];
++    out[2 * r + 1] = certain;
++}
++
++}  // namespace
++
++void gpu_sample_rows_cuda(const at::Tensor& got, int64_t rank_stride, int64_t world, const at::Tensor& table,
++                          at::Tensor& out, int64_t rows) {
++    if (rows <= 0) return;
++    sample_rows_kernel<<<(unsigned)rows, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
++        got.data_ptr<float>(), (long long)rank_stride, (int)world,
++        reinterpret_cast<const long long*>(table.data_ptr<int64_t>()), out.data_ptr<int>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/cuda/gpu_sample.py tensorfold/cuda/gpu_sample.py
+new file mode 100644
+index 0000000..453b782
+--- /dev/null
++++ tensorfold/cuda/gpu_sample.py
+@@ -0,0 +1,256 @@
++"""Keyed top-k draws and greedy picks on the GPU with the host rule's tokens (TENSORFOLD_GPU_SAMPLE).
++
++The samplers all-gather every rank's top candidates (``top_k + MARGIN`` values and ids a row) and draw on the host
++(``exact_sampling.choose_rows``, or the first of value descending, id ascending for greedy rows): a pageable copy of
++the whole pack and numpy work every round. Here the GPU draws from the gathered pack where it lies (``gpu_sample.cu``)
++and only the tokens come back, in one small pinned copy:
++
++- exact on the GPU: the merge by (value descending, id ascending), the top-k cut, value / max(T, 1e-6), the keyed
++  uniform (splitmix64 of seed, position and id), the min_p threshold and its comparisons;
++- certified: the two decisions that go through log / exp (numpy's float64 functions on the host, CUDA's here, both
++  within a few ulps but not always the same ulp): the argmax is taken only when the best score leads the next by more
++  than 2^-39 x max(1, |scores|), the top_p cut only when no cumulative probability is within 2^-34 of top_p.
++A row that misses a margin (in practice almost never: it needs a near tie at 1e-12) is drawn on the host by the host
++rule from its own candidates, so every token equals today's for the same seed. Rows with top_k off (the nucleus rule)
++and callers that need the draft probabilities keep the host path.
++
++TENSORFOLD_GPU_SAMPLE unset or 1: on, after a check at the first call (random candidate packs, every certified token
++compared with the host rule; any difference turns it off for the process, with a line); 0: off.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors)."""
++
++from __future__ import annotations
++
++import math
++import os
++import struct
++from functools import lru_cache
++from pathlib import Path
++from typing import Callable, Sequence
++
++import numpy as np
++import torch
++
++COLS = 9
++MAXC = 1024                         # candidates a row the kernel takes (ranks x per-rank candidates)
++_state: dict = {"decided": None}
++_pinned: dict = {}
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_gpu_sample_v1", sources=[str(here / "gpu_sample.cpp"), str(here / "gpu_sample.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def wanted() -> bool:
++    v = (os.environ.get("TENSORFOLD_GPU_SAMPLE", "") or "1").strip().lower()
++    if v not in ("0", "1", "on", "off"):
++        raise ValueError(f"TENSORFOLD_GPU_SAMPLE: 1 (on) or 0 (off), not {v!r}")
++    return v in ("1", "on")
++
++
++def reset() -> None:
++    """Forget the decision (tests)."""
++    _state["decided"] = None
++
++
++def _buf(name: str, shape: tuple, dtype, device=None) -> torch.Tensor:
++    """A cached pinned host buffer (device None) or device buffer of at least ``shape``."""
++
++    key = (name, dtype, str(device))
++    t = _pinned.get(key)
++    n = int(np.prod(shape))
++    if t is None or t.numel() < n:
++        t = torch.empty((max(n, 64),), dtype=dtype, device=device, pin_memory=device is None)
++        _pinned[key] = t
++    return t[:n].view(shape)
++
++
++def table(specs: Sequence[tuple]) -> np.ndarray:
++    """specs [(offset, n, sampling or None, position)] -> the kernel's int64 table [rows, COLS]."""
++
++    rows = len(specs)
++    t = np.zeros((rows, COLS), dtype=np.int64)
++    d = np.zeros((rows, 3), dtype=np.float64)
++    for i, (off, n, s, pos) in enumerate(specs):
++        greedy = s is None or s.temperature <= 0
++        t[i, 0], t[i, 1], t[i, 2] = int(off), int(n), 0 if greedy else 1
++        if not greedy:
++            t[i, 3] = int(s.top_k)
++            t[i, 4] = np.uint64(int(s.seed) & 0xFFFFFFFFFFFFFFFF).view(np.int64)
++            t[i, 5] = int(pos)
++            d[i] = (max(float(s.temperature), 1e-6), float(s.top_p), float(s.min_log))
++        else:
++            d[i] = (1.0, 1.0, -math.inf)
++    t[:, 6:9] = d.view(np.int64)
++    return t
++
++
++def _bits(x: float) -> int:
++    return struct.unpack("<q", struct.pack("<d", float(x)))[0]
++
++
++def table_parts(parts: Sequence[tuple]) -> np.ndarray:
++    """``table`` for parts [(offset, rows, n, positions, sampling)] (row r of a part at offset + r x 2n), built a
++    part at a time: the rows of a part share everything but their offsets and positions."""
++
++    sizes = [int(R) for _, R, _, _, _ in parts]
++    consts = np.zeros((len(parts), COLS), dtype=np.int64)
++    offs, poss = [], []
++    for j, (off, R, n, positions, s) in enumerate(parts):
++        greedy = s is None or s.temperature <= 0
++        if greedy:
++            consts[j] = (0, n, 0, 0, 0, 0, _bits(1.0), _bits(1.0), _bits(-math.inf))
++            poss.append(np.zeros(R, dtype=np.int64))
++        else:
++            seed = int(s.seed) & 0xFFFFFFFFFFFFFFFF
++            consts[j] = (0, n, 1, int(s.top_k), seed - (1 << 64) if seed >= 1 << 63 else seed, 0,
++                         _bits(max(float(s.temperature), 1e-6)), _bits(float(s.top_p)), _bits(float(s.min_log)))
++            poss.append(np.asarray(list(positions)[:R], dtype=np.int64))
++        offs.append(int(off) + 2 * int(n) * np.arange(R, dtype=np.int64))
++    t = np.repeat(consts, sizes, axis=0)
++    if len(t):
++        t[:, 0] = np.concatenate(offs)
++        t[:, 5] = np.concatenate(poss)
++    return t
++
++
++def run(got: torch.Tensor, rank_stride: int, world: int, specs: Sequence[tuple]) -> tuple[np.ndarray, np.ndarray]:
++    """The kernel on a gathered pack for rows ``specs`` [(offset, n, sampling, position)]: (tokens int64 [rows],
++    certified bool [rows])."""
++
++    return launch(got, rank_stride, world, table(specs))
++
++
++def launch(got: torch.Tensor, rank_stride: int, world: int, tab: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    """The kernel on a gathered pack for the rows of table ``tab``; one pinned upload of the table, one pinned
++    readback, waited for on an event."""
++
++    rows = int(tab.shape[0])
++    dev = got.device
++    host_t = _buf("table", (rows, COLS), torch.int64)
++    host_t.numpy()[:] = tab
++    dev_t = _buf("table", (rows, COLS), torch.int64, dev)
++    dev_t.copy_(host_t, non_blocking=True)
++    out = _buf("out", (rows, 2), torch.int32, dev)
++    _ext().sample_rows(got.contiguous().view(-1), int(rank_stride), int(world), dev_t, out, rows)
++    host_o = _buf("out", (rows, 2), torch.int32)
++    host_o.copy_(out, non_blocking=True)
++    ev = torch.cuda.Event()
++    ev.record()
++    ev.synchronize()
++    o = host_o.numpy()
++    return o[:, 0].astype(np.int64), o[:, 1] != 0
++
++
++def host_rows(got_rows: np.ndarray, n: int, world: int, positions: Sequence[int], s) -> list[int]:
++    """The host rule on gathered packs [world, R, 2n] (fp32, ids as int32 bits): the samplers' own code."""
++
++    from tensorfold.engine.exact_sampling import choose_rows
++
++    g = got_rows
++    values = np.concatenate([g[q, :, :n] for q in range(world)], axis=1).astype(np.float32)
++    tokens = np.concatenate([np.ascontiguousarray(g[q, :, n:]).view(np.int32) for q in range(world)],
++                            axis=1).astype(np.int64)
++    if s is None or s.temperature <= 0:
++        order = np.lexsort((tokens, -values), axis=-1)
++        return [int(tokens[i, order[i, 0]]) for i in range(values.shape[0])]
++    return choose_rows(values, tokens, positions, s)
++
++
++def draw(got: torch.Tensor, rank_stride: int, world: int, parts: Sequence[tuple]) -> list[list[int]]:
++    """Tokens of ``parts`` [(offset of the part's first row in a rank's pack, rows, n, positions, sampling)], each row
++    at offset + row x 2n, as the host rule draws them: certified rows from the GPU, the others on the host."""
++
++    bases, at = [], 0
++    for _, R, _, _, _ in parts:
++        bases.append(at)
++        at += R
++    tokens, certain = launch(got, rank_stride, world, table_parts(parts))
++    out = [tokens[b:b + R].tolist() for b, (_, R, _, _, _) in zip(bases, parts)]
++    if certain.all():
++        return out
++    flat = got.contiguous().view(-1)
++    for p, (b, (off, R, n, positions, s)) in enumerate(zip(bases, parts)):
++        idx = [r for r in range(R) if not certain[b + r]]
++        if not idx:
++            continue
++        g = torch.stack([flat[q * rank_stride + off:q * rank_stride + off + R * 2 * n].view(R, 2 * n)
++                         for q in range(world)]).cpu().numpy()
++        sampled = s is not None and s.temperature > 0
++        redo = host_rows(g[:, idx], n, world, [positions[r] for r in idx] if sampled else [0] * len(idx), s)
++        for r, t in zip(idx, redo):
++            out[p][r] = t
++    return out
++
++
++def applies(parts: Sequence[tuple]) -> bool:
++    """Whether every part fits the kernel: keyed top-k (top_k on) or greedy rows, at most MAXC candidates a row."""
++    for _, _, n, _, s in parts:
++        if s is not None and s.temperature > 0 and not s.top_k:
++            return False
++    return True
++
++
++def enabled(world: int, n_max: int, device) -> bool:
++    """TENSORFOLD_GPU_SAMPLE and this GPU's check (run once, at the first call)."""
++
++    if not wanted():
++        return False
++    if world * n_max > MAXC:
++        return False
++    if _state["decided"] is None:
++        try:
++            ok, why = check(device)
++        except Exception as exc:  # noqa: BLE001 - no kernel here: the host draws
++            ok, why = False, f"{type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++        _state["decided"] = ok
++        print(f"[tensorfold] GPU sampling: {'on (checked against the host rule)' if ok else 'off: ' + why}",
++              flush=True)
++    return bool(_state["decided"])
++
++
++def check(device, rows: int = 512, seed: int = 7) -> tuple[bool, str]:
++    """Random gathered packs (4 ranks, 28 candidates each, many tied values) under many sampling settings: every
++    certified GPU token must equal the host rule's."""
++
++    from tensorfold.engine.exact_sampling import Sampling
++
++    rng = np.random.default_rng(seed)
++    world, n = 4, 28
++    vals = rng.standard_normal((world, rows, n)).astype(np.float32) * 3
++    vals[:, ::3, :] = np.round(vals[:, ::3, :])                      # ties: whole numbers
++    vals = -np.sort(-vals, axis=2)                                   # each rank's top-k comes sorted
++    ids = np.stack([rng.permutation(1000)[:n] + 1000 * q for q in range(world) for _ in range(rows)])
++    ids = ids.reshape(world, rows, n).astype(np.int32)
++    pack = np.concatenate([vals, ids.view(np.float32)], axis=2)      # [world, rows, 2n]
++    got = torch.from_numpy(np.ascontiguousarray(pack)).to(device)
++    settings = [None, Sampling(1, 0.7, 20, 0.95), Sampling(2, 1.0, 20, 0.95), Sampling(3, 0.3, 5, 1.0),
++                Sampling(4, 1.5, 40, 0.5), Sampling(5, 1.0, 1, 0.9), Sampling(6, 1.0, 20, 0.95, 0.05),
++                Sampling(7, 1e-7, 20, 0.95), Sampling(2 ** 62 + 11, 0.8, 112, 0.99)]
++    per = rows // len(settings)
++    parts = []
++    for j, s in enumerate(settings):
++        positions = list(rng.integers(0, 1 << 20, size=per))
++        parts.append((j * per * 2 * n, per, n, positions, s))
++    flat_got = got.view(world, -1)
++    specs, expect = [], []
++    for off, R, nn, positions, s in parts:
++        g = pack.reshape(world, -1)[:, off:off + R * 2 * nn].reshape(world, R, 2 * nn)
++        expect += host_rows(g, nn, world, positions, s)
++        specs += [(off + r * 2 * nn, nn, s, positions[r]) for r in range(R)]
++    tokens, certain = run(flat_got, flat_got.shape[1], world, specs)
++    bad = [i for i in range(len(specs)) if certain[i] and int(tokens[i]) != expect[i]]
++    if bad:
++        return False, f"{len(bad)} of {len(specs)} certified tokens differ from the host rule"
++    if certain.mean() < 0.99:
++        return False, f"only {certain.mean():.3f} of the rows certified"
++    return True, ""
++
++
++__all__ = ["COLS", "MAXC", "applies", "check", "draw", "enabled", "host_rows", "launch", "run", "table", "table_parts",
++           "wanted"]
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 316cbb6..72c3e7a 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -33,13 +33,20 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+         k = min(logits.shape[1], 20 + MARGIN)       # the draft's confidence needs its competitors too
+     vals, ids = torch.topk(logits.float(), k, dim=-1)
+     ids = (ids + (w.vocab_offset if offset is None else offset)).to(torch.int32)
++    world = 1 if w.comm is None else w.world
++    gpu = probs is None and _gpu_draws(world, k, logits.device, [(0, R, k, positions, sampling)])
+     if w.comm is None:
++        if gpu:                                      # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn here
++            packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
++            return _gpu_draw(packed.view(-1), R * 2 * k, 1, [(0, R, k, list(positions), sampling)])[0]
+         values = vals.cpu().numpy().astype(np.float32)
+         tokens = ids.cpu().numpy().astype(np.int64)
+     else:
+         packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
+         got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
+         w.comm.all_gather(packed.view(-1), got)
++        if gpu:
++            return _gpu_draw(got, R * 2 * k, w.world, [(0, R, k, list(positions), sampling)])[0]
+         g = got.view(w.world, R, 2 * k).cpu()
+         values = torch.cat([g[r, :, :k] for r in range(w.world)], dim=1).numpy().astype(np.float32)
+         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w.world)], dim=1).numpy()
+@@ -54,6 +61,21 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+     return chosen
+ 
+ 
++def _gpu_draws(world: int, n: int, device, parts) -> bool:
++    """TENSORFOLD_GPU_SAMPLE (tensorfold.cuda.gpu_sample): draw these parts' rows on the GPU (keyed top-k or greedy
++    rows, the host rule's tokens; checked against the host rule at the first call)."""
++
++    from tensorfold.cuda import gpu_sample
++
++    return gpu_sample.applies(parts) and gpu_sample.enabled(world, n, device)
++
++
++def _gpu_draw(got, rank_stride: int, world: int, parts) -> list[list[int]]:
++    from tensorfold.cuda import gpu_sample
++
++    return gpu_sample.draw(got, rank_stride, world, parts)
++
++
+ def _probability(values: np.ndarray, tokens: np.ndarray, chosen: list[int], sampling: Sampling | None) -> list[float]:
+     """Return each chosen token's top-k/top-p probability, using temperature 1 for greedy draft confidence."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 2ab9825..db6b347 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -252,12 +252,22 @@ def sample_streams(w, parts: Sequence[tuple]) -> list[list[int]]:
+         layout.append((k, logits.shape[0], n))
+     if packed:
+         flat = torch.cat(packed) if len(packed) > 1 else packed[0]
+-        if w.comm is None:
+-            host = flat.view(1, -1).cpu()
+-        else:
++        world = 1 if w.comm is None else w.world
++        got = flat.contiguous()
++        if w.comm is not None:
+             got = torch.empty((w.world * flat.numel(),), dtype=torch.float32, device=flat.device)
+             w.comm.all_gather(flat.contiguous(), got)
+-            host = got.view(w.world, -1).cpu()
++        specs, at = [], 0
++        for k, R, n in layout:
++            specs.append((at, R, n, list(parts[k][1]), parts[k][2]))
++            at += R * 2 * n
++        from .decode import _gpu_draw, _gpu_draws
++
++        if _gpu_draws(world, max(n for _, _, n in layout), flat.device, specs):
++            for (k, _, _), toks in zip(layout, _gpu_draw(got, flat.numel(), world, specs)):
++                out[k] = toks                    # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn on the GPU
++            layout = []
++        host = got.view(world, -1).cpu() if layout else None
+         at = 0
+         for k, R, n in layout:
+             g = host[:, at:at + R * 2 * n].reshape(host.shape[0], R, 2 * n)
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+index 587d644..d5d523e 100644
+--- tensorfold/families/glm5_next/cuda/multi_tune.py
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -201,7 +201,16 @@ def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
+         words2 = packed.contiguous().view(torch.float32).view(-1)
+         host2 = gather(words2).reshape(-1, words2.numel()).view(torch.int64).reshape(-1, rows, 3 * count + 2)
+         host2 = host2.cpu().numpy()
+-    host1 = got1.cpu()
++    if topk:
++        from .decode import _gpu_draw, _gpu_draws
++
++        specs = [(at, R, n, list(parts[k][1]), parts[k][2]) for k, R, n, at in topk]
++        if _gpu_draws(world, max(n for _, _, n, _ in topk), got1.device, specs):
++            g1 = got1.contiguous()
++            for (k, _, _, _), toks in zip(topk, _gpu_draw(g1, g1.numel() // world, world, specs)):
++                out[k] = toks                    # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn on the GPU
++            topk = []
++    host1 = got1.cpu() if topk else None
+     for k, R, n, at in topk:
+         g = host1[:, at:at + R * 2 * n].reshape(host1.shape[0], R, 2 * n)
+         values = torch.cat([g[r, :, :n] for r in range(g.shape[0])], dim=1).numpy().astype(np.float32)

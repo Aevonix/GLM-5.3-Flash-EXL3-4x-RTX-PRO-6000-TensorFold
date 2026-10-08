@@ -1,0 +1,65 @@
+0068-glm-kept-prompt-arrays: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: families/glm5_next/cuda/multi.py.
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 7735cc1..e649ae8 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -130,6 +130,19 @@ def fill_share(value: str | None = None) -> float:
+     return share
+ 
+ 
++def _ids_array(c) -> np.ndarray:
++    """A kept prompt's ids as an int64 array, made once and kept on the snapshot (its ids never change)."""
++
++    arr = getattr(c, "ids_np", None)
++    if arr is None or len(arr) != len(c.ids):
++        arr = np.asarray(c.ids, dtype=np.int64)
++        try:
++            c.ids_np = arr
++        except AttributeError:            # a snapshot type without a free attribute slot: no cache
++            pass
++    return arr
++
++
+ def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
+     """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
+     policy its DFlash2 twin; without a draft model, serial."""
+@@ -641,7 +654,7 @@ class MultiDecoder:
+         cut = len(hit.ids) if hit is not None else 0
+         shared: list[int] = []
+         if draft and feed is None and g.shared:
+-            known = [np.asarray(c.ids, dtype=np.int64) for c in self.kept]
++            known = [_ids_array(c) for c in self.kept]
+             shared = shared_points(prompt, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
+                                    g.opener)
+         sid = self.next_sid
+@@ -756,14 +769,23 @@ class MultiDecoder:
+ 
+     def _resume(self, prompt: list[int]):
+         """The longest kept strict prefix of ``prompt``, or the whole prompt when it kept its head's logits row (a
+-        replay of an earlier prompt), whose DFlash2 window came along."""
++        replay of an earlier prompt), whose DFlash2 window came along. The prompt is compared as one int64 array
++        against each kept prompt's cached array (``_ids_array``): the same answer as comparing the id lists, without
++        copying every kept prompt's ids for every request (32 kept prompts of 100K+ tokens cost tens of ms a request)."""
+         best = None
++        arr = None
+         for c in self.kept:
+             n = len(c.ids)
+             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
+             fits = fits and not (self.grid and n % self.grid)
+             short = n < len(prompt) or (n == len(prompt) and c.head is not None)
+-            if fits and short and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
++            if not (fits and short and (best is None or n > len(best.ids))):
++                continue
++            if n and prompt[n - 1] != c.ids[-1]:              # cheap reject before the full comparison
++                continue
++            if arr is None:
++                arr = np.asarray(prompt, dtype=np.int64)
++            if np.array_equal(arr[:n], _ids_array(c)):
+                 best = c
+         return best
+ 

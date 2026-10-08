@@ -1,0 +1,19 @@
+0041-glm-parallel-ring-base: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: MiaAI-Lab's patch (GLM-5.3-Flash EXL3 recipe, Apache-2.0), first written for TensorFold 0.6.0.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: families/glm5_next/cuda/verify.py.
+
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 9bf8b95..3858103 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -148,7 +148,7 @@ class BatchedVerify:
+         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
+             g = self.graphs[R]
+             self._stage([0] * R)
+-            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
++            self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+             self._write_table([(R, 0, 0, 0, R)])
+             best = float("inf")
+             for _ in range(reps + 1):

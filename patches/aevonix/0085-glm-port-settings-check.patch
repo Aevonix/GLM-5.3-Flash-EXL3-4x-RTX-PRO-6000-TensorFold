@@ -1,0 +1,27 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index dbfe558..6ce0c88 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -675,6 +675,13 @@ class GlmEngine:
+         from . import wide as wide_mod                                # TF_GLM_MULTI_GRAPH_STEP: captures and pads
+ 
+         mine += [wide_mod.code()]
++        # the 0.6.1 port's choices: the EXL3 expert route (patch 0000: GLM's kernels or the universal route, other
++        # prompt bits) and the grouped lane matmul's mode (patch 0016: the same bits, other speed)
++        from tensorfold.cuda.kernels import qmm as shared_qmm
++        from .weights import exl3_route
++
++        mine += [int(cfg.quant == "exl3" and exl3_route(str(model_dir), rank, world) == "universal"),
++                 shared_qmm.GROUP_MODES.index(shared_qmm.GROUP_MODE)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -689,7 +696,7 @@ class GlmEngine:
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
+                                "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
+-                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP): "
++                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP, TF_GLM_EXL3_PATH, TENSORFOLD_QMM_GROUP): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")

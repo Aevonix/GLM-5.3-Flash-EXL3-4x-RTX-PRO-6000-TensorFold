@@ -1,0 +1,1033 @@
+0066-glm-priority-lanes.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
+index 62299f0..1e4846d 100644
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -97,6 +97,12 @@ class Health:
+                     extra = {}
+                 body["streams"].update(extra.pop("streams", {}))
+                 body.update(extra)
++            ranked = getattr(scheduler, "health", None)     # a scheduler's own counts (patch 0141: priority lanes)
++            if callable(ranked):
++                try:
++                    body.update(dict(ranked()))
++                except Exception:                         # noqa: BLE001  (a table changing under the read)
++                    pass
+         window = getattr(app, "effective_context_window", None)
+         if window:
+             body["context_length"] = int(window)
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index f7d4c98..629c774 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -20,6 +20,9 @@ if TYPE_CHECKING:
+     from tensorfold.cuda.server import App
+ 
+ 
++PRIORITY_HEADER = "X-Priority"          # tensorfold.cuda.priority.HEADER (patch 0141)
++
++
+ def usage_of(result: dict[str, Any]) -> dict[str, Any]:
+     """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
+ 
+@@ -121,6 +124,14 @@ def make_handler(app: App):
+                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+             except (json.JSONDecodeError, UnicodeDecodeError):
+                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
++            # patch 0141: a request's class may come as a header (X-Priority) when the body names none (priority
++            # lanes on: TENSORFOLD_PRIORITY=0 leaves the body as sent)
++            header = self.headers.get(PRIORITY_HEADER)
++            if isinstance(body, dict) and body.get("priority") is None and header and header.strip():
++                from tensorfold.cuda import priority as prio
++
++                if prio.enabled():
++                    body["priority"] = header.strip()
+             if tokenizer:                                   # vLLM's /tokenize and /detokenize
+                 try:
+                     reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)
+diff --git tensorfold/cuda/priority.py tensorfold/cuda/priority.py
+new file mode 100644
+index 0000000..ae54e75
+--- /dev/null
++++ tensorfold/cuda/priority.py
+@@ -0,0 +1,438 @@
++"""Priority lanes for concurrent CUDA engines (patch 0141): request classes, and the rules that order admission,
++prompt chunks and decode rounds by them. Pure Python (no torch): rank 0's scheduler asks, and every rule takes its
++clock as an argument, so tests drive it on a simulated clock.
++
++A request names its class with the ``priority`` field (or, when the body has none, the ``X-Priority`` header):
++``realtime`` (latency-critical, for example speech), ``interactive`` (alias ``high``: a person waiting on the
++reply), ``normal`` (``default``) or ``background`` (``low``, ``batch``), or an integer as vLLM reads its field (lower
++is sooner): 0 normal, -1 interactive, -2 or less realtime, 1 or more background. A request naming none gets
++TENSORFOLD_PRIORITY_DEFAULT (normal); session-title requests stay background, as before.
++
++What a class decides (rank 0 decides everything; the other ranks apply rank 0's messages, so nothing here reaches
++the arithmetic of any request):
++
++- admission: the waiting request of the soonest class goes first (a normal or background request moves one class
++  sooner for every TENSORFOLD_PRIORITY_ADMIT_AGE_S it has waited, up to interactive: nothing ages into realtime),
++  then arrival order. Slots are kept in tiers: TENSORFOLD_PRIORITY_RESERVE_REALTIME slots only realtime requests
++  take, TENSORFOLD_PRIORITY_RESERVE_INTERACTIVE more only realtime and interactive ones (by default one each from 4
++  and 8 slots on), each tier while a request of its class arrived within TENSORFOLD_PRIORITY_TIER_HOLD_S (a server
++  whose clients name no class keeps every slot). A tier counts only the streams of the classes it keeps out, so no
++  slot idles while its own class has room. When no slot a waiting request may take is free, the youngest decoding
++  streams of a later class that is normal or background (never realtime or interactive) give their slots back and
++  replay later, as background streams always did: exactly as many as the request needs, or none when that many
++  cannot yield; at most TENSORFOLD_PRIORITY_MAX_YIELDS times a request, and a replay waits as a new arrival.
++- prompt chunks: the filling stream that advances next is a realtime one if any (the fewest rows left first), else
++  one that has not advanced for TENSORFOLD_PRIORITY_STARVE_MS (the longest waiting first; never two such chunks in a
++  row), else the soonest class, then the fewest prompt rows left (a short prompt never waits behind a long one), then
++  admission order.
++- chunk or round: while streams decode, a prompt chunk of a sooner class than every decoding stream goes before the
++  rounds (a round still runs at least every TENSORFOLD_PRIORITY_ROUND_GAP_MS), one of a later class takes
++  TENSORFOLD_PRIORITY_DOWN_SHARE of the iterations, equal classes alternate by the engine's own share as before, and
++  a chunk of at most TENSORFOLD_PRIORITY_SHORT_ROWS rows (no later class than the decoding streams) does not wait for
++  its turn.
++- chunk size: while realtime requests arrive (within TENSORFOLD_PRIORITY_TIER_HOLD_S), a prompt chunk of a later class
++  is at most TENSORFOLD_PRIORITY_REALTIME_ROWS rows (a chunk in flight is what a realtime arrival waits for), so
++  larger prompt chunks (TF_GLM_PREFILL_ROWS) keep their speed when no realtime client is about.
++- a realtime reply's head: while a realtime stream has written fewer than TENSORFOLD_PRIORITY_REALTIME_HEAD tokens,
++  rounds hold only the realtime streams in their heads and no prompt chunk of a later class runs (unless starving),
++  so the first sentence of a latency-critical reply decodes at a lone stream's speed; the other streams wait those
++  few rounds.
++
++TENSORFOLD_PRIORITY=0 restores the scheduler as it was (arrival order, background last)."""
++
++from __future__ import annotations
++
++import itertools
++import os
++import queue
++import threading
++import time
++from dataclasses import dataclass
++from typing import Any, Callable, Mapping, Sequence
++
++REALTIME, INTERACTIVE, NORMAL, BACKGROUND = 0, 1, 2, 3
++CLASSES = ("realtime", "interactive", "normal", "background")
++NAMES = {"realtime": REALTIME, "interactive": INTERACTIVE, "high": INTERACTIVE, "normal": NORMAL, "default": NORMAL,
++         "background": BACKGROUND, "low": BACKGROUND, "batch": BACKGROUND}
++HEADER = "X-Priority"                   # read when the body has no ``priority`` field
++
++
++def _from_int(value: int) -> int:
++    return min(BACKGROUND, max(REALTIME, NORMAL + int(value)))
++
++
++def parse(value: Any, default: int = NORMAL) -> int:
++    """A request's ``priority`` (a class name, an alias or a vLLM-style integer) as a class; ``default`` when absent.
++    ValueError for anything else."""
++
++    if value is None or (isinstance(value, str) and not value.strip()):
++        return default
++    if isinstance(value, bool):
++        pass
++    elif isinstance(value, int):
++        return _from_int(value)
++    elif isinstance(value, float) and value.is_integer():
++        return _from_int(int(value))
++    elif isinstance(value, str):
++        text = value.strip().lower()
++        if text in NAMES:
++            return NAMES[text]
++        try:
++            return _from_int(int(text))
++        except ValueError:
++            pass
++    raise ValueError(f"priority: realtime, interactive (high), normal (default) or background (low, batch), or an "
++                     f"integer where lower is sooner (0 normal, -1 interactive, -2 realtime, 1 background), not "
++                     f"{value!r}")
++
++
++def name(klass: int) -> str:
++    return CLASSES[min(BACKGROUND, max(REALTIME, int(klass)))]
++
++
++def effective(klass: int, waited_s: float, age_s: float) -> int:
++    """A waiting request's class for admission: a normal or background one moves one class sooner for every
++    ``age_s`` seconds waited (0: never), up to interactive (realtime is never reached by waiting)."""
++
++    if age_s <= 0 or waited_s <= 0 or klass <= INTERACTIVE:
++        return klass
++    return max(INTERACTIVE, klass - int(waited_s // age_s))
++
++
++# -- settings ---------------------------------------------------------------------------------------------------
++def _number(env: Mapping[str, str], key: str, default: float, low: float, high: float) -> float:
++    raw = env.get(key, "").strip()
++    try:
++        value = default if raw == "" else float(raw)
++    except ValueError:
++        value = low - 1
++    if not low <= value <= high:
++        raise ValueError(f"{key}: a number from {low:g} to {high:g}, not {raw!r}")
++    return value
++
++
++@dataclass(frozen=True)
++class Settings:
++    """The priority rules' settings (TENSORFOLD_PRIORITY_*; ``from_env``)."""
++
++    # each field's setting is TENSORFOLD_PRIORITY_<NAME> (the module docstring); -1 reserves: by --parallel
++    enabled: bool = True                # TENSORFOLD_PRIORITY: 0 restores the order as before
++    default: int = NORMAL               # _DEFAULT: the class of a request that names none
++    reserve_rt: int = -1                # _RESERVE_REALTIME: slots only realtime takes (auto: 1 from 4 slots)
++    reserve_int: int = -1               # _RESERVE_INTERACTIVE: more for realtime and interactive (auto: 1 from 8)
++    starve_s: float = 2.0               # _STARVE_MS: a filling stream this long without a chunk goes first
++    round_gap_s: float = 1.0            # _ROUND_GAP_MS: decoding streams get a round at least this often
++    short_rows: int = 256               # _SHORT_ROWS: a chunk this short does not wait for its turn (0: off)
++    down_share: float = 0.25            # _DOWN_SHARE: iterations a later class's chunk takes while sooner decode
++    up_share: float = 1.0               # _UP_SHARE: iterations a sooner class's chunk takes while later decode
++    admit_age_s: float = 10.0           # _ADMIT_AGE_S: seconds waited that move a request one class sooner
++    max_yields: int = 2                 # _MAX_YIELDS: times one request may give its slot back
++    tier_hold_s: float = 900.0          # _TIER_HOLD_S: a tier holds while its class arrived this recently
++    rt_head: int = 32                   # _REALTIME_HEAD: a realtime reply's tokens decoded in rounds of its own
++    rt_rows: int = 2048                 # _REALTIME_ROWS: later classes' chunk rows while realtime arrives (0: off)
++
++    @classmethod
++    def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
++        env = os.environ if env is None else env
++        on = env.get("TENSORFOLD_PRIORITY", "").strip() or "1"
++        if on not in ("0", "1"):
++            raise ValueError(f"TENSORFOLD_PRIORITY: 0 or 1, not {on!r}")
++        if on == "0":                                 # off: the other settings are not read
++            return cls(enabled=False)
++        default = parse(env.get("TENSORFOLD_PRIORITY_DEFAULT", ""), NORMAL)
++
++        def slots(key: str) -> int:
++            raw = env.get(key, "").strip().lower()
++            if raw in ("", "auto"):
++                return -1
++            if raw.isdecimal() and int(raw) <= 31:
++                return int(raw)
++            raise ValueError(f"{key}: auto or 0 to 31 slots, not {raw!r}")
++
++        return cls(enabled=on == "1", default=default, reserve_rt=slots("TENSORFOLD_PRIORITY_RESERVE_REALTIME"),
++                   reserve_int=slots("TENSORFOLD_PRIORITY_RESERVE_INTERACTIVE"),
++                   starve_s=_number(env, "TENSORFOLD_PRIORITY_STARVE_MS", 2000, 50, 600000) / 1000.0,
++                   round_gap_s=_number(env, "TENSORFOLD_PRIORITY_ROUND_GAP_MS", 1000, 20, 600000) / 1000.0,
++                   short_rows=int(_number(env, "TENSORFOLD_PRIORITY_SHORT_ROWS", 256, 0, 65536)),
++                   down_share=_number(env, "TENSORFOLD_PRIORITY_DOWN_SHARE", 0.25, 0.01, 1.0),
++                   up_share=_number(env, "TENSORFOLD_PRIORITY_UP_SHARE", 1.0, 0.01, 1.0),
++                   admit_age_s=_number(env, "TENSORFOLD_PRIORITY_ADMIT_AGE_S", 10, 0, 86400),
++                   max_yields=int(_number(env, "TENSORFOLD_PRIORITY_MAX_YIELDS", 2, 0, 100)),
++                   tier_hold_s=_number(env, "TENSORFOLD_PRIORITY_TIER_HOLD_S", 900, 0, 31536000),
++                   rt_head=int(_number(env, "TENSORFOLD_PRIORITY_REALTIME_HEAD", 32, 0, 1 << 20)),
++                   rt_rows=int(_number(env, "TENSORFOLD_PRIORITY_REALTIME_ROWS", 2048, 0, 1 << 20)))
++
++    def tiers(self, max_streams: int, active: tuple[bool, bool] = (True, True)) -> tuple[int, int]:
++        """(slots only realtime takes, more slots only realtime and interactive take):
++        TENSORFOLD_PRIORITY_RESERVE_REALTIME (by default 1 from 4 slots on) and TENSORFOLD_PRIORITY_RESERVE_INTERACTIVE
++        (by default 1 from 8 slots on), each only while ``active`` (a request of its class arrived lately), cut so
++        normal and background requests keep at least one slot (the interactive tier first)."""
++
++        rt = (1 if max_streams >= 4 else 0) if self.reserve_rt < 0 else self.reserve_rt
++        it = (1 if max_streams >= 8 else 0) if self.reserve_int < 0 else self.reserve_int
++        rt, it = (rt if active[0] else 0), (it if active[1] else 0)
++        rt = max(0, min(rt, max_streams - 1))
++        it = max(0, min(it, max_streams - 1 - rt))
++        return rt, it
++
++    def slots_reserved(self, max_streams: int, active: tuple[bool, bool] = (True, True)) -> int:
++        return sum(self.tiers(max_streams, active))
++
++    def short(self, klass: int, live: Sequence[int], max_streams: int, active: tuple[bool, bool] = (True, True)) -> int:
++        """How many live streams must leave before a request of ``klass`` may be admitted; ``live``: the classes the
++        live streams were admitted at. A free slot; for a request past realtime also fewer than all but the realtime
++        tier held by streams past realtime; for a normal or background request also fewer than all but both tiers
++        held by normal and background streams. Each tier counts only the classes it keeps out, so a stream of a
++        tier's own class never makes it keep a second slot free."""
++
++        rt, it = self.tiers(max_streams, active)
++        need = len(live) - (max_streams - 1)
++        if klass > REALTIME:
++            need = max(need, sum(1 for k in live if k > REALTIME) - (max_streams - rt - 1))
++        if klass > INTERACTIVE:
++            need = max(need, sum(1 for k in live if k > INTERACTIVE) - (max_streams - rt - it - 1))
++        return max(0, need)
++
++    def cap(self, klass: int, max_streams: int, active: tuple[bool, bool] = (True, True)) -> int:
++        """The most slots streams of ``klass`` and later classes may hold: realtime every one; interactive all but the
++        realtime tier; normal and background all but both tiers (``active``: which tiers hold, ``tiers``)."""
++
++        rt, it = self.tiers(max_streams, active)
++        return max_streams if klass <= REALTIME else max_streams - rt if klass <= INTERACTIVE else max_streams - rt - it
++
++    def describe(self, max_streams: int) -> str:
++        if not self.enabled:
++            return "priority lanes off (TENSORFOLD_PRIORITY=0): arrival order, background last"
++        rt, it = self.tiers(max_streams)
++        return (f"priority lanes realtime > interactive > normal > background (default {name(self.default)}): "
++                f"of {max_streams} slots {rt} kept for realtime and {it} more for interactive, "
++                f"starve {self.starve_s * 1e3:.0f} ms, round gap {self.round_gap_s * 1e3:.0f} ms, short chunk "
++                f"{self.short_rows} rows, shares up {self.up_share:g} / down {self.down_share:g}, admission age "
++                f"{self.admit_age_s:g} s, at most {self.max_yields} yields a request, tiers hold "
++                f"{self.tier_hold_s:g} s, realtime head {self.rt_head} tokens, chunks of later classes at most "
++                f"{self.rt_rows or 'any'} rows while realtime requests arrive")
++
++
++def enabled(env: Mapping[str, str] | None = None) -> bool:
++    env = os.environ if env is None else env
++    return (env.get("TENSORFOLD_PRIORITY", "").strip() or "1") != "0"
++
++
++def request_class(body: Mapping[str, Any], default: int | None = None, *, title: bool = False) -> int:
++    """A request body's class (``title``: a session-title request, background as before)."""
++
++    if title:
++        return BACKGROUND
++    if default is None:
++        default = parse(os.environ.get("TENSORFOLD_PRIORITY_DEFAULT", ""), NORMAL)
++    return parse(body.get("priority"), default)
++
++
++# -- prompt chunks: which filling stream advances, and whether a chunk or a round goes next --------------------------
++@dataclass(frozen=True)
++class Fill:
++    """A filling stream as the rules see it: its class, prompt rows left, admission order and the clock time of its
++    last chunk (or of its admission)."""
++
++    klass: int
++    rows: int
++    order: int
++    since: float
++
++
++def fill_key(f: Fill, now: float, starve_s: float) -> tuple:
++    """Sort key, soonest first: starving streams (oldest progress first), then class, rows left, admission order."""
++
++    if now - f.since >= starve_s:
++        return (0, f.since, f.order)
++    return (1, f.klass, f.rows, f.order)
++
++
++def pick_fill(fills: Sequence[Fill], now: float, starve_s: float, starved_last: bool = False) -> tuple[int, bool]:
++    """(index of the filling stream that advances next, whether it goes for starving): a realtime one if any (the
++    fewest rows left first), else, unless the last chunk went to a starving stream (``starved_last``), the one that
++    has waited longest past ``starve_s``, else by class, rows left and admission order."""
++
++    if not fills:
++        raise ValueError("no filling stream to pick")
++    rt = [i for i, f in enumerate(fills) if f.klass <= REALTIME]
++    if rt:
++        return min(rt, key=lambda i: (fills[i].rows, fills[i].order)), False
++    if starved_last:
++        return min(range(len(fills)), key=lambda i: fill_key(fills[i], now, float("inf"))), False
++    k = min(range(len(fills)), key=lambda i: fill_key(fills[i], now, starve_s))
++    return k, now - fills[k].since >= starve_s
++
++
++class Arbiter:
++    """Rank 0's choice, each iteration while streams decode, between the next prompt chunk and a decode round."""
++
++    def __init__(self, settings: Settings, share: float, clock: Callable[[], float] = time.monotonic) -> None:
++        self.s, self.share, self.clock = settings, float(share), clock
++        self.credit = 0.0
++        self.last_round: float | None = None
++        self.counts = {"chunks": 0, "rounds": 0, "starved": 0, "overdue": 0, "short": 0, "held": 0}
++
++    def choose(self, fill_class: int, fill_rows: int, starving: bool, round_class: int, hold: bool = False) -> bool:
++        """True: the chunk goes now; False: a decode round. ``round_class``: the soonest decoding stream's class;
++        ``hold``: a realtime reply's head decodes (no chunk of a later class unless starving)."""
++
++        s = self.s
++        now = self.clock()
++        if self.last_round is not None and now - self.last_round >= s.round_gap_s:
++            self.counts["overdue"] += 1
++            return self._round()
++        if starving:
++            self.counts["starved"] += 1
++            return self._chunk()
++        if hold and fill_class > round_class:
++            self.counts["held"] += 1
++            return self._round()
++        if s.short_rows and fill_rows <= s.short_rows and fill_class <= round_class:
++            self.counts["short"] += 1
++            return self._chunk()
++        share = (s.up_share if fill_class < round_class else s.down_share if fill_class > round_class
++                 else self.share)
++        self.credit = min(self.credit + share, 1.0 + share)
++        if self.credit < 1.0:
++            return self._round()
++        self.credit -= 1.0
++        return self._chunk()
++
++    def _chunk(self) -> bool:
++        self.counts["chunks"] += 1
++        return True
++
++    def _round(self) -> bool:
++        self.counts["rounds"] += 1
++        return False
++
++    def rounded(self) -> None:
++        """A decode round just ran."""
++
++        self.last_round = self.clock()
++
++
++# -- admission ------------------------------------------------------------------------------------------------------
++def preemptible(s: Any) -> bool:
++    """A stream that can give its slot back and replay: no grammar or images (they cannot replay), not finished."""
++
++    return (not getattr(s, "done", False) and getattr(s, "constraint", None) is None
++            and getattr(s, "vision", None) is None and len(getattr(s, "out", ())) < getattr(s, "count", 0))
++
++
++def victims(streams: Sequence[Any], waiter_class: int, max_yields: int, need: int) -> list:
++    """``need`` streams that give their slots to a waiting request of ``waiter_class`` (``victim`` in turn), or none
++    when fewer can (a request is never given a slot it would still have to wait for)."""
++
++    pool, out = list(streams), []
++    for _ in range(max(0, need)):
++        v = victim(pool, waiter_class, max_yields)
++        if v is None:
++            return []
++        out.append(v)
++        pool = [s for s in pool if s is not v]
++    return out
++
++
++def victim(streams: Sequence[Any], waiter_class: int, max_yields: int) -> Any | None:
++    """The decoding stream (``streams`` in admission order) that gives its slot to a waiting request of
++    ``waiter_class``: a later class that is normal or background, replayable, given back fewer than ``max_yields``
++    times; the latest class first, then the youngest. A stream counts at the class it was admitted at
++    (``admitted_as``: its aged class, so a request let in by waiting is not sent back by the next arrival)."""
++
++    best, best_key = None, None
++    for order, s in enumerate(streams):
++        klass = getattr(s, "admitted_as", getattr(s, "priority", NORMAL))
++        if klass <= waiter_class or klass < NORMAL or getattr(s, "yields", 0) >= max_yields or not preemptible(s):
++            continue
++        key = (klass, order)
++        if best_key is None or key > best_key:
++            best, best_key = s, key
++    return best
++
++
++class PriorityWaiting:
++    """Waiting (stream, box) pairs: the soonest effective class first (``effective``: aged by the time waited since
++    the request arrived, ``stream.arrived`` on ``clock``), then arrival. ``queue.Queue``'s put / get / get_nowait,
++    plus peeking (``best``), removing a peeked item and waiting for any item without taking it."""
++
++    def __init__(self, clock: Callable[[], float] = time.monotonic, age_s: float = 0.0) -> None:
++        self.cv = threading.Condition()
++        self.items: list[tuple[int, tuple]] = []
++        self.seq = itertools.count()
++        self.clock, self.age_s = clock, age_s
++
++    def put(self, item: tuple, block: bool = True, timeout: float | None = None) -> None:
++        with self.cv:
++            self.items.append((next(self.seq), item))
++            self.cv.notify_all()
++
++    def rank(self, stream: Any, now: float | None = None) -> int:
++        """The stream's effective class now."""
++
++        now = self.clock() if now is None else now
++        return effective(getattr(stream, "priority", NORMAL), now - getattr(stream, "arrived", now), self.age_s)
++
++    def _best(self) -> tuple[int, tuple] | None:
++        if not self.items:
++            return None
++        now = self.clock()
++        return min(self.items, key=lambda e: (self.rank(e[1][0], now), e[0]))
++
++    def best(self) -> tuple | None:
++        """The item ``get`` would take, left waiting (None: nothing waits)."""
++
++        with self.cv:
++            entry = self._best()
++            return entry[1] if entry is not None else None
++
++    def remove(self, item: tuple) -> None:
++        with self.cv:
++            self.items = [e for e in self.items if e[1] is not item]
++
++    def get(self, block: bool = True, timeout: float | None = None) -> tuple:
++        with self.cv:
++            if block:
++                end = None if timeout is None else time.monotonic() + timeout
++                while not self.items:
++                    left = None if end is None else end - time.monotonic()
++                    if left is not None and left <= 0:
++                        raise queue.Empty
++                    self.cv.wait(left)
++            entry = self._best()
++            if entry is None:
++                raise queue.Empty
++            self.items.remove(entry)
++            return entry[1]
++
++    def get_nowait(self) -> tuple:
++        return self.get(False)
++
++    def wait(self, timeout: float | None = None) -> bool:
++        """Block until an item waits (or ``timeout`` seconds pass): whether one does."""
++
++        with self.cv:
++            if not self.items and (timeout is None or timeout > 0):
++                self.cv.wait_for(lambda: bool(self.items), timeout)
++            return bool(self.items)
++
++    def foreground(self) -> bool:
++        """Whether a request of a class before background waits."""
++
++        with self.cv:
++            return any(getattr(e[1][0], "priority", NORMAL) < BACKGROUND for e in self.items)
++
++    def qsize(self) -> int:
++        with self.cv:
++            return len(self.items)
++
++    def empty(self) -> bool:
++        return self.qsize() == 0
++
++    def counts(self) -> dict[str, int]:
++        with self.cv:
++            out = dict.fromkeys(CLASSES, 0)
++            for _, (s, _box) in self.items:
++                out[name(getattr(s, "priority", NORMAL))] += 1
++            return out
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 9af204a..55c5ab3 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -132,6 +132,13 @@ class App:
+             return "this model's CUDA engine has no serial switch (\"draft\": false)"
+         if not isinstance(body.get("messages", []), list):
+             return "messages must be a list"
++        if _concurrent_priority(self.engine):          # patch 0141: a malformed class is refused, never guessed
++            from tensorfold.cuda import priority as prio
++
++            try:
++                prio.parse(body.get("priority"))
++            except ValueError as exc:
++                return str(exc)
+         problem = grammar.refusal(body)                 # a malformed grammar field, or one beside a required call
+         if problem is None and grammar.request_spec(body) and "constraint" not in inspect.signature(
+                 self.engine.generate).parameters:
+@@ -520,10 +527,19 @@ class App:
+         budget = self._think_budget(prepared, think_end)
+         # background: the request's own priority, else --name-priority's default for its id; title requests always
+         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
+-        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
++        title = chat and is_title_request(body.get("messages"), tools)
++        background = body.get("priority") == "background" or by_name or title
+         concurrent = getattr(self.engine, "concurrent", False)
+         turns = None if concurrent else self._turns()
+-        if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
++        if _concurrent_priority(self.engine):
++            # patch 0141: priority lanes, the request's class (realtime, interactive, normal, background) to the
++            # engine's scheduler, which orders admission, prompt chunks and rounds by it (``tensorfold.cuda.priority``)
++            from tensorfold.cuda import priority as prio
++
++            klass = prio.request_class(body, default=prio.BACKGROUND if by_name else None, title=title)
++            background = klass >= prio.BACKGROUND
++            options["priority"] = klass
++        elif concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
+             options["background"] = True            # the engine's scheduler orders its lanes and prompts
+         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
+         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
+@@ -676,6 +692,17 @@ class App:
+                                      encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
+ 
+ 
++def _concurrent_priority(engine) -> bool:
++    """Whether requests go to ``engine`` with their priority class (patch 0141): an engine whose scheduler orders
++    concurrent requests (``concurrent``) and takes ``priority``, with TENSORFOLD_PRIORITY on (the default)."""
++
++    if not getattr(engine, "concurrent", False):
++        return False
++    from tensorfold.cuda import priority as prio
++
++    return prio.enabled() and "priority" in inspect.signature(engine.generate).parameters
++
++
+ def token_sha(tokens: list[int]) -> str:
+     """A reply's token ids, hashed as the Mac server does: drafted and ``"draft": false`` replies must match."""
+ 
+diff --git tensorfold/cuda/streams.py tensorfold/cuda/streams.py
+index 07492c8..7e7b115 100644
+--- tensorfold/cuda/streams.py
++++ tensorfold/cuda/streams.py
+@@ -43,6 +43,15 @@ class Stream:
+     prefill_s: float = 0.0
+     started: float = 0.0
+     finished: float = 0.0
++    priority: int = -1                                    # class (cuda.priority: 0 realtime .. 3 background); -1: from
++                                                          # ``background`` (3 if set, else 2)
++    arrived: float = 0.0                                  # time.monotonic() at submit (a replay keeps its request's)
++    yields: int = 0                                       # times the request gave its slot back (each replays)
++
++    def __post_init__(self) -> None:
++        if self.priority < 0:
++            self.priority = 3 if self.background else 2
++        self.background = self.priority >= 3
+ 
+     def take(self, new: list[int], eos: Sequence[int] = ()) -> None:
+         """Append a round's tokens and emit them; the stream ends at its count, an end token or a stop."""
+@@ -82,7 +91,8 @@ class Stream:
+ 
+         return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit,
+                       background=self.background, probabilities=self.probabilities,
+-                      carry=self.stats(), owed=[*self.out, *self.owed])
++                      carry=self.stats(), owed=[*self.out, *self.owed], priority=self.priority, arrived=self.arrived,
++                      yields=self.yields)
+ 
+ 
+ def next_fill(filling: list[Stream]) -> Stream:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index f63a790..65a809f 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -809,6 +809,7 @@ class GlmEngine:
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                       f"{self.multi.tune.describe()}", flush=True)
++                print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+@@ -1174,8 +1175,9 @@ class GlmEngine:
+         return stats
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
+-                 constraint=None, *, vision=None, background: bool = False) -> dict[str, Any]:
+-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them."""
++                 constraint=None, *, vision=None, background: bool = False,
++                 priority: int | None = None) -> dict[str, Any]:
++        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them; ``priority``: under --parallel, the request's class (``tensorfold.cuda.priority``, patch 0141; None: from ``background``)."""
+ 
+         if len(prompt) >= self.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+@@ -1191,7 +1193,8 @@ class GlmEngine:
+                 raise ValueError("image inputs require starting this server with --vision")
+             stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
+-                                          background=background, glm={"code": code, "spec": spec})
++                                          background=background, glm={"code": code, "spec": spec},
++                                          priority=priority)
+             stats.update(policy=spec, drafts=draft)
+             return stats
+         positions: list[int] = []
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index db6b347..7735cc1 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -32,6 +32,7 @@ import hashlib
+ import json
+ import os
+ import queue
++import threading
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Sequence
+@@ -39,7 +40,8 @@ from typing import Any, Callable, Sequence
+ import numpy as np
+ import torch
+ 
+-from tensorfold.cuda.scheduler import Scheduler
++from tensorfold.cuda import priority as prio
++from tensorfold.cuda.scheduler import Scheduler, Waiting
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+ from . import digest as _digest, multi_prefill
+@@ -315,6 +317,7 @@ class Lane:
+     decoding: bool = False
+     paused: bool = False
+     t0: float = 0.0
++    since: float = 0.0                 # rank 0's clock at its last prompt chunk or its admission (priority rules)
+     copy_rounds: int = 0
+     copy_drafted: int = 0
+     copy_accepted: int = 0
+@@ -348,6 +351,14 @@ class MultiDecoder:
+         self.fill_rows = fill_rows(e.prefill_rows, self.grid)
+         self.share = fill_share()
+         self.credit = 0.0
++        # patch 0141: priority lanes (cuda.priority; TENSORFOLD_PRIORITY=0: the order as before). Rank 0 decides with
++        # them; rank 1 applies rank 0's messages, so they never reach a request's arithmetic
++        self.clock = time.monotonic                      # the rules' clock (tests drive a simulated one)
++        self.prio = prio.Settings.from_env()
++        self.arbiter = prio.Arbiter(self.prio, self.share, lambda: self.clock()) if self.prio.enabled else None
++        self.starved_last = False                        # the last prompt chunk went to a starving stream
++        self.full_at = None                              # rank 0's clock at the last round of every decoding stream
++        self.rt_seen_at = None                           # rank 0's clock when a realtime request last arrived
+         # TF_GLM_MULTI_PREFILL: rank 0 groups filling streams into one chunk (rank 1 applies whatever MFILL it gets)
+         self.group = multi_prefill.enabled()
+         if self.group:
+@@ -423,7 +434,16 @@ class MultiDecoder:
+                             "filling": sum(not l.decoding for l in lanes),
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+-                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {})}
++                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
++                **({"lanes": self._class_counts(lanes), "arbiter": dict(self.arbiter.counts)}
++                   if self.arbiter is not None else {})}
++
++    @staticmethod
++    def _class_counts(lanes: Sequence[Lane]) -> dict:
++        out = {c: {"filling": 0, "decoding": 0} for c in prio.CLASSES}
++        for l in lanes:
++            out[prio.name(l.s.priority)]["decoding" if l.decoding else "filling"] += 1
++        return out
+ 
+     def _check(self) -> None:
+         if self.broken is not None:
+@@ -720,6 +740,7 @@ class MultiDecoder:
+                                               else [])
+         s.started = time.perf_counter()
+         lane.t0 = s.started
++        lane.since = self.clock()
+         self.lanes[lane.sid] = lane
+ 
+     def _ctx(self, lane: Lane):
+@@ -905,6 +926,8 @@ class MultiDecoder:
+         if not filling:
+             return None
+         decoding = [l for l in self.lanes.values() if l.decoding and not l.paused and not l.s.done]
++        if self.arbiter is not None:
++            return self._ranked_fill(filling, decoding)
+         if decoding:
+             self.credit += self.share
+             if self.credit < 1:
+@@ -913,6 +936,37 @@ class MultiDecoder:
+         s = next_fill([l.s for l in filling])
+         return self.lanes[s.sid]
+ 
++    @staticmethod
++    def _rows_left(lane: Lane) -> int:
++        return 0 if lane.head is not None else len(lane.s.prompt) - lane.st.pos
++
++    def _ranked_fill(self, filling: list[Lane], decoding: list[Lane]) -> Lane | None:
++        """Rank 0, priority lanes: the filling stream that advances next (``prio.pick_fill``: a starving one, else the
++        soonest class, the fewest rows left, admission order) when its chunk goes before a decode round
++        (``prio.Arbiter``), else None (a round)."""
++
++        now = self.clock()
++        k, starving = prio.pick_fill([prio.Fill(l.s.priority, self._rows_left(l), l.order, l.since) for l in filling],
++                                     now, self.prio.starve_s, self.starved_last)
++        lane = filling[k]
++        if decoding and self.arbiter.last_round is None:
++            self.arbiter.last_round = now               # the round gap counts from the first decoding stream on
++        if decoding and not self.arbiter.choose(lane.s.priority, self._rows_left(lane), starving,
++                                                min(l.s.priority for l in decoding), bool(self._heads(decoding))):
++            self.starved_last = False                   # a round ran: the next chunk may go to a starving stream
++            return None
++        self.starved_last = starving
++        return lane
++
++    def _heads(self, lanes: Sequence[Lane]) -> list[Lane]:
++        """Rank 0, priority lanes: the realtime streams of ``lanes`` still in their reply's head (fewer than
++        TENSORFOLD_PRIORITY_REALTIME_HEAD tokens written): their rounds hold only them."""
++
++        if self.arbiter is None or not self.prio.rt_head:
++            return []
++        return [l for l in lanes if l.s.priority <= prio.REALTIME and l.decoding and not l.s.done
++                and len(l.s.out) < self.prio.rt_head]
++
+     def _iterate(self) -> list[Stream]:
+         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
+         lane = self._fill_turn()
+@@ -923,7 +977,9 @@ class MultiDecoder:
+             self._emit(MFILL, [len(group), *[v for l, stop in group for v in (l.sid, stop)]])
+             self._flush()
+             firsts = self._fill_many(group)
++            now = self.clock()
+             for (l, _), first in zip(group, firsts):
++                l.since = now
+                 if first is not None:
+                     l.s.take([first], self._ends(l))
+             self.grouped["chunks"] += 1
+@@ -938,6 +994,7 @@ class MultiDecoder:
+             self._emit(FILL, [lane.sid, stop])
+             self._flush()
+             first = self._fill(lane, stop)
++            lane.since = self.clock()
+             if first is not None:
+                 lane.s.take([first], self._ends(lane))
+             if prof is not None:
+@@ -945,6 +1002,16 @@ class MultiDecoder:
+             return [lane.s] if lane.s.done else []
+         lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
+         t_begin = time.perf_counter()
++        heads = self._heads(lanes)            # priority lanes: a realtime reply's head decodes in rounds of its own,
++        if heads and self.full_at is None:
++            self.full_at = self.clock()
++        if heads and self.clock() - self.full_at >= self.prio.round_gap_s:
++            heads = []                        # unless the others have had no round for TENSORFOLD_PRIORITY_ROUND_GAP_MS
++        for l in heads:
++            l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
++        everyone = len(lanes)
++        if any(not l.paused for l in heads):
++            lanes = heads
+         for l in lanes:                       # room for this round's widest window, else paused
+             l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
+         active = [l for l in lanes if not l.paused]
+@@ -970,6 +1037,10 @@ class MultiDecoder:
+         if prof is not None:
+             prof.mark("message")
+         self._round(active, lone=lone)
++        if self.arbiter is not None:
++            self.arbiter.rounded()
++            if len(lanes) == everyone:
++                self.full_at = self.clock()
+         return [l.s for l in active if l.s.done]
+ 
+     def _home(self, lane: Lane) -> bool:
+@@ -1014,12 +1085,25 @@ class MultiDecoder:
+         st.cur = list(lane.st.cur)
+         lane.st, lane.slot = st, slot
+ 
++    def _chunk_rows(self, lane: Lane) -> int:
++        """Rows of the lane's next prompt chunk: TF_GLM_FILL_ROWS while others decode or for a background prompt,
++        else the engine's prompt chunk. Priority lanes: a realtime prompt always takes the whole prompt chunk; while
++        realtime requests arrive, a later class's chunk is at most TENSORFOLD_PRIORITY_REALTIME_ROWS rows (in whole
++        ``fill_unit``s, so every cut stays on the prompt grid)."""
++
++        if self.arbiter is not None and lane.s.priority <= prio.REALTIME:
++            return self.e.prefill_rows
++        busy = any(l.decoding and not l.s.done for l in self.lanes.values())
++        rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
++        cap = self.prio.rt_rows if self.arbiter is not None else 0
++        if cap and self.rt_seen_at is not None and self.clock() - self.rt_seen_at <= self.prio.tier_hold_s:
++            rows = min(rows, max(self.unit, cap // self.unit * self.unit))
++        return rows
++
+     def _stop(self, lane: Lane) -> int:
+         pos, n = lane.st.pos, len(lane.s.prompt)
+         stop = next((p for p in lane.stops if p > pos), n)
+-        busy = any(l.decoding and not l.s.done for l in self.lanes.values())
+-        rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
+-        return min(stop, pos + rows)
++        return min(stop, pos + self._chunk_rows(lane))
+ 
+     def _group(self, first: Lane) -> list[tuple[Lane, int]] | None:
+         """Rank 0, TF_GLM_MULTI_PREFILL=1: the (lane, stop) pieces of this iteration's prompt chunk when it can hold
+@@ -1037,8 +1121,19 @@ class MultiDecoder:
+             return None
+         busy = any(l.decoding and not l.s.done for l in self.lanes.values())
+         left = self.fill_rows if busy else self.e.prefill_rows
+-        lanes = sorted((l for l in self.lanes.values() if plain(l)),
+-                       key=lambda l: (bool(l.s.background), len(l.s.prompt) - l.st.pos, l.order))
++        if self.arbiter is not None:
++            # priority lanes: ``first`` (the rules' pick) leads; the others by class, rows left, admission order; a
++            # realtime or interactive prompt shares its chunk only with prompts of its class or sooner (a long
++            # prompt's rows would delay its first token)
++            left = self._chunk_rows(first)
++            top = first.s.priority
++            rest = sorted((l for l in self.lanes.values() if plain(l) and l is not first
++                           and (top > prio.INTERACTIVE or l.s.priority <= top)),
++                          key=lambda l: (l.s.priority, len(l.s.prompt) - l.st.pos, l.order))
++            lanes = [first] + rest
++        else:
++            lanes = sorted((l for l in self.lanes.values() if plain(l)),
++                           key=lambda l: (bool(l.s.background), len(l.s.prompt) - l.st.pos, l.order))
+         out: list[tuple[Lane, int]] = []
+         for l in lanes:
+             pos, n = l.st.pos, len(l.s.prompt)
+@@ -1323,7 +1418,10 @@ class MultiDecoder:
+         extent and returns to the queue; it replays later, its sent tokens owed, not sent again. If every stream has
+         a grammar or images, the youngest fails instead (returned, to be finished)."""
+ 
+-        lanes = sorted(self.lanes.values(), key=lambda l: l.order, reverse=True)
++        if self.arbiter is not None:          # priority lanes: the latest class first, then the youngest
++            lanes = sorted(self.lanes.values(), key=lambda l: (l.s.priority, l.order), reverse=True)
++        else:
++            lanes = sorted(self.lanes.values(), key=lambda l: l.order, reverse=True)
+         lane = next((l for l in lanes if l.constraint is None and l.feed is None), None)
+         if lane is None:
+             lane = lanes[0]
+@@ -1355,6 +1453,8 @@ class MultiDecoder:
+         tokens = list(s.out[:s.count])
+         out.update(sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16],
+                    tokens_per_round=round((len(tokens) - 1) / max(s.rounds, 1), 3), parallel=self.count)
++        if self.arbiter is not None:
++            out.update(priority=prio.name(s.priority), yields=s.yields)
+         lane_info = getattr(s, "glm_lane", None)
+         if lane_info:
+             out.update(lane_info)
+@@ -1448,22 +1548,82 @@ class MultiDecoder:
+ class GlmScheduler(Scheduler):
+     """``cuda.scheduler.Scheduler`` for the GLM decoder: a request's GLM settings ride on its stream (``glm``); a
+     request the pool cannot place yet waits at the head of the queue (``MultiDecoder.fits``); streams the decoder gives
+-    back (every stream waiting for room) return to the queue to replay."""
++    back (every stream waiting for room) return to the queue to replay.
++
++    Priority lanes (patch 0141, ``cuda.priority``; TENSORFOLD_PRIORITY=0: arrival order, background last, as
++    before): waiting requests by class (aged), then arrival; tiers of slots kept for realtime and interactive
++    requests (TENSORFOLD_PRIORITY_RESERVE_*); a waiting request with no slot it may take gets one from the youngest
++    decoding stream of a later normal or background class, which replays later (``prio.victim``)."""
++
++    def __init__(self, decoder: MultiDecoder, *, max_streams: int, settings: prio.Settings | None = None,
++                 clock: Callable[[], float] | None = None, start: bool = True) -> None:
++        """``settings``: the priority rules (default TENSORFOLD_PRIORITY_*); ``clock``: theirs (default the
++        decoder's, else ``time.monotonic``); ``start``: run the worker thread (tests step ``_iteration``)."""
+ 
+-    def __init__(self, decoder: MultiDecoder, *, max_streams: int) -> None:
+         self.held = None
+         # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
+         # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
+         self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
+-        super().__init__(decoder, max_streams=max_streams)
++        self.prio = settings if settings is not None else getattr(decoder, "prio", None) or prio.Settings.from_env()
++        self.clock = clock if clock is not None else (lambda: getattr(decoder, "clock", time.monotonic)())
++        self.preempted = 0                              # streams that gave their slot to a sooner class
++        self.seen: dict[int, float] = {}                # class -> the clock when a request of it last arrived
++        self.decoder = decoder
++        self.max_streams = max_streams
++        self.waiting = (prio.PriorityWaiting(self.clock, self.prio.admit_age_s) if self.prio.enabled
++                        else Waiting())
++        self.boxes: dict[int, queue.Queue] = {}
++        self.yields = 0
++        self.thread = threading.Thread(target=self._loop, daemon=True)
++        if start:
++            self.thread.start()
++
++    def health(self) -> dict:
++        """/health: waiting requests by class, the reserve, the streams given back to sooner classes."""
++
++        if not self.prio.enabled:
++            return {}
++        rt, it = self.prio.tiers(self.max_streams, self._active())
++        return {"priority": {"default": prio.name(self.prio.default), "waiting": self.waiting.counts(),
++                             "reserved_slots": {"realtime": rt, "interactive": it}, "preempted": self.preempted,
++                             "yields": self.yields}}
++
++    def saw(self, klass: int) -> None:
++        """A request of ``klass`` arrived (its tier of slots holds for TENSORFOLD_PRIORITY_TIER_HOLD_S; a realtime one
++        also caps later classes' prompt chunks for as long, ``MultiDecoder._chunk_rows``)."""
++
++        now = self.clock()
++        self.seen[int(klass)] = now
++        if klass <= prio.REALTIME:
++            self.decoder.rt_seen_at = now
++
++    def _active(self) -> tuple[bool, bool]:
++        """Which tiers of kept slots hold: a request of their class arrived within TENSORFOLD_PRIORITY_TIER_HOLD_S."""
++
++        now, hold = self.clock(), self.prio.tier_hold_s
++        return tuple(k in self.seen and now - self.seen[k] <= hold for k in (prio.REALTIME, prio.INTERACTIVE))
++
++    def _short(self, stream: Stream) -> int:
++        """How many live streams must leave before the waiting ``stream`` may be admitted (its aged class, the classes
++        the live streams were admitted at, the tiers that hold: ``Settings.short``)."""
++
++        live = [getattr(l.s, "admitted_as", l.s.priority) for l in self.decoder.lanes.values()]
++        return self.prio.short(self.waiting.rank(stream), live, self.max_streams, self._active())
+ 
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+-               constraint: Any = None, background: bool = False, glm: dict | None = None) -> dict:
++               constraint: Any = None, background: bool = False, glm: dict | None = None,
++               priority: int | None = None) -> dict:
++        """``priority``: the request's class (``cuda.priority``; None: background if ``background`` else the
++        default class)."""
++
+         box: queue.Queue = queue.Queue()
++        if priority is None:
++            priority = prio.BACKGROUND if background else self.prio.default if self.prio.enabled else prio.NORMAL
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+-                        constraint=constraint, background=background)
++                        constraint=constraint, background=background, priority=int(priority), arrived=self.clock())
+         stream.glm = dict(glm or {})
++        self.saw(stream.priority)
+         cancel = [False]
+         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
+         self.waiting.put((stream, box))
+@@ -1481,6 +1641,8 @@ class GlmScheduler(Scheduler):
+         """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
+         is waited on until then for more arrivals."""
+ 
++        if self.prio.enabled:
++            return self._admit_ranked(until)
+         done: list[Stream] = []
+         while self.decoder.live() < self.max_streams:
+             if first is not None:
+@@ -1511,9 +1673,65 @@ class GlmScheduler(Scheduler):
+                 done.append(stream)
+         return done
+ 
++    def _admit_ranked(self, until: float | None = None) -> list[Stream]:
++        """Priority lanes: the waiting request ``PriorityWaiting`` ranks first, while a slot its class may take is free
++        (``Settings.cap``) and the pool has room for it (``MultiDecoder.fits``); it waits, first in line, otherwise.
++        ``until`` (a deadline on ``self.clock``): an empty queue is waited on until then for more arrivals."""
++
++        done: list[Stream] = []
++        while True:
++            item = self.waiting.best()
++            if item is None:
++                left = until - self.clock() if until is not None else 0.0
++                if left > 0 and self.decoder.live() < self.max_streams and self.waiting.wait(left):
++                    continue
++                break
++            stream, box = item
++            if self._short(stream):
++                break                                # no slot for its class: it waits (``_yield`` may free one)
++            if not self.decoder.fits(stream):
++                break                                # waits, first in line, for room
++            self.boxes[id(stream)] = box
++            stream.admitted_as = self.waiting.rank(stream)      # its aged class: tiers and ``prio.victim`` count it
++            try:
++                self.decoder.admit(stream)
++            except NoRoom:
++                self.boxes.pop(id(stream))
++                break                                # still first in line (it never left the queue)
++            except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++                self.waiting.remove(item)
++                self.boxes.pop(id(stream)).put(("error", exc))
++                continue
++            self.waiting.remove(item)
++            if stream.done:
++                done.append(stream)
++        return done
++
+     def _yield(self) -> None:
+-        """``Scheduler._yield``, the stream's GLM settings carried to its replay."""
++        """``Scheduler._yield``, the stream's GLM settings carried to its replay. Priority lanes: the request ranked
++        first, when no slot its class may take is free, gets one from ``prio.victim`` (a later normal or background
++        class, by its own class: waiting time does not make a request preempt)."""
+ 
++        if self.prio.enabled:
++            item = self.waiting.best()
++            if item is None:
++                return
++            waiter = item[0]
++            need = self._short(waiter)
++            if not need:
++                return
++            gone = prio.victims(list(self.decoder.streams.values()), waiter.priority, self.prio.max_yields, need)
++            for stream in gone:              # exactly the slots it needs (none when fewer can be freed)
++                box = self.boxes.pop(id(stream))
++                self.decoder.finish([stream])
++                self.yields += 1
++                self.preempted += 1
++                again = stream.continued()
++                again.glm = getattr(stream, "glm", {})
++                again.yields = stream.yields + 1
++                again.arrived = self.clock()     # waits as a new arrival: it never outranks the request it yielded to
++                self.waiting.put((again, box))
++            return
+         if self.decoder.live() < self.max_streams or not self.waiting.foreground():
+             return
+         live = list(self.decoder.streams.values())
+@@ -1555,8 +1773,14 @@ class GlmScheduler(Scheduler):
+     def _iteration(self) -> None:
+         self._yield()
+         idle = not self.decoder.live() and self.held is None
+-        first = self.waiting.get() if idle else None                # idle: wait for a request
+-        until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
++        if self.prio.enabled:                                       # idle: wait for a request (left in the queue)
++            first = None
++            if idle:
++                self.waiting.wait()
++            until = self.clock() + self.gather_s if idle and self.gather_s > 0 else None
++        else:
++            first = self.waiting.get() if idle else None            # idle: wait for a request
++            until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
+         done = self._admit(first, until)
+         try:
+             done += self.decoder.round()

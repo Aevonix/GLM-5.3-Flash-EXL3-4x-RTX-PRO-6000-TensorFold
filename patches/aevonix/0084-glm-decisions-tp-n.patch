@@ -1,0 +1,56 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index f80e013..dbfe558 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -1331,8 +1331,13 @@ class GlmEngine:
+         return stats
+ 
+     def score_labels(self, prompt_ids: list[int], label_ids: list[int]) -> tuple[list[float], float]:
+-        """Both ranks prefill the prompt and return its label logits plus the full-vocabulary logsumexp."""
++        """Every rank prefills the prompt; rank 0 returns its label logits plus the full-vocabulary logsumexp. The
++        one-stream engine only: with --parallel above 1 the followers run the multi-stream loop, which takes no
++        decision header, so the request is refused before any rank is told of it."""
+ 
++        if getattr(self, "multi", None) is not None:
++            raise ValueError(f"decision scoring runs on the one-stream engine (--parallel 1); this server decodes up "
++                             f"to {self.parallel} streams at once")
+         prompt = [int(token) for token in prompt_ids]
+         labels = [int(token) for token in label_ids]
+         if not prompt:
+@@ -1341,7 +1346,7 @@ class GlmEngine:
+             raise ValueError("empty labels")
+         if len(prompt) >= self.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+-        self._ring()                    # rank 1 waits on the store before this header, as a chat request does
++        self._ring()                    # the followers wait on the store before this header, as a chat request does
+         self._share([0, len(labels)])   # max_tokens on a chat header is at least 1, so 0 is a score
+         self._share(prompt)
+         self._share(labels)
+@@ -1361,15 +1366,22 @@ class GlmEngine:
+         rows = [local] if self.comm is None else self._gather_floats(local)
+         if self.rank != 0:
+             return [], 0.0
+-        return reduce_vocab_shards(rows, labels, len(rows[0]))
++        # the ranks' vocabulary shards in rank order (tp.Layout: they may differ in width), joined into one row
++        whole = [value for row in rows for value in row]
++        return reduce_vocab_shards([whole], labels, len(whole))
+ 
+     def _gather_floats(self, values: list[float]) -> list[list[float]]:
++        """Every rank's ``values`` (its vocabulary shard: widths may differ between ranks), in rank order."""
++
+         torch = self.torch
+-        mine = torch.tensor(values, dtype=torch.float32, device="cuda")
+-        got = torch.empty((2 * len(values),), dtype=torch.float32, device="cuda")
++        world = int(getattr(self, "world", 2))
++        sizes = [int(row[0]) for row in self._gather_ints([len(values)])]
++        width = max(sizes)
++        mine = torch.zeros((width,), dtype=torch.float32, device="cuda")
++        mine[:len(values)] = torch.tensor(values, dtype=torch.float32, device="cuda")
++        got = torch.empty((world * width,), dtype=torch.float32, device="cuda")
+         self.comm.all_gather(mine, got)
+-        width = len(values)
+-        return [[float(item) for item in got[:width].tolist()], [float(item) for item in got[width:].tolist()]]
++        return [[float(item) for item in got[r * width:r * width + n].tolist()] for r, n in enumerate(sizes)]
+ 
+     def follow(self) -> None:
+         """Ranks past 0: mirror every request rank 0 serves, forever."""

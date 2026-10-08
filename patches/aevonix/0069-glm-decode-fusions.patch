@@ -1,0 +1,1745 @@
+0069-glm-decode-fusions: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: conflicts resolved: qmm_cfg's 16-64-row tiles beside 0.6.1's grouped kernel (tensorfold_qmm_v5m2); the router fusion with the route guard.
+Files: cuda/gpu_sample.cu, cuda/gpu_sample.py, cuda/kernels/qmm.cpp, cuda/kernels/qmm.py, families/glm5_next/cuda/engine.py, families/glm5_next/cuda/exl3.cpp, families/glm5_next/cuda/exl3.cu, families/glm5_next/cuda/exl3_mm.py, families/glm5_next/cuda/forward.py, families/glm5_next/cuda/fuse.py, families/glm5_next/cuda/glue.py, families/glm5_next/cuda/hc.cpp, families/glm5_next/cuda/hc.cu, families/glm5_next/cuda/kda.cpp, families/glm5_next/cuda/kda.cu, families/glm5_next/cuda/kda.py, families/glm5_next/cuda/qmm.py, families/glm5_next/cuda/sparse.py, families/glm5_next/cuda/tune.py.
+
+diff --git tensorfold/cuda/gpu_sample.cu tensorfold/cuda/gpu_sample.cu
+index 320eba9..88ac9f2 100644
+--- tensorfold/cuda/gpu_sample.cu
++++ tensorfold/cuda/gpu_sample.cu
+@@ -64,6 +64,7 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
+     __shared__ int oid[MAXC];
+     __shared__ double sc[MAXC];
+     __shared__ double score[MAXC];
++    __shared__ double ex[MAXC];                                // exp(scaled - top), for the top_p cut
+     __shared__ int bad;
+     if (threadIdx.x == 0) bad = (W < 1 || W > MAXC);
+     __syncthreads();
+@@ -79,10 +80,11 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
+     }
+     __syncthreads();
+     // np.lexsort((ids, -values)): value descending (IEEE order, -0 == +0), then id ascending; ids are distinct
++    int nan_here = 0;
+     for (int i = threadIdx.x; i < W; i += blockDim.x) {
+         const float v = sv[i];
+         const int id = sid[i];
+-        if (v != v) bad = 1;                                   // NaN: the host rule decides
++        nan_here |= v != v;                                    // NaN: the host rule decides
+         int rank = 0;
+         for (int j = 0; j < W; ++j) {
+             const float u = sv[j];
+@@ -90,29 +92,31 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
+         }
+         if (rank < W) { ov[rank] = v; oid[rank] = id; }
+     }
++    if (__syncthreads_or(nan_here) && threadIdx.x == 0) bad = 1;
+     __syncthreads();
+     if (mode == 0) {                                           // greedy: the first in that order
+         if (threadIdx.x == 0) { out[2 * r] = oid[0]; out[2 * r + 1] = bad ? 0 : 1; }
+         return;
+     }
+     const int k = max(1, min(top_k > 0 ? top_k : W, W));
++    const double top = __ddiv_rn((double)ov[0], temp);         // scaled.max(): the first in the order
+     for (int i = threadIdx.x; i < k; i += blockDim.x) {
+         const double s = __ddiv_rn((double)ov[i], temp);
+         sc[i] = s;
+         score[i] = __dsub_rn(s, log(-log(keyed_uniform(seed, position, (long long)oid[i]))));
++        ex[i] = exp(__dsub_rn(s, top));
+     }
+     __syncthreads();
+     if (threadIdx.x != 0) return;
+     int certain = !bad;
+     int keep = k;
+     if (top_p > 0.0 && top_p < 1.0) {                          // (cumsum(probs) < top_p).sum() + 1
+-        const double top = sc[0];
+         double sum = 0.0;
+-        for (int i = 0; i < k; ++i) sum += exp(sc[i] - top);
++        for (int i = 0; i < k; ++i) sum += ex[i];
+         double cum = 0.0;
+         int below = 0;
+         for (int i = 0; i < k; ++i) {
+-            cum += exp(sc[i] - top) / sum;
++            cum += ex[i] / sum;
+             if (fabs(cum - top_p) <= DP) certain = 0;
+             below += cum < top_p;
+         }
+@@ -124,6 +128,7 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
+     for (int i = 0; i < k && i < keep; ++i) {
+         if (sc[i] < thr) continue;
+         const double s = score[i];
++        if (s != s) certain = 0;                               // a NaN score (-inf - -inf): numpy's argmax takes it
+         if (best < 0 || s > s1) { s2 = s1; s1 = s; best = i; }
+         else if (s > s2) s2 = s;
+     }
+diff --git tensorfold/cuda/gpu_sample.py tensorfold/cuda/gpu_sample.py
+index 453b782..f8eeeb6 100644
+--- tensorfold/cuda/gpu_sample.py
++++ tensorfold/cuda/gpu_sample.py
+@@ -42,7 +42,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_gpu_sample_v1", sources=[str(here / "gpu_sample.cpp"), str(here / "gpu_sample.cu")],
++    return load(name="tensorfold_gpu_sample_v2", sources=[str(here / "gpu_sample.cpp"), str(here / "gpu_sample.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -132,17 +132,18 @@ def launch(got: torch.Tensor, rank_stride: int, world: int, tab: np.ndarray) ->
+ 
+     rows = int(tab.shape[0])
+     dev = got.device
+-    host_t = _buf("table", (rows, COLS), torch.int64)
+-    host_t.numpy()[:] = tab
+-    dev_t = _buf("table", (rows, COLS), torch.int64, dev)
+-    dev_t.copy_(host_t, non_blocking=True)
+-    out = _buf("out", (rows, 2), torch.int32, dev)
+-    _ext().sample_rows(got.contiguous().view(-1), int(rank_stride), int(world), dev_t, out, rows)
+-    host_o = _buf("out", (rows, 2), torch.int32)
+-    host_o.copy_(out, non_blocking=True)
+-    ev = torch.cuda.Event()
+-    ev.record()
+-    ev.synchronize()
++    with torch.cuda.device(dev):                    # the copies, the kernel and the event on got's device's stream
++        host_t = _buf("table", (rows, COLS), torch.int64)
++        host_t.numpy()[:] = tab
++        dev_t = _buf("table", (rows, COLS), torch.int64, dev)
++        dev_t.copy_(host_t, non_blocking=True)
++        out = _buf("out", (rows, 2), torch.int32, dev)
++        _ext().sample_rows(got.contiguous().view(-1), int(rank_stride), int(world), dev_t, out, rows)
++        host_o = _buf("out", (rows, 2), torch.int32)
++        host_o.copy_(out, non_blocking=True)
++        ev = torch.cuda.Event()
++        ev.record(torch.cuda.current_stream(dev))
++        ev.synchronize()
+     o = host_o.numpy()
+     return o[:, 0].astype(np.int64), o[:, 1] != 0
+ 
+diff --git tensorfold/cuda/kernels/qmm.cpp tensorfold/cuda/kernels/qmm.cpp
+index 264e02d..3696c13 100644
+--- tensorfold/cuda/kernels/qmm.cpp
++++ tensorfold/cuda/kernels/qmm.cpp
+@@ -81,12 +81,13 @@ void qmm_group(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::
+     qmm_group_cuda(x, xs, ws, scales, biases, outs, ns, sks, f32, static_cast<int>(tile), static_cast<int>(pdl));
+ }
+ 
+-// ``qmm`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg`` (same bits, other speed).
++// ``qmm`` for decode rows (M <= 64: 16-row tiles side by side above 16, groups of 64, K slices reduced) on tile
++// config ``cfg`` (same bits, other speed).
+ void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+              const at::Tensor& biases, at::Tensor& out, const c10::optional<at::Tensor>& part, int64_t n, int64_t sk,
+              bool f32, int64_t cfg) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
+-                x.size(0) <= 16 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 16, K) bf16");
++                x.size(0) <= 64 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 64, K) bf16");
+     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
+                 "x rows must start on 16-byte boundaries");
+     const int64_t m = x.size(0), k = x.size(1), kg = k / 64, npad = (n + 127) / 128 * 128;
+diff --git tensorfold/cuda/kernels/qmm.py tensorfold/cuda/kernels/qmm.py
+index d472e8e..1750521 100644
+--- tensorfold/cuda/kernels/qmm.py
++++ tensorfold/cuda/kernels/qmm.py
+@@ -18,7 +18,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_qmm_v5m1", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
++    return load(name="tensorfold_qmm_v5m2", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+                                                      str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
+                                                      str(here / "qmm_prefill8.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index a4ef9a3..dc271fd 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -670,13 +670,36 @@ class GlmEngine:
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+         self.cache_bytes = min(row[-1] for row in rows) << 20
+-        # launch tables (TF_GLM_TUNE, tune.py): every rank must read the same table file (its tables' checksum)
++        # launch tables (TF_GLM_TUNE, tune.py): every rank must read the same table file (its tables' checksum; -1: a
++        # rank could not read or accept it); and the settings read at first use (TF_GLM_FUSE, TF_GLM_FUSE_HC_ROWS,
++        # TENSORFOLD_GPU_SAMPLE; -1: not valid on that rank) must be valid and the same on every rank. All of it is read
++        # without raising and compared in one gather, so every rank refuses the start together.
++        from tensorfold.cuda import gpu_sample as _gpu_sample
++
++        from . import fuse as _fuse
+         from . import tune as _tune
+ 
+-        tables = [row[0] for row in self._gather_ints([_tune.code()])]
+-        if any(t != tables[0] for t in tables):
+-            raise RuntimeError(f"the ranks read different launch tables (TF_GLM_TUNE; checksums {tables}): give every "
+-                               "rank the same file, or none")
++        def quiet(read) -> tuple[int, str | None]:
++            try:
++                return min(int(read()), 1 << 30), None
++            except ValueError as exc:
++                return -1, str(exc)
++
++        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted)]
++        got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
++        tables = [row[0] for row in got]
++        if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
++            why = _tune.error()
++            raise RuntimeError(f"launch tables (TF_GLM_TUNE): checksums by rank {tables}"
++                               + (f"; this rank: {why}" if why else "") + ": give every rank the same valid file, or none")
++        settings = [row[1:] for row in got]
++        if any(-1 in row for row in settings) or any(row != settings[0] for row in settings):
++            why = "; ".join(w for _, w in mine if w)
++            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE by rank "
++                               f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
++                               + ": give every rank the same valid values")
++        if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
++            _gpu_sample.enabled(world, 1, torch.device("cuda", torch.cuda.current_device()))
+         plan["kept_bytes"] = self.cache_bytes
+         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
+             plan[key] = plan[key] + self.cache_bytes
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index cfb0e17..1932a99 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -14,7 +14,7 @@ void exl3_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Ten
+ void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+-                      double, int64_t, int64_t, bool, const c10::optional<at::Tensor>&);
++                      double, int64_t, int64_t, bool, const c10::optional<at::Tensor>&, int64_t);
+ void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
+ void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                    const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+@@ -96,7 +96,7 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+             const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
+             const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
+             at::Tensor xd, at::Tensor y, int64_t D, int64_t N, int64_t E, int64_t max_items, double limit,
+-            int64_t pass, int64_t slots, bool shx, c10::optional<at::Tensor> order) {
++            int64_t pass, int64_t slots, bool shx, c10::optional<at::Tensor> order, int64_t stages) {
+     const at::cuda::CUDAGuard guard(Xg.device());
+     for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
+     for (auto* t : {&Tg, &Tu, &Td, &items, &counts, &members}) check(*t, at::kInt, "prompt: int32 input");
+@@ -106,7 +106,7 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+     TORCH_CHECK(slots > 0, "prompt: slots");
+     if (order.has_value()) check(*order, at::kInt, "prompt: order");
+     exl3_prompt_cuda(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+-                     max_items, limit, pass, slots, shx, order);
++                     max_items, limit, pass, slots, shx, order, stages);
+ }
+ 
+ // Decode windows: the grouped kernel's sums; fuse 1 writes Y (down, its epilogue fused), 2 writes Xd
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 0e6ac21..4b683f3 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -599,7 +599,7 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
+ // kernel's (which sums split and warp partials). The epilogues are gateup/down_epilogue_kernel's formulas.
+ constexpr int PBK = 32;              // k values a shared-memory stage (2 k tiles)
+ constexpr int PKT = PBK / 16;
+-constexpr int PSTAGES = 3;
++constexpr int PSTAGES = 3;           // the default pipeline depth (a template parameter PS, 2 to 4: loads only, same bits)
+ constexpr int PXS = PBK + 8;         // stage row stride in halves (+16 B: ldmatrix rows on distinct banks)
+ 
+ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
+@@ -638,7 +638,7 @@ __device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
+     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
+ }
+ 
+-template <int MATS, int PM, int NW, bool SHX = false>
++template <int MATS, int PM, int NW, bool SHX = false, int PS = PSTAGES>
+ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
+                                                 const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
+                                                 const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
+@@ -658,7 +658,7 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
+             for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
+ 
+     auto load = [&](int chunk) {
+-        half* dst = stage + (size_t)(chunk % PSTAGES) * C::STAGE_HALVES;
++        half* dst = stage + (size_t)(chunk % PS) * C::STAGE_HALVES;
+         const int k0 = chunk * PBK;
+         for (int idx = threadIdx.x; idx < C::XM * PM * (PBK / 8); idx += C::T) {
+             const int m = idx / (PM * (PBK / 8)), rem = idx % (PM * (PBK / 8)), i = rem / (PBK / 8),
+@@ -677,16 +677,16 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
+         }
+     };
+ #pragma unroll
+-    for (int c = 0; c < PSTAGES - 1; ++c) {
++    for (int c = 0; c < PS - 1; ++c) {
+         if (c < chunks) load(c);
+         cp_async_commit();
+     }
+     for (int c = 0; c < chunks; ++c) {
+-        cp_async_wait<PSTAGES - 2>();
++        cp_async_wait<PS - 2>();
+         __syncthreads();
+-        if (c + PSTAGES - 1 < chunks) load(c + PSTAGES - 1);
++        if (c + PS - 1 < chunks) load(c + PS - 1);
+         cp_async_commit();
+-        const half* base = stage + (size_t)(c % PSTAGES) * C::STAGE_HALVES;
++        const half* base = stage + (size_t)(c % PS) * C::STAGE_HALVES;
+         const half* xs = base + (size_t)(SHX ? 0 : mat) * PM * PXS;
+         const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)C::XM * PM * PXS);
+ #pragma unroll
+@@ -738,11 +738,11 @@ __device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const f
+ }
+ 
+ constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
+-template <int PM, int XM = 2>
++template <int PM, int XM = 2, int PS = PSTAGES>
+ constexpr size_t prompt_smem() {
+     // max of: gate/up stages (XM copies of the member rows), down stages, gate/up epilogue half (2 x PM/2 x GU_ES),
+     // down half (PM/2 x DN_ES)
+-    const size_t gu = (size_t)PSTAGES * (XM * PM * PXS + 2 * PWORDS) * 2;
++    const size_t gu = (size_t)PS * (XM * PM * PXS + 2 * PWORDS) * 2;
+     const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
+     const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
+     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+@@ -811,7 +811,7 @@ __global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restric
+ }
+ 
+ // SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
+-template <int PM, int NW, bool SHX>
++template <int PM, int NW, bool SHX, int PS = PSTAGES>
+ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+     const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
+     const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+@@ -836,7 +836,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[MT][PM / 8][4];
+-    prompt_mainloop<2, PM, NW, SHX>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
++    prompt_mainloop<2, PM, NW, SHX, PS>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
+                                     reinterpret_cast<half*>(smem_raw), acc);
+     float* Eg = reinterpret_cast<float*>(smem_raw);
+     int mat, nt;
+@@ -877,7 +877,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+     }  // halves
+ }
+ 
+-template <int PM, int NW>
++template <int PM, int NW, int PS = PSTAGES>
+ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+     const half* __restrict__ Xd, const uint32_t* __restrict__ Td, const int* __restrict__ items,
+     const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+@@ -895,7 +895,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[MT][PM / 8][4];
+-    prompt_mainloop<1, PM, NW>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
++    prompt_mainloop<1, PM, NW, false, PS>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
+                                acc);
+     float* Ed = reinterpret_cast<float*>(smem_raw);
+     for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
+@@ -1070,21 +1070,22 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
+ }
+ 
+ // Prompt chunks (a plan of PM-pair items, PM 64 or 128): Xd [P, N] = the gate/up epilogue of Xg/Xu's pairs;
+-// Y [P, D] = the down epilogue.
+-template <int PM, int NW>
++// Y [P, D] = the down epilogue. PS: the cp.async pipeline depth (loads only: every output's chain is the same).
++template <int PM, int NW, int PS = PSTAGES>
+ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
+                           const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                           const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                           const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+                           int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx,
+                           const int* order) {
+-    constexpr size_t SMEM = prompt_smem<PM>(), SMEM_SHX = prompt_smem<PM, 1>();
++    constexpr size_t SMEM = prompt_smem<PM, 2, PS>(), SMEM_SHX = prompt_smem<PM, 1, PS>();
+     static bool once = [] {
+-        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false, PS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              (int)SMEM);
+-        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true, PS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              (int)SMEM_SHX);
+-        cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
++        cudaFuncSetAttribute(prompt_down_kernel<PM, NW, PS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                             (int)SMEM);
+         return true;
+     }();
+     (void)once;
+@@ -1093,17 +1094,17 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
+     const dim3 gu_grid((unsigned)(N / 128), (unsigned)max_items);
+     if (shx)
+-        prompt_gateup_kernel<PM, NW, true><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
++        prompt_gateup_kernel<PM, NW, true, PS><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
+             h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+             (float)limit, (int)slots, order);
+     else
+-        prompt_gateup_kernel<PM, NW, false><<<gu_grid, NW * 32, SMEM, stream>>>(
++        prompt_gateup_kernel<PM, NW, false, PS><<<gu_grid, NW * 32, SMEM, stream>>>(
+             h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+             (float)limit, (int)slots, order);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+-    prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
++    prompt_down_kernel<PM, NW, PS><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+         reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
+         members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E, order);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+@@ -1114,8 +1115,9 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
+                       const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                       const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+                       int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx,
+-                      const c10::optional<at::Tensor>& order_buf) {
++                      const c10::optional<at::Tensor>& order_buf, int64_t stages) {
+     TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
++    TORCH_CHECK(stages >= 2 && stages <= 4, "prompt experts: 2 to 4 pipeline stages");
+     const int* order = nullptr;
+     if (order_buf.has_value()) {
+         TORCH_CHECK(order_buf->numel() >= max_items, "prompt experts: order buffer too small");
+@@ -1126,12 +1128,15 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
+         C10_CUDA_KERNEL_LAUNCH_CHECK();
+         order = o;
+     }
+-    if (pass == 128)
+-        prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
+-                               E, max_items, limit, slots, shx, order);
+-    else if (pass == 64)
+-        prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+-                             max_items, limit, slots, shx, order);
+-    else
++#define GO(PM_, NW_, PS_)                                                                                         \
++    prompt_launch<PM_, NW_, PS_>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, \
++                                 E, max_items, limit, slots, shx, order)
++    if (pass == 128) {
++        if (stages == 2) GO(128, 16, 2); else if (stages == 4) GO(128, 16, 4); else GO(128, 16, 3);
++    } else if (pass == 64) {
++        if (stages == 2) GO(64, 8, 2); else if (stages == 4) GO(64, 8, 4); else GO(64, 8, 3);
++    } else {
+         TORCH_CHECK(false, "prompt experts: passes of 64 or 128 members");
++    }
++#undef GO
+ }
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 5e67715..d5abc3a 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -78,7 +78,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v20a1", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v20a2", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -97,6 +97,8 @@ def dec_config(kind: str, K: int, N: int, R: int) -> dict:
+     t = tune.pick("exl3_dec_" + kind, tune.shape(K, N), R)
+     if t:
+         cfg.update(t)
++    if cfg["wn"] == 4 and cfg["ld"] != 0:            # (tune refuses such an entry; a merge must not reach the kernel)
++        cfg["wn"] = 1
+     return cfg
+ 
+ 
+@@ -196,12 +198,20 @@ def prompt_pass() -> int:
+     import os
+ 
+     t = tune.pick("exl3_prompt", "all")
+-    value = int(t["passm"]) if t else int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
++    value = int(t["passm"]) if t and "passm" in t else int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
+     if value not in (64, 128):
+         raise ValueError(f"TF_GLM_EXL3_PASS is 64 or 128, not {value}")
+     return value
+ 
+ 
++def prompt_stages() -> int:
++    """The prompt kernels' cp.async pipeline depth: 3 (GB10's), or a launch table's ``exl3_prompt`` entry "all"
++    (TF_GLM_TUNE): 2 to 4, loads only, the same bits."""
++
++    t = tune.pick("exl3_prompt", "all")
++    return int(t.get("stages", 3)) if t else 3
++
++
+ def prompt_kernels() -> bool:
+     """TF_GLM_EXL3_PROMPT (default on): prompt chunks run the Y^T = W^T X^T kernels on a 64-pair plan (one fp32
+     chain a row: other bits than the decode kernels', independent of the chunking); 0: the decode kernels."""
+@@ -263,7 +273,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+         ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
+                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
+                                                                                    plan.tile), float(limit),
+-                   plan.tile, slots, shx, s.order if item_order() else None)
++                   plan.tile, slots, shx, s.order if item_order() else None, prompt_stages())
+         return
+     if plan.tile != grouped.TILE:
+         raise ValueError("the EXL3 kernel takes items of 16 pairs")
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index d9759f8..5e486e9 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -77,6 +77,10 @@ class Buffers:
+         self.post = torch.empty((rows, S), dtype=f32, device=dev)
+         self.comb = torch.empty((rows, S * S), dtype=f32, device=dev)
+         self.hcpart = torch.empty((rows, glue.HC_BLOCKS, 32), dtype=f32, device=dev)
++        # decode windows' new hyper-connection streams under TF_GLM_FUSE hc (glue.hc_post_pre's scratch): only when
++        # the setting asks for hc, for windows of up to TF_GLM_FUSE_HC_ROWS rows
++        hc_rows = 0 if prefill else _hc_scratch_rows(rows)
++        self.hcx = torch.empty((hc_rows, S * D), dtype=bf, device=dev) if hc_rows else None
+         # KDA
+         self.ka = torch.empty((rows, LL * 128), dtype=bf, device=dev)
+         self.kg = torch.empty((rows, LL * 128), dtype=bf, device=dev)
+@@ -493,20 +497,62 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+                 kda_front(layer, b, lo, hi)
+         else:
+             mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+-            fa = p[:, k.fa_off:k.fa_off + 128]
+-            ga = p[:, k.ga_off:k.ga_off + 128]
+-            mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+-            mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++            _kda_gates(layer, b, p, R)
+             l2pf.site(layer.index, "o")
+     if pre:                              # a prompt chunk keeps every row: the layer commits now
+         out = kda_rows(layer, w, st, b, 0, R)
+     else:
+         cur = st.cur[li]
+         with prof.timed("kda: recurrence"):
++            sums = _kda_out_sums(k)
+             out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
++                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li],
++                                xs=b.kxs[:R] if sums else None)
+     with prof.timed("kda: out + all-gather"):
+-        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
++        xs = None if pre else b.kxs[:R] if sums else qmm.group_sums(out, b.kxs[:R])
++        return out_proj(w, b, out, k.o, xs, R, site=(layer.index, "a"))
++
++
++def _fuse():
++    from . import fuse
++
++    return fuse
++
++
++def _hc_scratch_rows(rows: int) -> int:
++    """Rows of the hc fusion's scratch for a decode buffer of ``rows`` rows (0: none). Never raises: a setting that is
++    not valid gets none here, and the engine's start check refuses it on every rank."""
++    try:
++        f = _fuse()
++        return min(rows, f.hc_rows()) if f.asks("hc") else 0
++    except ValueError:
++        return 0
++
++
++def _fused(name: str, applies: bool, check) -> bool:
++    """TF_GLM_FUSE: run fusion ``name`` here (it applies to these tensors and passed its check on this GPU)."""
++    return applies and _fuse().on(name, check)
++
++
++def _kda_gates(layer: LayerW, b: Buffers, p: torch.Tensor, R: int) -> None:
++    """A decode window's KDA gate projections: f_b and g_b on their 128-input low-rank rows and their group sums (one
++    launch for both under TF_GLM_FUSE gates, the same bits)."""
++
++    k = layer.kda
++    fa = p[:, k.fa_off:k.fa_off + 128]
++    ga = p[:, k.ga_off:k.ga_off + 128]
++    if k.ga_off == k.fa_off + 128 and _fused("gates", True, lambda: _fuse().check_gates(p.shape[1], k.fa_off, p.device)):
++        qmm.group_sums_split(p[:, k.fa_off:k.fa_off + 256], 128, b.xs_fa[:R], b.xs_ga[:R])
++        mm(b, fa, k.fb, b.xs_fa[:R], b.ka[:R])
++        mm(b, ga, k.gb, b.xs_ga[:R], b.kg[:R])
++        return
++    mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
++    mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++
++
++def _kda_out_sums(k) -> bool:
++    """Whether the KDA chain writes its read-out's group sums itself (TF_GLM_FUSE kdaout, checked on this GPU)."""
++    return _fused("kdaout", True, lambda: _fuse().check_kdaout(k.heads, k.a_log.device))
+ 
+ 
+ def _scratch_rows(s, lo: int):
+@@ -551,17 +597,16 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
+     p = proj[li, :R]
+     with prof.timed("kda: projections"):
+         mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+-        fa = p[:, k.fa_off:k.fa_off + 128]
+-        ga = p[:, k.ga_off:k.ga_off + 128]
+-        mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+-        mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++        _kda_gates(layer, b, p, R)
+         l2pf.site(layer.index, "o")
+     with prof.timed("kda: recurrence"):
++        sums = _kda_out_sums(k)
+         out = kda_mod.chain_segments(seg, p, k.b_off, b.ka[:R], b.kg[:R], slots.conv[:, li], k.conv,
+                                      slots.rec[:, :, li], k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R,
+-                                     scratch.views[li])
++                                     scratch.views[li], xs=b.kxs[:R] if sums else None)
+     with prof.timed("kda: out + all-gather"):
+-        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
++        return out_proj(w, b, out, k.o, b.kxs[:R] if sums else qmm.group_sums(out, b.kxs[:R]), R,
++                        site=(layer.index, "a"))
+ 
+ 
+ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -779,8 +824,14 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+     c = w.cfg
+     m = layer.moe
+     with prof.timed("moe: route"):
+-        glue.router(b.normed[:R], m.router, b.mlog[:R])
+-        glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
++        x = b.normed[:R]
++        if not b.prefill and _fused("router", glue.router_select_ok(x, m.router, b.mlog[:R]), lambda: _fuse().check_router(
++                x, m.router, m.bias, c.top_k, c.experts, c.routed_scale, c.norm_topk)):
++            glue.router_select(x, m.router, b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts,
++                               c.routed_scale, c.norm_topk)
++        else:
++            glue.router(x, m.router, b.mlog[:R])
++            glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+         if b.plan is not None:           # (the universal EXL3 route groups its own pairs)
+             grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
+     if m.shared is not None:
+@@ -869,20 +920,53 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     segmented blocks, ``verify.BatchedVerify``); everything else is the same calls."""
+ 
+     c = w.cfg
+-    x = b.x[:R]
+-    h = layer.attn_hc
+-    glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+-                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
++    _hc_pre(b, R, c, layer.attn_hc, layer.in_norm)
+     g = mixer(layer) if mixer is not None else _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
+     with prof.timed("hc"):
+-        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+-        h = layer.ffn_hc
+-        glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+-                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
++        _hc_post(b, R, g)
++        _hc_pre(b, R, c, layer.ffn_hc, layer.post_norm)
+     g = _ffn(layer, w, b, R)
++    _hc_post(b, R, g)
++
++
++# Decode windows (TF_GLM_FUSE hc, fuse.py): a site's hc_post is left pending and runs inside the next site's hc_pre
++# (glue.hc_post_pre: two launches instead of three, the same bits); anything else that reads b.x first flushes it.
++def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
++    from . import fuse
++
++    x = b.x[:R]
++    _hc_flush(b, R)                      # (never pending here: every hc_post is followed by an hc_pre or a flush)
++    if (not b.prefill and getattr(b, "hcx", None) is not None and fuse.asks("hc") and R <= fuse.hc_rows()
++            and R <= b.hcx.shape[0] and glue.hc_post_pre_ok(x, g)):
++        b.hc_pending = g                 # the gathered partials: read by the next hc_pre, before the next gather
++        return
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+ 
+ 
++def _hc_flush(b: Buffers, R: int) -> None:
++    g = getattr(b, "hc_pending", None)
++    if g is not None:
++        b.hc_pending = None
++        glue.hc_post(b.x[:R], b.x[:R], g, b.post[:R], b.comb[:R])
++
++
++def _hc_pre(b: Buffers, R: int, c, h, norm: torch.Tensor) -> None:
++    x = b.x[:R]
++    g = getattr(b, "hc_pending", None)
++    if g is not None:
++        from . import fuse
++
++        b.hc_pending = None
++        if glue.hc_post_pre_ok(x, g, h.fn, norm) and b.hcpart.is_contiguous() and fuse.on(
++                "hc", lambda: fuse.check_hc(x, g, h.fn, h.base, h.scale, norm, c.eps, c.hc_eps, c.hc_iters)):
++            glue.hc_post_pre(x, g, h.fn, h.base, h.scale, norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
++                             b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, b.hcx[:R])
++            return
++        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
++    glue.hc_pre(x, h.fn, h.base, h.scale, norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R], b.hcpart[:R], c.eps,
++                c.hc_eps, c.hc_iters, prompt=b.prefill)
++
++
+ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+                  mixer=None) -> None:
+     """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
+@@ -975,10 +1059,15 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
+         else:
+             split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
+     else:
++        b.hc_pending = None
+         for layer in w.layers:
+             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
+-            for slot in b.tap_at.get(layer.index, ()):
++            taps = b.tap_at.get(layer.index, ())
++            if taps:
++                _hc_flush(b, R)
++            for slot in taps:
+                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
++        _hc_flush(b, R)
+         glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+diff --git tensorfold/families/glm5_next/cuda/fuse.py tensorfold/families/glm5_next/cuda/fuse.py
+new file mode 100644
+index 0000000..5c9905d
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/fuse.py
+@@ -0,0 +1,285 @@
++"""Decode-window kernel fusions that keep every output's bits (TF_GLM_FUSE).
++
++A decode forward of GLM-5.3-Flash launches about 1,800 kernels; on a large discrete GPU each launch costs about as
++much as a small kernel's work. These fusions run two or three adjacent kernels as fewer launches with the same
++per-element operations, the same reduction trees and the same roundings:
++
++  hc      a site's hyper-connection post with the next site's pre (hc_post + hc_partial + _hc_finish: 3 launches to
++          2, at the 84 of the 90 sites that are not followed by a tap or the final mean; glue.hc_post_pre)
++  router  the MoE router's slice sum with its top-k selection (2 to 1, every MoE layer; glue.router_select)
++  gates   the KDA gates' two 64-input group sums (2 to 1, every KDA layer; qmm.group_sums_split)
++  kdaout  the KDA read-out's group sums inside its output kernel (2 to 1, every KDA layer; kda.chain(xs=...))
++
++Setting: TF_GLM_FUSE unset, "1" or "on": router and gates (Triton kernels holding the unfused kernels' source
++verbatim); "all": kdaout and hc as well, which reproduce in CUDA what Triton 3.7 compiles for the unfused kernels
++(_group_sums' reduction tree for these rows, _hc_post's per-element operation order, read from their PTX), so they
++are exact by construction for that compiler and checked again on the GPU (another Triton version may compile the
++unfused kernels otherwise: the check then turns the fusion off); "0" or "off": none (the off switch); a
++comma-separated list of names: those. Prompt chunks never take them. TF_GLM_FUSE_HC_ROWS (default 8): windows of
++more rows keep hc unfused (its blocks recompute their K block of the new streams from all four old ones, extra L2
++reads that grow with the rows while the launch it saves does not; both ways give the same bits, so the limit is a
++speed choice). The engine reads both settings at start on every rank and refuses a value that is not valid, or
++values that differ between ranks, on every rank together.
++
++Each fusion is used only after it gave the unfused kernels' bits on this GPU: on its first call outside a CUDA graph
++capture, both run on random inputs of the call's widths (with the call's own weights; hundreds to a thousand rows,
++several seeds; values spread over a wide range of magnitudes and, for hc, a cancelling draw as well, so that another
++order of operations shows) and their outputs are compared byte for byte; any difference turns that fusion off for
++the process (a line says so) and the unfused kernels run, as they do inside a capture before the check. The engine's
++graphs are captured after eager warm-up rounds, which run the checks. Decisions are per process (per rank); a fused
++and an unfused rank compute the same bits.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++import os
++from typing import Callable
++
++import torch
++
++NAMES = ("hc", "router", "gates", "kdaout")
++DEFAULT = ("router", "gates")
++CHECK_ROWS = 1024                  # rows the checks run (fewer where a row is large)
++CHECK_SEEDS = 3
++
++_decided: dict[str, bool] = {}
++_wanted: frozenset | None = None
++
++
++def wanted() -> frozenset:
++    """The fusions TF_GLM_FUSE asks for (read once)."""
++
++    global _wanted
++    if _wanted is None:
++        v = (os.environ.get("TF_GLM_FUSE", "") or "on").strip().lower()
++        if v in ("1", "on"):
++            _wanted = frozenset(DEFAULT)
++        elif v == "all":
++            _wanted = frozenset(NAMES)
++        elif v in ("0", "off", "none"):
++            _wanted = frozenset()
++        else:
++            names = {n.strip() for n in v.split(",") if n.strip()}
++            bad = names - set(NAMES)
++            if bad:
++                raise ValueError(f"TF_GLM_FUSE: on, off or names among {', '.join(NAMES)}; "
++                                 f"not {', '.join(sorted(bad))}")
++            _wanted = frozenset(names)
++    return _wanted
++
++
++def reset(value: str | None = None) -> None:
++    """Forget the decisions (tests): TF_GLM_FUSE is read again, or ``value`` is used."""
++
++    global _wanted, _hc_rows
++    _decided.clear()
++    _wanted = None
++    _hc_rows = None
++    if value is not None:
++        os.environ["TF_GLM_FUSE"] = value
++
++
++def code() -> int:
++    """The requested fusions as a bit mask (for logs and tests; ranks may differ in what their checks allowed)."""
++    return sum(1 << i for i, n in enumerate(NAMES) if n in wanted())
++
++
++_hc_rows: int | None = None
++
++
++def hc_rows() -> int:
++    """TF_GLM_FUSE_HC_ROWS: the most rows a window may have for the hc fusion (read once)."""
++
++    global _hc_rows
++    if _hc_rows is None:
++        v = int(os.environ.get("TF_GLM_FUSE_HC_ROWS", "") or 8)
++        if v < 0:
++            raise ValueError("TF_GLM_FUSE_HC_ROWS: 0 (never) or more rows")
++        _hc_rows = v
++    return _hc_rows
++
++
++def asks(name: str) -> bool:
++    """Whether the setting asks for ``name`` (before its check)."""
++    return name in wanted()
++
++
++def on(name: str, check: Callable[[], bool]) -> bool:
++    """Whether to run fusion ``name`` now: asked for, and its check passed (run here on its first call outside a
++    capture); inside a capture before the check: False."""
++
++    if name not in wanted():
++        return False
++    got = _decided.get(name)
++    if got is not None:
++        return got
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        ok = bool(check())
++        why = "" if ok else ": its outputs differ from the unfused kernels' on this GPU"
++    except Exception as exc:  # noqa: BLE001 - a fusion that cannot run here is off, the unfused kernels run
++        ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++    _decided[name] = ok
++    print(f"[tensorfold] decode fusion {name}: {'on (checked bit for bit)' if ok else 'off' + why}", flush=True)
++    return ok
++
++
++def _same(*pairs) -> bool:
++    for a, b in pairs:
++        if a.shape != b.shape or a.dtype != b.dtype:
++            return False
++        if not torch.equal(a.contiguous().view(-1).view(torch.uint8), b.contiguous().view(-1).view(torch.uint8)):
++            return False
++    return True
++
++
++def _gen(seed: int, device) -> torch.Generator:
++    return torch.Generator(device=device).manual_seed(seed)
++
++
++def _wide(shape, gen, device, spread: int = 12, scale: float = 1.0) -> torch.Tensor:
++    """Normal values times 2^e, e uniform in [-spread, spread] per element: sums of such values round differently
++    under any other order of operations (a fp32 tensor)."""
++    e = torch.randint(-spread, spread + 1, shape, device=device, generator=gen).to(torch.float32)
++    return torch.randn(shape, device=device, generator=gen) * torch.exp2(e) * scale
++
++
++def check_hc(x: torch.Tensor, g: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor,
++             norm_w: torch.Tensor, eps: float, hc_eps: float, iters: int) -> bool:
++    """hc_post + hc_pre against glue.hc_post_pre on random streams, partials, post and comb (the call's weights):
++    CHECK_SEEDS draws over a wide range of magnitudes (another order of the partials' adds shows) and one cancelling
++    draw (``hc_cancelling``), on which another rounding order of the first two products shows."""
++
++    dev, R = x.device, 256
++    world, _, d = g.shape
++    for seed in range(CHECK_SEEDS + 1):
++        if not _check_hc_once(dev, R, world, d, x.shape[1], seed, fn, base, scale, norm_w, eps, hc_eps, iters,
++                              cancel=seed == CHECK_SEEDS):
++            return False
++    return True
++
++
++def hc_cancelling(x: torch.Tensor, g: torch.Tensor, comb: torch.Tensor) -> None:
++    """Make a draw cancelling, in place: stream 1 = -stream 0, stream 1's comb weights 1 + 2^-20 times stream 0's,
++    streams 2 and 3 and the gathered partials 2^-36 smaller. A new stream's x0 c0 + x1 c1 then nearly cancels, so the
++    rounding of whichever product is rounded first (an fp32 ulp of x0 c0) is a large part of the result and shows in
++    its bf16 value for most elements (about 92%); on draws of independent values it shows for a few in a million."""
++
++    d = g.shape[-1]
++    x[:, d:2 * d] = -x[:, :d]
++    x[:, 2 * d:] *= 2.0 ** -36
++    g *= 2.0 ** -36
++    comb[:, 4:8] = comb[:, 0:4] * (1 + 2.0 ** -20)
++
++
++def _check_hc_once(dev, R, world, d, wide, seed, fn, base, scale, norm_w, eps, hc_eps, iters, cancel=False) -> bool:
++    from . import glue
++
++    gen = _gen(10 + seed, dev)
++    xs0 = _wide((R, wide), gen, dev, 6).to(torch.bfloat16)
++    gg = _wide((world, R, d), gen, dev, 6)
++    post0 = torch.rand((R, 4), device=dev, generator=gen) * 2.0
++    comb0 = torch.rand((R, 16), device=dev, generator=gen) * 0.5
++    if cancel:
++        hc_cancelling(xs0, gg, comb0)
++    outs = []
++    for fused in (False, True):
++        xx, post, comb = xs0.clone(), post0.clone(), comb0.clone()
++        out = torch.empty((R, d), dtype=torch.bfloat16, device=dev)
++        xs = torch.empty((R, d // 64), dtype=torch.float32, device=dev)
++        part = torch.zeros((R, glue.HC_BLOCKS, 32), dtype=torch.float32, device=dev)
++        if fused:
++            xn = torch.empty_like(xx)
++            glue.hc_post_pre(xx, gg, fn, base, scale, norm_w, out, xs, post, comb, part, eps, hc_eps, iters, xn)
++        else:
++            glue.hc_post(xx, xx, gg, post, comb)
++            glue.hc_pre(xx, fn, base, scale, norm_w, out, xs, post, comb, part, eps, hc_eps, iters)
++        outs.append((xx, out, xs, post, comb, part[:, :, :25].contiguous()))
++    return _same(*zip(*outs))
++
++
++def check_router(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, top_k: int, experts: int, scale: float,
++                 norm: bool) -> bool:
++    """router + select against glue.router_select on random rows (the call's router weights and bias)."""
++
++    from . import glue
++
++    dev, R = x.device, CHECK_ROWS
++    xx = _wide((R, x.shape[1]), _gen(2, dev), dev, 4).to(x.dtype)
++    if w.shape[0] != experts:
++        return False
++    outs = []
++    for fused in (False, True):
++        logits = torch.empty((R, experts), dtype=torch.float32, device=dev)
++        pick = torch.empty((R, top_k + 1), dtype=torch.int32, device=dev)
++        wts = torch.empty((R, top_k + 1), dtype=torch.float32, device=dev)
++        if fused:
++            glue.router_select(xx, w, logits, bias, pick, wts, top_k, experts, scale, norm)
++        else:
++            glue.router(xx, w, logits)
++            glue.select(logits, bias, pick, wts, top_k, experts, scale, norm)
++        outs.append((logits, pick, wts))
++    return _same(*zip(*outs))
++
++
++def check_gates(width: int, fa_off: int, device) -> bool:
++    """Two qmm.group_sums against qmm.group_sums_split on random projection rows."""
++
++    from . import qmm
++
++    R = CHECK_ROWS
++    p = _wide((R, width), _gen(3, device), device, 12).to(torch.bfloat16)
++    a1 = torch.empty((R, 2), dtype=torch.float32, device=device)
++    b1 = torch.empty_like(a1)
++    a2, b2 = torch.empty_like(a1), torch.empty_like(a1)
++    qmm.group_sums(p[:, fa_off:fa_off + 128], a1)
++    qmm.group_sums(p[:, fa_off + 128:fa_off + 256], b1)
++    qmm.group_sums_split(p[:, fa_off:fa_off + 256], 128, a2, b2)
++    return _same((a1, a2), (b1, b2))
++
++
++def check_kdaout(heads: int, device) -> bool:
++    """The wide KDA chain plus qmm.group_sums of its output against the chain with xs, on random inputs."""
++
++    for seed in range(CHECK_SEEDS):
++        if not _check_kdaout_once(heads, device, 192, seed):
++            return False
++    return True
++
++
++def _check_kdaout_once(heads: int, device, R: int, seed: int) -> bool:
++    from . import kda, qmm
++
++    H = heads
++    gen = _gen(40 + seed, device)
++    C = 3 * H * kda.DK
++    b_off = C + 256
++    p = (torch.randn((R, b_off + H + 32), device=device, generator=gen) * 0.5).to(torch.bfloat16)
++    a = torch.randn((R, H * kda.DK), device=device, generator=gen).to(torch.bfloat16)
++    # gates and norm weights over many magnitudes: the read-outs then span enough exponents that a 64-wide sum rounds
++    # differently under any other order (sums of a narrow range of bf16 values are exact in every order)
++    gate = (_wide((R, H * kda.DV), gen, device, 2) * 6).to(torch.bfloat16)
++    cs = (torch.randn((3, C), device=device, generator=gen) * 0.5).to(torch.bfloat16)
++    cw = (torch.randn((C, 4), device=device, generator=gen) * 0.5).to(torch.bfloat16)
++    state = torch.randn((H, kda.DV, kda.DK), device=device, generator=gen) * 0.1
++    a_log = torch.rand(H, device=device, generator=gen) * 2 - 1
++    dt = torch.randn(H * kda.DK, device=device, generator=gen) * 0.1
++    nw = torch.exp2(torch.randint(-8, 9, (kda.DV,), device=device, generator=gen).float()).to(torch.bfloat16)
++    outs = []
++    for fused in (False, True):
++        sc = kda.KDAScratch(R, H, device)
++        so = torch.empty_like(state)
++        xs = torch.empty((R, H * kda.DV // 64), dtype=torch.float32, device=device)
++        out = kda.chain(p, b_off, a, gate, cs, cw, state, a_log, dt, nw, 1e-5, -5.0, R, sc, so, wide=True,
++                        xs=xs if fused else None)
++        if not fused:
++            qmm.group_sums(out, xs)
++        outs.append((out.clone(), so, xs))
++    return _same(*zip(*outs))
++
++
++__all__ = ["NAMES", "asks", "check_gates", "check_hc", "check_kdaout", "check_router", "code", "on", "reset",
++           "wanted"]
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index 993b71a..2eea48e 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -199,7 +199,7 @@ def _hc_ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_hc_v2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
++    return load(name="tensorfold_glm_hc_v2a2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -297,6 +297,96 @@ def hc_post_ranks(x: torch.Tensor, xout: torch.Tensor, first: torch.Tensor, stri
+                                  num_warps=4)
+ 
+ 
++@triton.jit
++def _hc_finish_copy(XN, X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
++                    D: tl.constexpr, S: tl.constexpr, NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr):
++    """``hc_post_pre``'s second launch, row r: _hc_finish's code verbatim on the new streams XN (which the first
++    launch computed with _hc_post's operations and stored there; this kernel recomputes nothing), then XN's row copied
++    to X, bit for bit. No buffer is read and written here: XN and PART are read, X, OUT, XS, POST and COMB written."""
++
++    r = tl.program_id(0)
++    m = tl.arange(0, 32)
++    mix = tl.zeros((32,), dtype=tl.float32)
++    ss = 0.0
++    for b in range(NB):
++        mix += tl.load(PART + (r * NB + b) * 32 + m)
++        ss += tl.load(PART + (r * NB + b) * 32 + 24)
++    rinv = 1.0 / tl.sqrt(ss / (S * D) + eps_norm)
++    mix = mix * rinv
++    s_pre = tl.load(SCALE + 0)
++    s_post = tl.load(SCALE + 1)
++    s_comb = tl.load(SCALE + 2)
++    sv = tl.arange(0, 4)
++    base = tl.load(BASE + m, mask=m < 24, other=0.0)
++    pre_logit = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s_pre + base)[None, :], 0.0), axis=1)
++    post_logit = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s_post + base)[None, :], 0.0), axis=1)
++    pre = 1.0 / (1.0 + tl.exp(-pre_logit)) + hc_eps
++    post = 2.0 * (1.0 / (1.0 + tl.exp(-post_logit)))
++    ii = tl.arange(0, 4)[:, None]
++    jj = tl.arange(0, 4)[None, :]
++    flat = 8 + ii * 4 + jj
++    cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s_comb + base)[None, None, :], 0.0), axis=2)
++    cmax = tl.max(cl, axis=1)
++    ce = tl.exp(cl - cmax[:, None])
++    comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
++    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
++    for _ in range(ITERS - 1):
++        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
++        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
++    tl.store(POST + r * S + sv, post)
++    tl.store(COMB + r * 16 + ii * 4 + jj, comb)
++    d = tl.arange(0, BLOCK)
++    p0 = tl.sum(tl.where(sv == 0, pre, 0.0), axis=0)
++    p1 = tl.sum(tl.where(sv == 1, pre, 0.0), axis=0)
++    p2 = tl.sum(tl.where(sv == 2, pre, 0.0), axis=0)
++    p3 = tl.sum(tl.where(sv == 3, pre, 0.0), axis=0)
++    x0 = tl.load(XN + r * (S * D) + d).to(tl.float32)
++    x1 = tl.load(XN + r * (S * D) + D + d).to(tl.float32)
++    x2 = tl.load(XN + r * (S * D) + 2 * D + d).to(tl.float32)
++    x3 = tl.load(XN + r * (S * D) + 3 * D + d).to(tl.float32)
++    c = (((p0 * x0 + p1 * x1) + p2 * x2) + p3 * x3).to(tl.bfloat16).to(tl.float32)
++    rinv2 = 1.0 / tl.sqrt(tl.sum(c * c, axis=0) / D + eps_norm)
++    w = tl.load(NW + d).to(tl.float32)
++    y = (w * (c * rinv2).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    tl.store(OUT + r * D + d, y)
++    g = tl.sum(tl.reshape(y.to(tl.float32), (BLOCK // 64, 64)), axis=1)
++    tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
++    for s in tl.static_range(S):                              # the new streams into X, bit for bit
++        tl.store(X + r * (S * D) + s * D + d, tl.load(XN + r * (S * D) + s * D + d))
++
++
++def hc_post_pre_ok(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor | None = None,
++                   norm_w: torch.Tensor | None = None) -> bool:
++    """Whether ``hc_post_pre`` takes these tensors (decode rows at the CUDA kernel's shapes); ``fn`` / ``norm_w``:
++    the next site's weights, when known."""
++    if gathered.dim() != 3:
++        return False
++    world, rows, d = gathered.shape
++    ok = (x.is_contiguous() and gathered.is_contiguous() and gathered.dtype == torch.float32 and x.dim() == 2
++          and x.shape[1] == 16384 and d == 4096 and HC_BLOCKS == 16 and 1 <= world <= 4 and x.shape[0] == rows)
++    if fn is not None:
++        ok = ok and fn.is_contiguous() and tuple(fn.shape) == (24, 16384)
++    if norm_w is not None:
++        ok = ok and norm_w.shape[0] == d
++    return ok
++
++
++def hc_post_pre(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor,
++                norm_w: torch.Tensor, out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
++                part: torch.Tensor, eps: float, hc_eps: float, iters: int, xn: torch.Tensor) -> None:
++    """``hc_post(x, x, gathered, post, comb)`` then ``hc_pre(x, fn, ..., post, comb, part)`` for decode rows in two
++    launches instead of three, with the same bits (``fuse``'s check compares them on this GPU first): the new streams
++    (hc.cu, POST: _hc_post's operations as Triton orders them, into ``xn`` [rows, S * D] bf16, scratch) and their
++    partial dots from the old streams, then _hc_finish on xn and xn's rows copied to x (_hc_finish_copy). ``post`` /
++    ``comb`` hold the previous site's on entry and this site's on return."""
++
++    world, rows, d = gathered.shape
++    s = x.shape[1] // d
++    _hc_ext().hc_post_partial(x, gathered, rows * d, post, comb, fn, part, rows, world, xn)
++    _hc_finish_copy[(rows,)](xn, x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s,
++                             NB=HC_BLOCKS, ITERS=iters, BLOCK=d, num_warps=8)
++
++
+ @triton.jit
+ def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+     """Plain residual (the MTP block): X = bf16(X + bf16(partials summed rank 0 first))."""
+@@ -477,6 +567,68 @@ def select(logits: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, wts: to
+                    SLOTP=triton.next_power_of_2(top_k + 1), NORM=norm, num_warps=4)
+ 
+ 
++@triton.jit
++def _router_topk(PART, L, BIAS, PICK, WTS, scale, total, KS: tl.constexpr, NE: tl.constexpr, TOPK: tl.constexpr,
++                 SLOTS: tl.constexpr, BLOCK: tl.constexpr, SLOTP: tl.constexpr, NORM: tl.constexpr):
++    """_router_sum then _topk for row r in one program (decode rows, ``router_select``): the row's logits are the KS
++    slice partials added in slice order (_router_sum's adds), stored to L as _router_sum does, then _topk's code as it
++    is on them (its load of L replaced by the values just summed: the same fp32 values)."""
++
++    r = tl.program_id(0)
++    ar = tl.arange(0, BLOCK)
++    ak = tl.arange(0, SLOTP)
++    ok = ar < NE
++    i = r * NE + ar
++    lg = tl.load(PART + i, mask=ok, other=0.0)
++    for s in tl.static_range(1, KS):
++        lg = lg + tl.load(PART + s * total + i, mask=ok, other=0.0)
++    tl.store(L + i, lg, mask=ok)
++    score = 1.0 / (1.0 + tl.exp(-lg))
++    choice = tl.where(ok, score + tl.load(BIAS + ar, mask=ok, other=0.0), float("-inf"))
++    picks = tl.zeros((SLOTP,), dtype=tl.int32)
++    wts = tl.zeros((SLOTP,), dtype=tl.float32)
++    total_w = 0.0
++    for k in tl.static_range(TOPK):
++        mx = tl.max(choice, axis=0)
++        idx = tl.min(tl.where(choice == mx, ar, BLOCK), axis=0)
++        sk = tl.sum(tl.where(ar == idx, score, 0.0), axis=0)
++        picks = tl.where(ak == k, idx, picks)
++        wts = tl.where(ak == k, sk, wts)
++        total_w += sk
++        choice = tl.where(ar == idx, float("-inf"), choice)
++    if NORM:
++        wts = wts / (total_w + 1e-20)
++    wts = wts * scale
++    picks = tl.where(ak == TOPK, NE, picks)
++    wts = tl.where(ak == TOPK, 1.0, wts)
++    tl.store(PICK + r * SLOTS + ak, picks, mask=ak < SLOTS)
++    tl.store(WTS + r * SLOTS + ak, wts, mask=ak < SLOTS)
++
++
++def router_select_ok(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> bool:
++    """Whether ``router`` runs the sliced path here (the one ``router_select`` fuses), with one logit an expert."""
++    return (ROUTER_KS > 1 and x.shape[1] % (ROUTER_KS * 64) == 0 and out.is_contiguous()
++            and w.shape[0] == out.shape[-1])
++
++
++def router_select(x: torch.Tensor, w: torch.Tensor, logits: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor,
++                  wts: torch.Tensor, top_k: int, experts: int, scale: float, norm: bool) -> None:
++    """``router(x, w, logits)`` then ``select(logits, ...)`` with _router_sum folded into _topk: one launch less,
++    the same bits (``fuse``'s check compares them on this GPU first); logits are written as before."""
++
++    m, d = x.shape
++    ne = w.shape[0]
++    bm = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
++    ks = ROUTER_KS
++    part = torch.empty((ks, m, ne), dtype=torch.float32, device=x.device)
++    _router_part[(triton.cdiv(m, bm), triton.cdiv(ne, 32), ks)](x, w, part, m, x.stride(0), D=d, NE=ne, BM=bm,
++                                                                 BLOCK_E=32, BK=64, KS=ks, num_warps=4,
++                                                                 num_stages=3)
++    block = triton.next_power_of_2(experts + 1)
++    _router_topk[(m,)](part, logits, bias, pick, wts, float(scale), m * ne, KS=ks, NE=experts, TOPK=top_k,
++                       SLOTS=top_k + 1, BLOCK=block, SLOTP=triton.next_power_of_2(top_k + 1), NORM=norm, num_warps=4)
++
++
+ @triton.jit
+ def _combine(Y, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
+     """A rank's fp32 MoE share: w_k y_k summed in slot order, shared expert last with weight 1; y is bf16 in prefill."""
+diff --git tensorfold/families/glm5_next/cuda/hc.cpp tensorfold/families/glm5_next/cuda/hc.cpp
+index 4c0cd6a..e8a40a3 100644
+--- tensorfold/families/glm5_next/cuda/hc.cpp
++++ tensorfold/families/glm5_next/cuda/hc.cpp
+@@ -2,6 +2,8 @@
+ #include <c10/cuda/CUDAGuard.h>
+ 
+ void hc_partial_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t);
++void hc_post_partial_cuda(const at::Tensor&, const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, at::Tensor&, int64_t, int64_t, at::Tensor&);
+ 
+ // PART [rows, 16, 32] fp32 = glue._hc_partial's output for x [rows, 16384] bf16 and fn [24, 16384] bf16.
+ void hc_partial(const at::Tensor& x, const at::Tensor& fn, at::Tensor part, int64_t rows) {
+@@ -16,6 +18,33 @@ void hc_partial(const at::Tensor& x, const at::Tensor& fn, at::Tensor part, int6
+     hc_partial_cuda(x, fn, part, rows);
+ }
+ 
++// hc_partial of the streams glue.hc_post(x, ., g, post, comb) would write, read from the old x, which this does not
++// write (decode rows; glue.hc_post_pre): g [world, rows', 4096] fp32 contiguous with rank k's rows at k rs elements,
++// post [rows, 4], comb [rows, 16] fp32 (the previous site's); the new streams also go to xn [rows, 16384] bf16.
++void hc_post_partial(const at::Tensor& x, const at::Tensor& g, int64_t rs, const at::Tensor& post,
++                     const at::Tensor& comb, const at::Tensor& fn, at::Tensor part, int64_t rows, int64_t world,
++                     at::Tensor xn) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.size(1) == 16384,
++                "hc_post_partial: x [rows, 16384] bf16, contiguous");
++    TORCH_CHECK(fn.is_cuda() && fn.scalar_type() == at::kBFloat16 && fn.is_contiguous() && fn.size(0) == 24 &&
++                fn.size(1) == 16384, "hc_post_partial: fn [24, 16384] bf16");
++    TORCH_CHECK(part.is_cuda() && part.scalar_type() == at::kFloat && part.is_contiguous() &&
++                part.numel() >= rows * 16 * 32, "hc_post_partial: part [rows, 16, 32] fp32");
++    TORCH_CHECK(g.is_cuda() && g.scalar_type() == at::kFloat && g.is_contiguous() && world >= 1 && world <= 4 &&
++                rs >= rows * 4096 && g.numel() >= (world - 1) * rs + rows * 4096, "hc_post_partial: g [world, rows, 4096]");
++    TORCH_CHECK(post.is_cuda() && post.scalar_type() == at::kFloat && post.is_contiguous() && post.numel() >= rows * 4,
++                "hc_post_partial: post [rows, 4] fp32");
++    TORCH_CHECK(comb.is_cuda() && comb.scalar_type() == at::kFloat && comb.is_contiguous() &&
++                comb.numel() >= rows * 16, "hc_post_partial: comb [rows, 16] fp32");
++    TORCH_CHECK(rows >= 1 && x.size(0) >= rows, "hc_post_partial: rows");
++    TORCH_CHECK(xn.is_cuda() && xn.scalar_type() == at::kBFloat16 && xn.is_contiguous() && xn.dim() == 2 &&
++                xn.size(1) == 16384 && xn.size(0) >= rows && xn.data_ptr() != x.data_ptr(),
++                "hc_post_partial: xn [rows, 16384] bf16, contiguous, apart from x");
++    c10::cuda::CUDAGuard guard(x.device());
++    hc_post_partial_cuda(x, g, rs, post, comb, fn, part, rows, world, xn);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("hc_partial", &hc_partial);
++    m.def("hc_post_partial", &hc_post_partial);
+ }
+diff --git tensorfold/families/glm5_next/cuda/hc.cu tensorfold/families/glm5_next/cuda/hc.cu
+index 2236475..eb6e381 100644
+--- tensorfold/families/glm5_next/cuda/hc.cu
++++ tensorfold/families/glm5_next/cuda/hc.cu
+@@ -26,13 +26,72 @@ __device__ __forceinline__ void unpack8(const uint4 v, float (&f)[8]) {
+ // Block (K block, part, row group): warps 0..7 the dots of mixing rows 8 part .. 8 part + 7 (their weights read once
+ // for up to RPB rows), warp 8 of part 0 the squares.
+ constexpr int RPB = 4;
++constexpr int D = WIDE / 4;              // a stream's width (4 streams, hc_mult 4)
+ 
++template <bool SH>
++__device__ __forceinline__ uint4 ld16(const __nv_bfloat16* p) {
++    return SH ? *reinterpret_cast<const uint4*>(p) : __ldg(reinterpret_cast<const uint4*>(p));
++}
++
++// POST (the previous site's hc_post fused in front, decode rows): the block first writes its K block of the NEW
++// streams (stream s = b / 4, columns (b % 4) KB ..) for its rows into shared memory from the old X, that site's
++// gathered partials G [WORLD, rows, D] (rank k at k RS) and its POST / COMB, with the operations Triton 3.7 emits for
++// glue._hc_post on sm_120 (its PTX, every element of a row, read symbolically for 1 to 4 ranks): branch =
++// bf16(((g0 + g1) + g2) + g3); m = x1 c1, then fma(x0, c0, m), except where Triton packs the pair the other way round
++// (3 ranks: column % 8 == 6 - 2 s; 4 ranks: stream 0's even columns): m = x0 c0, then fma(x1, c1, m); then
++// m = fma(x2, c2, m); m = fma(x3, c3, m); v = fma(branch, ps, m); bf16(v). The blocks of part 0 also store their K
++// block of the new streams to XN (each element once); X is not written here (other blocks still read the old
++// streams): glue._hc_finish_copy copies XN to X row by row. fuse.py checks the bits on the GPU before use.
++template <int WORLD>
++__device__ __forceinline__ bool post_swapped(int st, int col) {
++    return (WORLD == 3 && (col & 7) == 6 - 2 * st) || (WORLD == 4 && st == 0 && (col & 1) == 0);
++}
++
++template <bool POST, int WORLD>
+ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __restrict__ X,
+                                                         const __nv_bfloat16* __restrict__ FN, float* __restrict__ part,
+-                                                        int rows) {
++                                                        int rows, const float* __restrict__ G, long long RS,
++                                                        const float* __restrict__ POSTW,
++                                                        const float* __restrict__ COMB,
++                                                        __nv_bfloat16* __restrict__ XN) {
+     const int b = blockIdx.x, p = blockIdx.y, r0 = blockIdx.z * RPB;
+     const int r1 = min(r0 + RPB, rows);
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    __shared__ __align__(16) __nv_bfloat16 xn[POST ? RPB : 1][POST ? KB : 8];
++    if constexpr (POST) {
++        const int st = b / (D / KB), c0 = (b % (D / KB)) * KB;
++        for (int i = threadIdx.x; i < (r1 - r0) * KB; i += blockDim.x) {
++            const int rr = i / KB, c = i % KB, r = r0 + rr, col = c0 + c;
++            const float* gr = G + (size_t)r * D + col;
++            float acc = gr[0];
++#pragma unroll
++            for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, gr[(size_t)k * RS]);
++            const float branch = __bfloat162float(__float2bfloat16_rn(acc));
++            const __nv_bfloat16* xr = X + (size_t)r * WIDE + col;
++            const float x0 = __bfloat162float(xr[0]), x1 = __bfloat162float(xr[D]);
++            const float x2 = __bfloat162float(xr[2 * D]), x3 = __bfloat162float(xr[3 * D]);
++            const float* cm = COMB + (size_t)r * 16 + st;                  // column st of comb: cm[4 j] = comb[j][st]
++            float mixed;
++            if (post_swapped<WORLD>(st, col)) {
++                mixed = __fmul_rn(x0, cm[0]);
++                mixed = __fmaf_rn(x1, cm[4], mixed);
++            } else {
++                mixed = __fmul_rn(x1, cm[4]);
++                mixed = __fmaf_rn(x0, cm[0], mixed);
++            }
++            mixed = __fmaf_rn(x2, cm[8], mixed);
++            mixed = __fmaf_rn(x3, cm[12], mixed);
++            const __nv_bfloat16 v = __float2bfloat16_rn(__fmaf_rn(branch, POSTW[(size_t)r * 4 + st], mixed));
++            xn[rr][c] = v;
++            if (p == 0) XN[(size_t)r * WIDE + st * D + col] = v;
++        }
++        __syncthreads();
++    }
++    // a row's KB inputs of this K block: the new streams in shared memory (POST) or X
++    auto xrow = [&](int r) -> const __nv_bfloat16* {
++        if constexpr (POST) return &xn[r - r0][0];
++        else return X + (size_t)r * WIDE + b * KB;
++    };
+     if (warp < 8) {
+         const int m = p * 8 + warp;
+         const int h = lane >> 4, l = lane & 15;
+@@ -42,10 +101,10 @@ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __
+         for (int i = 0; i < 4; ++i)                    // steps 2 i + h, inputs 8 l .. 8 l + 7 of the step
+             unpack8(__ldg(reinterpret_cast<const uint4*>(wr + (2 * i + h) * SUB + 8 * l)), wf[i]);
+         for (int r = r0; r < r1; ++r) {
+-            const __nv_bfloat16* xr = X + (size_t)r * WIDE + b * KB;
++            const __nv_bfloat16* xr = xrow(r);
+             uint4 xv[4];
+ #pragma unroll
+-            for (int i = 0; i < 4; ++i) xv[i] = __ldg(reinterpret_cast<const uint4*>(xr + (2 * i + h) * SUB + 8 * l));
++            for (int i = 0; i < 4; ++i) xv[i] = ld16<POST>(xr + (2 * i + h) * SUB + 8 * l);
+             float s[4];
+ #pragma unroll
+             for (int i = 0; i < 4; ++i) {
+@@ -68,7 +127,7 @@ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __
+         }
+     } else if (p == 0) {
+         for (int r = r0; r < r1; ++r) {
+-            const __nv_bfloat16* xr = X + (size_t)r * WIDE + b * KB;
++            const __nv_bfloat16* xr = xrow(r);
+             float w[4];
+ #pragma unroll
+             for (int j = 0; j < 4; ++j) {              // the Triton kernel's warp j: input 32 j + lane of each step
+@@ -90,8 +149,32 @@ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __
+ }  // namespace
+ 
+ void hc_partial_cuda(const at::Tensor& x, const at::Tensor& fn, at::Tensor& part, int64_t rows) {
+-    hc_partial_kernel<<<dim3(NB, 3, (unsigned)((rows + RPB - 1) / RPB)), 288, 0, at::cuda::getCurrentCUDAStream()>>>(
++    hc_partial_kernel<false, 1><<<dim3(NB, 3, (unsigned)((rows + RPB - 1) / RPB)), 288, 0,
++                                  at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(fn.data_ptr()),
+-        part.data_ptr<float>(), (int)rows);
++        part.data_ptr<float>(), (int)rows, nullptr, 0, nullptr, nullptr, nullptr);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// hc_partial of the rows hc_post(x, ., g, post, comb) would write, from the old x (not written here); those rows
++// also go to xn.
++void hc_post_partial_cuda(const at::Tensor& x, const at::Tensor& g, int64_t rs, const at::Tensor& post,
++                          const at::Tensor& comb, const at::Tensor& fn, at::Tensor& part, int64_t rows, int64_t world,
++                          at::Tensor& xn) {
++    const dim3 grid(NB, 3, (unsigned)((rows + RPB - 1) / RPB));
++    auto stream = at::cuda::getCurrentCUDAStream();
++    auto xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
++    auto fp = reinterpret_cast<const __nv_bfloat16*>(fn.data_ptr());
++#define GO(W_)                                                                                                     \
++    hc_partial_kernel<true, W_><<<grid, 288, 0, stream>>>(xp, fp, part.data_ptr<float>(), (int)rows,               \
++                                                          g.data_ptr<float>(), (long long)rs, post.data_ptr<float>(), \
++                                                          comb.data_ptr<float>(),                                     \
++                                                          reinterpret_cast<__nv_bfloat16*>(xn.data_ptr()))
++    if (world == 1) GO(1);
++    else if (world == 2) GO(2);
++    else if (world == 3) GO(3);
++    else if (world == 4) GO(4);
++    else TORCH_CHECK(false, "hc_post_partial: 1 to 4 ranks");
++#undef GO
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+diff --git tensorfold/families/glm5_next/cuda/kda.cpp tensorfold/families/glm5_next/cuda/kda.cpp
+index d2bf4ad..fcc0dbc 100644
+--- tensorfold/families/glm5_next/cuda/kda.cpp
++++ tensorfold/families/glm5_next/cuda/kda.cpp
+@@ -8,7 +8,8 @@ void kda_chain_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int6
+ void kda_chain_wide_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t,
+                          const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                          const at::Tensor&, double, double, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
+-                         at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t);
++                         at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t,
++                         const c10::optional<at::Tensor>&);
+ void kda_replay_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                      int64_t, at::Tensor&);
+ void kda_replay_layers_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -18,7 +19,8 @@ void kda_chain_wide_segments_cuda(const at::Tensor&, int64_t, const at::Tensor&,
+                                   int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t, const at::Tensor&,
+                                   at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&,
+                                   const at::Tensor&, double, double, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
+-                                  at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t);
++                                  at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t,
++                                  const c10::optional<at::Tensor>&);
+ void kda_replay_layers_segments_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t, int64_t,
+                                      const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                                      int64_t, int64_t, int64_t, int64_t);
+@@ -59,7 +61,7 @@ void chain_wide(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::
+                 const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
+                 const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor out,
+                 at::Tensor state_out, at::Tensor k_save, at::Tensor v_save, at::Tensor g_save, at::Tensor b_save,
+-                at::Tensor q_tmp, at::Tensor y_tmp, int64_t warps, int64_t tr) {
++                at::Tensor q_tmp, at::Tensor y_tmp, int64_t warps, int64_t tr, c10::optional<at::Tensor> xs) {
+     check(P, at::kBFloat16, "P");
+     check(A, at::kBFloat16, "A");
+     check(G, at::kBFloat16, "G");
+@@ -82,9 +84,11 @@ void chain_wide(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::
+     TORCH_CHECK(rows >= 1 && P.size(0) >= rows && out.size(0) >= rows, "rows");
+     TORCH_CHECK(k_save.numel() >= rows * H * 128 && q_tmp.numel() >= rows * H * 128 &&
+                 y_tmp.numel() >= rows * H * 128 && b_save.numel() >= rows * H, "scratch rows");
++    TORCH_CHECK(!xs.has_value() || (xs->is_cuda() && xs->scalar_type() == at::kFloat && xs->is_contiguous() &&
++                                    xs->numel() >= rows * H * 2), "xs: [rows, H * 128 / 64] fp32, contiguous");
+     c10::cuda::CUDAGuard guard(P.device());
+     kda_chain_wide_cuda(P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps,
+-                        lower, rows, out, state_out, k_save, v_save, g_save, b_save, q_tmp, y_tmp, warps, tr);
++                        lower, rows, out, state_out, k_save, v_save, g_save, b_save, q_tmp, y_tmp, warps, tr, xs);
+ }
+ 
+ void replay(const at::Tensor& state_in, const at::Tensor& k_save, const at::Tensor& v_save, const at::Tensor& g_save,
+@@ -120,7 +124,7 @@ void chain_wide_segments(const at::Tensor& seg, const at::Tensor& P, int64_t p_s
+                          const at::Tensor& conv, const at::Tensor& cw, at::Tensor rec, const at::Tensor& a_log,
+                          const at::Tensor& dt_bias, const at::Tensor& norm_w, double eps, double lower, int64_t rows,
+                          at::Tensor out, at::Tensor k_save, at::Tensor v_save, at::Tensor g_save, at::Tensor b_save,
+-                         at::Tensor q_tmp, at::Tensor y_tmp, int64_t warps, int64_t tr) {
++                         at::Tensor q_tmp, at::Tensor y_tmp, int64_t warps, int64_t tr, c10::optional<at::Tensor> xs) {
+     check_segments(seg);
+     check(P, at::kBFloat16, "P");
+     check(A, at::kBFloat16, "A");
+@@ -147,10 +151,12 @@ void chain_wide_segments(const at::Tensor& seg, const at::Tensor& P, int64_t p_s
+     TORCH_CHECK(rows >= 1 && P.size(0) >= rows && out.size(0) >= rows, "rows");
+     TORCH_CHECK(k_save.numel() >= rows * H * 128 && q_tmp.numel() >= rows * H * 128 &&
+                 y_tmp.numel() >= rows * H * 128 && b_save.numel() >= rows * H, "scratch rows");
++    TORCH_CHECK(!xs.has_value() || (xs->is_cuda() && xs->scalar_type() == at::kFloat && xs->is_contiguous() &&
++                                    xs->numel() >= rows * H * 2), "xs: [rows, H * 128 / 64] fp32, contiguous");
+     c10::cuda::CUDAGuard guard(P.device());
+     kda_chain_wide_segments_cuda(seg, seg.size(0), P, p_stride, b_off, A, a_stride, G, g_stride, conv,
+                                  conv.stride(0), cw, rec, rec.stride(0), rec.stride(1), a_log, dt_bias, norm_w, eps,
+-                                 lower, rows, out, k_save, v_save, g_save, b_save, q_tmp, y_tmp, warps, tr);
++                                 lower, rows, out, k_save, v_save, g_save, b_save, q_tmp, y_tmp, warps, tr, xs);
+ }
+ 
+ // rec [slots, 2, layers, H, 128, 128] (each [H, 128, 128] contiguous); segment i with keep < rows replays its
+diff --git tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/cuda/kda.cu
+index b42b622..cdde667 100644
+--- tensorfold/families/glm5_next/cuda/kda.cu
++++ tensorfold/families/glm5_next/cuda/kda.cu
+@@ -330,10 +330,16 @@ __global__ void __launch_bounds__(WARPS * 32) step_kernel(
+     }
+ }
+ 
+-// Block (row, head), 128 threads: the gated RMSNorm of the read-out.
++// Block (row, head), 128 threads: the gated RMSNorm of the read-out. XS (optional, decode windows): also the row's
++// 64-input group sums of out, xs [R, H * DV / 64], with the bits of qmm.group_sums as Triton 3.7 compiles it for
++// these rows (16-byte aligned, a row stride of H x 128: tile [16, 64] on two warps, layout sizePerThread [1, 8],
++// threadsPerWarp [4, 8], read from its PTX): eight lanes a group, each adding its 8 consecutive inputs in order
++// (((q0 + q1) + q2) + ... + q7), then butterfly adds over the eight lanes at xor 4, 2, 1. fuse.py checks the bits on
++// the GPU before this path is used (another Triton could lay the tile out otherwise).
+ __global__ void __launch_bounds__(128) out_kernel(
+         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
+-        const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
++        const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out,
++        float* __restrict__ xs = nullptr) {
+     const int r = blockIdx.x, h = blockIdx.y;
+     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+     __shared__ float rinv;
+@@ -349,7 +355,22 @@ __global__ void __launch_bounds__(128) out_kernel(
+     const float yn = __bfloat162float(y_in[base + t]) * rinv;
+     const float yw = __bfloat162float(norm_w[t]) * yn;
+     const float gate = __bfloat162float(G[(size_t)r * g_stride + h * DV + t]);
+-    out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
++    const __nv_bfloat16 o = __float2bfloat16_rn(yw * sigmoidf_(gate));
++    out[(size_t)r * H * DV + h * DV + t] = o;
++    if (xs != nullptr) {
++        __shared__ float ov[DV];
++        ov[t] = __bfloat162float(o);
++        __syncthreads();
++        if (t < (DV / 64) * 8) {                               // lanes 0-15 of warp 0: group t / 8, chunk t % 8
++            const float* q = ov + 64 * (t >> 3) + 8 * (t & 7);
++            float sum = __fadd_rn(q[0], q[1]);
++#pragma unroll
++            for (int j = 2; j < 8; ++j) sum = __fadd_rn(sum, q[j]);
++#pragma unroll
++            for (int off = 4; off; off >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffu, sum, off));
++            if ((t & 7) == 0) xs[(size_t)r * H * (DV / 64) + h * (DV / 64) + (t >> 3)] = sum;
++        }
++    }
+ }
+ 
+ // Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
+@@ -591,7 +612,8 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
+                          const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
+                          const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor& out,
+                          at::Tensor& state_out, at::Tensor& k_save, at::Tensor& v_save, at::Tensor& g_save,
+-                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp, int64_t warps, int64_t tr) {
++                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp, int64_t warps, int64_t tr,
++                         const c10::optional<at::Tensor>& xs) {
+     auto stream = at::cuda::getCurrentCUDAStream();
+     const int H = (int)a_log.numel();
+     const dim3 grid((unsigned)rows, (unsigned)H);
+@@ -608,7 +630,8 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
+ #undef STEP
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
+-                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
++                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out),
++                                        xs.has_value() ? xs->data_ptr<float>() : nullptr);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+@@ -619,7 +642,7 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
+                                   const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
+                                   double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
+                                   at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
+-                                  at::Tensor& y_tmp, int64_t warps, int64_t tr) {
++                                  at::Tensor& y_tmp, int64_t warps, int64_t tr, const c10::optional<at::Tensor>& xs) {
+     auto stream = at::cuda::getCurrentCUDAStream();
+     const int H = (int)a_log.numel();
+     const dim3 grid((unsigned)rows, (unsigned)H);
+@@ -638,7 +661,8 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
+ #undef STEP
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
+-                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
++                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out),
++                                        xs.has_value() ? xs->data_ptr<float>() : nullptr);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+diff --git tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
+index 5a84e2e..46e1f38 100644
+--- tensorfold/families/glm5_next/cuda/kda.py
++++ tensorfold/families/glm5_next/cuda/kda.py
+@@ -16,7 +16,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_kda_v2a1", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
++    return load(name="tensorfold_glm_kda_v2a3", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+ 
+ 
+@@ -108,8 +108,9 @@ def reserve(rows: int, heads: int, device) -> None:
+ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
+           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
+           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
+-          state_out: torch.Tensor, *, wide: bool | None = None, pos: int | None = None) -> torch.Tensor:
+-    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits; a prompt chunk (``pos``: its first row's position) takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written)."""
++          state_out: torch.Tensor, *, wide: bool | None = None, pos: int | None = None,
++          xs: torch.Tensor | None = None) -> torch.Tensor:
++    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits; a prompt chunk (``pos``: its first row's position) takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written). ``xs`` (decode rows): also out's 64-input group sums, qmm.group_sums' bits (the wide path computes them in its output kernel)."""
+ 
+     if CHUNKED and pos is not None:
+         from . import kda_chunked
+@@ -121,11 +122,15 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
+         warps, tr = step_launch(a_log.numel(), int(rows))
+         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
+                           a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out,
+-                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
++                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr, xs)
+         return scratch.out[:rows]
+     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
+                  dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out, scratch.k, scratch.v,
+                  scratch.g, scratch.b)
++    if xs is not None:                   # the one-block chain has no group sums of its own
++        from . import qmm
++
++        qmm.group_sums(scratch.out[:rows], xs)
+     return scratch.out[:rows]
+ 
+ 
+@@ -172,7 +177,7 @@ def segment_table(segments, device, out: torch.Tensor | None = None) -> torch.Te
+ def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor,
+                    conv: torch.Tensor, conv_w: torch.Tensor, rec: torch.Tensor, a_log: torch.Tensor,
+                    dt_bias: torch.Tensor, norm_w: torch.Tensor, eps: float, lower: float, rows: int,
+-                   scratch: KDAScratch) -> torch.Tensor:
++                   scratch: KDAScratch, xs: torch.Tensor | None = None) -> torch.Tensor:
+     """One layer's window of ``rows`` rows cut into the segments ``seg`` (``segment_table``): p/a/g as in ``chain``;
+     conv [conv slots, 3, 3 H 128] this layer's conv windows (read only; ``conv_shift_segments`` after the commit);
+     rec [state slots, 2, H, 128, 128] this layer's states (e.g. ``rec[:, :, layer]``). The three-kernel path
+@@ -182,7 +187,7 @@ def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tens
+     warps, tr = step_launch(a_log.numel(), int(rows))
+     _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
+                                a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
+-                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
++                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr, xs)
+     return scratch.out[:rows]
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index 811b6c2..1bbc8ac 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -127,6 +127,34 @@ def group_sums(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor
+     return out
+ 
+ 
++@triton.jit
++def _group_sums_split(X, XA, XB, x_stride, K: tl.constexpr, KA: tl.constexpr, GB: tl.constexpr):
++    """_group_sums of a row's K = KA + KB inputs in one program, groups 0 .. KA/64 - 1 to XA [M, KA/64], the rest to
++    XB [M, (K - KA)/64]: the same [GB, 64] tile and warps, so every group's sum has _group_sums' bits."""
++    m = tl.program_id(0)
++    gb = tl.program_id(1)
++    KG: tl.constexpr = K // 64
++    KGA: tl.constexpr = KA // 64
++    g = gb * GB + tl.arange(0, GB)
++    k = tl.arange(0, 64)
++    ok = g < KG
++    x = tl.load(X + m * x_stride + g[:, None] * 64 + k[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++    t = tl.sum(x, axis=1)
++    tl.store(XA + m * KGA + g, t, mask=g < KGA)
++    tl.store(XB + m * (KG - KGA) + (g - KGA), t, mask=ok & (g >= KGA))
++
++
++def group_sums_split(x: torch.Tensor, ka: int, out_a: torch.Tensor, out_b: torch.Tensor) -> None:
++    """``group_sums`` of x[:, :ka] into out_a and of x[:, ka:] into out_b in one launch, with the same bits (x: rows
++    of K bf16 inputs, unit-stride; ka and K multiples of 64; K <= 64 x 16 so one program takes a row as _group_sums'
++    grid would)."""
++
++    m, k = x.shape
++    if k % GS or ka % GS or not 0 < ka < k or x.stride(1) != 1 or k // GS > 16:
++        raise ValueError(f"group_sums_split: {tuple(x.shape)} at {ka}")
++    _group_sums_split[(m, 1)](x, out_a, out_b, x.stride(0), K=k, KA=ka, GB=16, num_warps=2)
++
++
+ @triton.jit
+ def _reduce(PART, OUT, total, SK: tl.constexpr, BLOCK: tl.constexpr, F32: tl.constexpr):
+     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index 19348d5..bbb060a 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -747,7 +747,10 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
+     D = qi.shape[1] // H
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # select_tokens' constants
+     scores = scratch.scores
+-    grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
++    from . import tune
++
++    t = tune.pick("sparse_scores", tune.shape(H, D), scores.shape[1])   # a launch table's grid (TF_GLM_TUNE)
++    grid = min(int(t["grid"]) if t else SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
+     pkv, pks, rs, fp8 = kv8.parts(pk)
+     # a window of R rows holds at most R segments: no programs for the table's unused (0-row) segments
+     _seg_scores[(min(rows.max_segs, R), grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
+diff --git tensorfold/families/glm5_next/cuda/tune.py tensorfold/families/glm5_next/cuda/tune.py
+index 84f5a0d..3824798 100644
+--- tensorfold/families/glm5_next/cuda/tune.py
++++ tensorfold/families/glm5_next/cuda/tune.py
+@@ -18,8 +18,9 @@ default launch. A table entry takes precedence over the kernel's own environment
+ TF_GLM_Q4_TILE, ...) for the shapes and row counts it lists; everything it does not list keeps the setting or default.
+ 
+ Every value is checked at load against the kernel's list of same-bit choices (``CHOICES``): a value outside it, or a
+-malformed file, refuses the start, so a table can only pick among configurations that keep the bits. The checksum of
+-the whole file's tables joins the settings every rank compares at start (``code``), so all ranks read one file.
++malformed or unreadable file, refuses the start, so a table can only pick among configurations that keep the bits.
++The checksum of the whole file's tables joins the settings every rank compares at start (``code``; -1 for a bad file,
++which every rank then refuses together: a lookup before that check gets the defaults instead of raising alone).
+ 
+ Row buckets: a kernel's entry for a shape is one value for every row count, or a dict {"<rows>": value} whose keys
+ are the upper bounds of row buckets; a call of R rows takes the smallest bound >= R (none: the default).
+@@ -67,8 +68,8 @@ def _int_range(lo: int, hi: int) -> Callable[[Any], int]:
+ def _exl3(check: Callable[[Any], dict]) -> Callable[[Any], dict]:
+     def both(v: Any) -> dict:
+         out = check(v)
+-        if out.get("wn", 1) == 4 and out.get("ld", 0) != 0:
+-            raise ValueError("4 warps along N only with the 32-bit loads (ld 0)")
++        if out.get("wn", 1) == 4 and out.get("ld") != 0:      # explicit: an entry merges over TF_GLM_EXL3_LOADS
++            raise ValueError("4 warps along N only with the 32-bit loads: give ld 0 with wn 4")
+         return out
+     return both
+ 
+@@ -82,8 +83,8 @@ CHOICES: dict[str, Callable[[Any], Any]] = {
+     "exl3_dec_gu": _exl3(_keys(ld=_ints(0, 1, 2, 3), wn=_ints(1, 2, 4), fuse=_ints(0, 2), xrow=_ints(0, 1))),
+     # decode EXL3 experts, down: loads, warps along N, epilogue fused (1) or its own kernel (0)
+     "exl3_dec_dn": _exl3(_keys(ld=_ints(0, 1, 2, 3), wn=_ints(1, 2, 4), fuse=_ints(0, 1))),
+-    # prompt EXL3 experts: members a pass (exl3_mm.prompt_pass)
+-    "exl3_prompt": _keys(passm=_ints(64, 128)),
++    # prompt EXL3 experts: members a pass (exl3_mm.prompt_pass), cp.async pipeline depth (exl3_mm.prompt_stages)
++    "exl3_prompt": _keys(passm=_ints(64, 128), stages=_ints(2, 3, 4)),
+     # 4-bit dense matmul of decode rows: the lane matmul's tile config (qmm.cu dispatch_cfg 0..15), -1 the stock tile
+     "q4_dec": _int_range(-1, 15),
+     # 4-bit dense matmul of prompt chunks: the prefill tile (qmm_prefill.cu dispatch 0..11)
+@@ -95,10 +96,14 @@ CHOICES: dict[str, Callable[[Any], Any]] = {
+     "kda_step": _keys(warps=_ints(1, 2, 4, 8), tr=_ints(8, 16)),
+     # L2 prefetch: programs one wave of a 4-bit decode matmul holds (l2pf.ONE_WAVE; GB10's 192 = 4 x 48 SMs)
+     "l2pf": _keys(one_wave=_int_range(1, 1 << 16)),
++    # the multi-stream indexer's score programs a segment (sparse.SEG_SCORE_GRID: a grid stride over pool blocks, each
++    # block scored alone, so any count gives the same bits), keyed by index heads x head width
++    "sparse_scores": _keys(grid=_int_range(1, 1 << 16)),
+ }
+ 
+ _lock = threading.Lock()
+-_loaded: tuple[str, dict, int] | None = None        # (path, this GPU's kernels, crc of the file's tables)
++_loaded: tuple[str, dict, int] | None = None        # (path, this GPU's kernels, crc of the file's tables; -1: bad)
++_error: str | None = None
+ _record: dict | None = None
+ _said = False
+ _PATH = os.environ.get("TF_GLM_TUNE", "")            # read once: lookups run on every eager prompt matmul
+@@ -110,9 +115,9 @@ def reset(path: str | None = None, record_path: str | None = None, device: dict
+     """Forget the loaded table: the next lookup reads ``path`` (default: TF_GLM_TUNE again) for ``device`` (default:
+     the current GPU, ``device_key``). For tests and the harness."""
+ 
+-    global _loaded, _record, _said, _PATH, _RECORD, _DEVICE
++    global _loaded, _record, _said, _PATH, _RECORD, _DEVICE, _error
+     with _lock:
+-        _loaded, _record, _said = None, None, False
++        _loaded, _record, _said, _error = None, None, False, None
+         _PATH = os.environ.get("TF_GLM_TUNE", "") if path is None else path
+         _RECORD = os.environ.get("TF_GLM_TUNE_RECORD", "") if record_path is None else record_path
+         _DEVICE = device
+@@ -193,27 +198,49 @@ def parse(doc: Any, where: str) -> list[tuple[dict, dict]]:
+ 
+ 
+ def load(path: str | None = None) -> dict:
+-    """This GPU's kernels from the table file ``path`` (default TF_GLM_TUNE); {} when off or no table matches."""
++    """This GPU's kernels from the table file ``path`` (default TF_GLM_TUNE); {} when off or no table matches.
++    A bad file raises ValueError here (and ``code`` is -1); ``pick`` gets the defaults instead."""
+ 
+-    global _loaded, _said
++    _load(path)
++    if _error is not None:
++        raise ValueError(_error)
++    return _loaded[1]
++
++
++def error() -> str | None:
++    """Why the table file was refused (None: it was not)."""
++
++    _load(None)
++    return _error
++
++
++def _load(path: str | None) -> dict:
++    global _loaded, _said, _error
+     path = _PATH if path is None else path
+     with _lock:
+         if _loaded is not None and _loaded[0] == path:
+             return _loaded[1]
+         if path.strip().lower() in OFF:
+-            _loaded = (path, {}, 0)
++            _loaded, _error = (path, {}, 0), None
+             return {}
+         try:
+-            with open(path, encoding="utf-8") as f:
+-                doc = json.load(f)
+-        except (OSError, json.JSONDecodeError) as exc:
+-            raise ValueError(f"TF_GLM_TUNE={path}: cannot read the launch table ({exc})") from None
+-        tables = parse(doc, f"TF_GLM_TUNE={path}")
++            try:
++                with open(path, encoding="utf-8") as f:
++                    doc = json.load(f)
++            except (OSError, json.JSONDecodeError) as exc:
++                raise ValueError(f"TF_GLM_TUNE={path}: cannot read the launch table ({exc})") from None
++            tables = parse(doc, f"TF_GLM_TUNE={path}")
++        except ValueError as exc:
++            _loaded, _error = (path, {}, -1), str(exc)
++            if not _said:
++                _said = True
++                _say(f"{exc}: the start is refused (every rank's launch tables are compared at start)")
++            return {}
+         canon = json.dumps([[d, k] for d, k in tables], sort_keys=True, separators=(",", ":"), default=str)
+         crc = (zlib.crc32(canon.encode()) & 0x7FFFFFFF) or 1
+         dev = device_key()
+         kernels = next((k for d, k in tables if same_device(d, dev)), {})
+-        _loaded = (path, kernels, crc)
++        _loaded, _error = (path, kernels, crc), None
+         if not _said:
+             _said = True
+             what = "no GPU" if dev is None else f"{dev['name']} ({dev['sms']} SMs, sm_{dev['capability'][0]}" \
+@@ -227,9 +254,9 @@ def load(path: str | None = None) -> dict:
+ 
+ 
+ def code() -> int:
+-    """The checksum of the table file's tables (0: off), for the settings every rank compares at start."""
++    """The checksum of the table file's tables (0: off, -1: a bad file), for the settings every rank compares."""
+ 
+-    load()
++    _load(None)
+     return _loaded[2] if _loaded is not None else 0
+ 
+ 
+@@ -239,7 +266,7 @@ def pick(kernel: str, key: str, rows: int | None = None) -> Any:
+     if _RECORD:
+         record(kernel, key, rows)
+     loaded = _loaded
+-    table = loaded[1] if loaded is not None and loaded[0] == _PATH else load()
++    table = loaded[1] if loaded is not None and loaded[0] == _PATH else _load(None)
+     entry = table.get(kernel, {}).get(key) if table else None
+     if isinstance(entry, dict) and entry and all(isinstance(b, int) for b in entry):
+         if rows is None:
+@@ -291,5 +318,5 @@ def shape(*dims: int) -> str:
+     return "x".join(str(int(d)) for d in dims)
+ 
+ 
+-__all__ = ["CALLS_FORMAT", "CHOICES", "FORMAT", "code", "device_key", "load", "parse", "pick", "record", "reset",
+-           "same_device", "shape", "validate_device", "validate_kernels"]
++__all__ = ["CALLS_FORMAT", "CHOICES", "FORMAT", "code", "device_key", "error", "load", "parse", "pick", "record",
++           "reset", "same_device", "shape", "validate_device", "validate_kernels"]

@@ -1,0 +1,1429 @@
+0071-glm-prefill-2.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/cuda/ce_comm.py tensorfold/cuda/ce_comm.py
+new file mode 100644
+index 0000000..29b7955
+--- /dev/null
++++ tensorfold/cuda/ce_comm.py
+@@ -0,0 +1,427 @@
++"""Paired sends and receives (``exchange`` / ``exchange_all``, NCCL's API in ``comm``) by the GPUs' copy engines,
++peer to peer over PCIe between the rank processes of one host, through CUDA IPC (TENSORFOLD_EXCHANGE=ce).
++
++Why: NCCL moves send/receive data with a few SMs a peer (two channels a PCIe peer), and on PCIe hosts its
++peer-to-peer send/receive path can be several times slower than its host shared-memory one, which is itself bounded
++by the SMs it takes. A copy engine writes straight into a peer GPU's memory at the link's speed and takes no SMs from
++the compute it runs beside. The row-split prompt chunks of GLM-5.3-Flash move about 36 MiB out of every rank at each
++of a chunk's 90 exchange sites (2,048 rows, four ranks): the bulk of a prompt's communication.
++
++How. Setup (every rank together, through the NCCL bootstrap's store): each rank cudaMallocs a receive arena, exports
++it (cudaIpcGetMemHandle) and maps every peer's (cudaIpcOpenMemHandle); creates a ring of interprocess CUDA events and
++exports them; rank 0 creates a small host shared-memory table of step numbers. Every phase is voted on, so a problem
++on one rank stops every rank with its reason; then a probe exchange is checked on every rank.
++
++The arena holds one slot a peer, each in two regions used by alternate steps (TENSORFOLD_CE_SLOT_MIB a region,
++default 8: 48 MiB a GPU at four ranks, whatever the chunk size). A call moves each peer's send tensors (laid back to
++back, 256-byte aligned) in steps of at most a region: a step is this rank's cudaMemcpyAsync copies into every peer's
++region (peers in rotated order, so each GPU receives from one sender at a time), one interprocess event recorded, then
++a stream wait on every peer's event of the same step, then this rank's local copies from its own regions into the
++receive tensors. A step number orders it all; every rank runs the same calls with the same sizes (NCCL's own contract:
++the peer's matching call names this rank with the same sizes, dtypes and order), and this transport requires every
++call to name every other rank with the same byte count, so every rank cuts a call into the same steps.
++
++Ordering. A stream wait binds an event's last record at the time of the call, so the host table makes a receiver wait
++for the record of the right step (the sender publishes its step number after recording; the receiver waits for it
++before waiting on the event), and keeps a sender from recording an event slot again before every receiver has waited
++on its previous use. A region is never overwritten while it may still be read: a sender's copies of step e start
++after its stream waited for every peer's record of step e - 1, and a receiver's local copies out of the region of
++step e - 2 sit on its stream before its own record of step e - 1 (a rank's steps run in its stream order: one stream,
++or streams joined with stream waits between them, as the callers' chunks are).
++
++Exact: transport only: the same bytes land in the same receive tensors as with NCCL. A failed step (a peer that stopped,
++a CUDA error, a timeout) poisons the transport: every later call raises, and the ranks must be restarted together.
++GPU-side waits on a peer that died mid-step do not time out (as with NCCL); the host-side waits do
++(TENSORFOLD_CE_TIMEOUT_S, default 300).
++
++Needs every rank on one host, each process seeing every GPU (its own first, as TensorFold uses device 0) with peer
++access, and BAR1 room for the arena next to NCCL's peer buffers (``nvidia-smi -q -d MEMORY`` shows BAR1)."""
++
++from __future__ import annotations
++
++import ctypes
++import glob
++import mmap
++import os
++import time
++import uuid
++
++import numpy as np
++import torch
++
++SLOTS = 16                # interprocess events a rank cycles through
++ALIGN = 256               # bytes: each tensor's start in a peer's payload
++_D2D = 3                  # cudaMemcpyDeviceToDevice
++_LAZY_PEER = 1            # cudaIpcMemLazyEnablePeerAccess
++
++
++class _IpcHandle(ctypes.Structure):
++    """cudaIpcMemHandle_t: 64 opaque bytes (unsigned: a c_char field would read as a string, cut at a zero byte)."""
++
++    _fields_ = [("reserved", ctypes.c_ubyte * 64)]
++
++
++def _loaded(fragment: str) -> list[str]:
++    """Paths of the shared libraries this process has mapped whose file name starts with ``fragment``."""
++
++    found = set()
++    try:
++        with open("/proc/self/maps") as f:
++            for line in f:
++                path = line.split()[-1] if line.strip() else ""
++                if path.startswith("/") and os.path.basename(path).startswith(fragment):
++                    found.add(path)
++    except OSError:
++        return []
++    return sorted(found)
++
++
++def _cudart():
++    """The CUDA runtime torch itself loaded (the same library instance: one set of runtime state)."""
++
++    torch.cuda.init()
++    names = _loaded("libcudart.so") + ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
++    names += glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "libcudart*.so*"))
++    names += glob.glob("/usr/local/cuda/lib64/libcudart.so*")
++    err = None
++    for name in names:
++        try:
++            lib = ctypes.CDLL(name)
++        except OSError as exc:
++            err = exc
++            continue
++        lib.cudaGetErrorString.restype = ctypes.c_char_p
++        lib.cudaGetErrorString.argtypes = [ctypes.c_int]
++        lib.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
++        lib.cudaIpcGetMemHandle.argtypes = [ctypes.POINTER(_IpcHandle), ctypes.c_void_p]
++        lib.cudaIpcOpenMemHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), _IpcHandle, ctypes.c_uint]
++        lib.cudaMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
++                                        ctypes.c_void_p]
++        return lib
++    raise RuntimeError(f"the CUDA runtime library was not found ({err})")
++
++
++class _Raw:
++    """A device pointer as a CUDA array (torch.as_tensor's view of memory this module allocated)."""
++
++    def __init__(self, ptr: int, nbytes: int) -> None:
++        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": (ptr, False),
++                                         "version": 3, "strides": None}
++
++
++def transport(value: str | None = None) -> str:
++    """TENSORFOLD_EXCHANGE: the paired sends and receives' transport, ``nccl`` (default) or ``ce``."""
++
++    value = (os.environ.get("TENSORFOLD_EXCHANGE", "") if value is None else value).strip().lower() or "nccl"
++    if value not in ("nccl", "ce"):
++        raise ValueError(f"TENSORFOLD_EXCHANGE: nccl or ce, not {value!r}")
++    return value
++
++
++def slot_bytes(value: str | None = None) -> int:
++    value = (os.environ.get("TENSORFOLD_CE_SLOT_MIB", "") if value is None else value).strip() or "8"
++    if not value.isdecimal() or not 1 <= int(value) <= 64:
++        raise ValueError(f"TENSORFOLD_CE_SLOT_MIB: MiB from 1 to 64, not {value!r}")
++    return int(value) << 20
++
++
++def timeout_s(value: str | None = None) -> float:
++    value = (os.environ.get("TENSORFOLD_CE_TIMEOUT_S", "") if value is None else value).strip() or "300"
++    try:
++        return max(1.0, float(value))
++    except ValueError:
++        raise ValueError(f"TENSORFOLD_CE_TIMEOUT_S: seconds, not {value!r}") from None
++
++
++def layout(tensors: list[torch.Tensor]) -> tuple[list[int], int]:
++    """Each tensor's start in a peer's payload (ALIGN-byte aligned, in order) and the payload's bytes."""
++
++    starts, at = [], 0
++    for t in tensors:
++        starts.append(at)
++        at += -(-t.numel() * t.element_size() // ALIGN) * ALIGN
++    return starts, at
++
++
++class CeTransport:
++    """``exchange`` / ``exchange_all`` over copy engines (one rank's side; created by every rank together)."""
++
++    def __init__(self, rank: int, world: int, store, slot: int | None = None, tag: str = "ce") -> None:
++        self.rank, self.world, self.store = int(rank), int(world), store
++        if self.world < 2:
++            raise ValueError("the copy-engine exchange needs two ranks or more")
++        # peers in rotated order (rank + 1, rank + 2, ..): at each moment every rank copies to a different peer
++        self.peers = [(self.rank + i) % self.world for i in range(1, self.world)]
++        self.slot = slot                                         # bytes a region (two a peer slot): set in
++        self.region = self.arena_bytes = 0                       # ``_first`` with the timeout, so a refused
++        self.timeout = 300.0                                     # setting reaches every rank through the vote
++        self.step = 0
++        self.poisoned: str | None = None
++        self.key = f"tf_{tag}"
++        self.device = "cuda"
++        self.lib = None
++        self._name = None
++        # two phases with a vote after each: every key a rank reads in ``_connect`` was written before the first vote
++        # passed, so a rank that fails early never leaves the others blocked on the store
++        try:
++            for label, phase in (("local", self._first), ("connect", self._connect)):
++                problem = ""
++                try:
++                    phase()
++                except Exception as exc:               # noqa: BLE001  (every rank learns it and stops)
++                    problem = f"{type(exc).__name__}: {exc}"
++                self._vote(label, problem)
++        finally:
++            self._unlink()                             # rank 0's table: every rank has mapped it by now, or never will
++        self._probe()
++
++    # -- setup ---------------------------------------------------------------------------------------------------------
++    def _check(self, code: int, what: str) -> None:
++        if code != 0:
++            raise RuntimeError(f"{what}: CUDA error {code} ({self.lib.cudaGetErrorString(code).decode()})")
++
++    def _vote(self, label: str, problem: str) -> None:
++        """Every rank's outcome of ``label``; all stop when any failed (no rank is left waiting in an exchange)."""
++
++        s = self.store
++        s.set(f"{self.key}/{label}/{self.rank}", ("0:" + problem) if problem else "1")
++        bad = []
++        for r in range(self.world):
++            v = s.get(f"{self.key}/{label}/{r}")
++            v = v.decode() if isinstance(v, bytes) else str(v)
++            if v != "1":
++                bad.append(f"rank {r}: {v[2:]}")
++        if bad:
++            raise RuntimeError("the copy-engine exchange could not start (" + "; ".join(bad) + "). It needs every "
++                               "rank on one host, each process seeing every GPU (its own first) with peer access, "
++                               f"and BAR1 room for its {self.arena_bytes >> 20} MiB arena a GPU beside NCCL's "
++                               "peer buffers (nvidia-smi -q -d MEMORY shows BAR1; TENSORFOLD_CE_SLOT_MIB sizes the "
++                               "arena); "
++                               "TENSORFOLD_EXCHANGE=nccl is NCCL's exchange.")
++
++    def _entries(self) -> int:
++        return self.world + self.world * self.world  # each sender's last step; each receiver's last wait a sender
++
++    def _first(self) -> None:
++        """The first phase: the settings (read here, so a value one rank refuses stops every rank through the vote),
++        then ``_local``."""
++
++        self.region = slot_bytes() if self.slot is None else int(self.slot)
++        self.arena_bytes = (self.world - 1) * 2 * self.region
++        self.timeout = timeout_s()
++        self._local()
++
++    def _local(self) -> None:
++        """This rank's part: the arena (allocated and exported), its events (exported), its host identity; rank 0
++        also creates the host table. Writes every key ``_connect`` reads."""
++
++        torch.cuda.current_device()
++        self.lib = lib = _cudart()
++        s = self.store
++        # one host (the table is host shared memory): the kernel's boot id, the same in every container on it
++        with open("/proc/sys/kernel/random/boot_id") as f:
++            self.host = f.read().strip()
++        s.set(f"{self.key}/host/{self.rank}", f"{self.host} {self.region}")
++        ptr = ctypes.c_void_p()
++        self._check(lib.cudaMalloc(ctypes.byref(ptr), self.arena_bytes), "cudaMalloc (arena)")
++        self.base = int(ptr.value)
++        arena = torch.as_tensor(_Raw(self.base, self.arena_bytes), device="cuda")
++        if arena.data_ptr() != self.base or arena.numel() != self.arena_bytes:
++            raise RuntimeError("the arena's tensor view does not cover the allocation")
++        self.arena = arena                                      # uint8 [(world - 1) x 2 x region]
++        handle = _IpcHandle()
++        self._check(lib.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(self.base)), "cudaIpcGetMemHandle")
++        s.set(f"{self.key}/mem/{self.rank}", bytes(handle))
++        self.mine = [torch.cuda.Event(enable_timing=False, blocking=False, interprocess=True) for _ in range(SLOTS)]
++        for k, ev in enumerate(self.mine):
++            ev.record()                                         # so that each exists
++            s.set(f"{self.key}/ev/{self.rank}/{k}", bytes(ev.ipc_handle()))
++        torch.cuda.synchronize()
++        if self.rank == 0:                                      # the host table, zeroed
++            name = f"/dev/shm/tf-{self.key}-{uuid.uuid4().hex}"
++            with open(name, "wb") as f:
++                f.write(b"\0" * (8 * self._entries()))
++            self._name = name
++            s.set(f"{self.key}/table", name)
++
++    def _connect(self) -> None:
++        """The peers' parts: the same host, the host table mapped, the peers' arenas and events opened."""
++
++        s, lib = self.store, self.lib
++        for r in self.peers:
++            v = s.get(f"{self.key}/host/{r}")
++            host, region = (v.decode() if isinstance(v, bytes) else str(v)).split()
++            if host != self.host:
++                raise RuntimeError(f"rank {r} runs on another host")
++            if int(region) != self.region:
++                raise RuntimeError(f"rank {r} uses regions of {int(region) >> 20} MiB, this rank "
++                                   f"{self.region >> 20} MiB (TENSORFOLD_CE_SLOT_MIB): give every rank the same")
++        name = s.get(f"{self.key}/table")
++        name = name.decode() if isinstance(name, bytes) else str(name)
++        fd = os.open(name, os.O_RDWR)
++        try:
++            self._map = mmap.mmap(fd, 8 * self._entries())
++        finally:
++            os.close(fd)                                        # the mapping keeps the file
++        self.tab = np.ndarray((self._entries(),), dtype=np.int64, buffer=self._map)
++        self.remote = {}
++        self.theirs = {}
++        dev = torch.cuda.current_device()
++        for p in self.peers:
++            raw = bytes(s.get(f"{self.key}/mem/{p}"))
++            if len(raw) != ctypes.sizeof(_IpcHandle):
++                raise RuntimeError(f"rank {p}'s arena handle has {len(raw)} bytes, not {ctypes.sizeof(_IpcHandle)}")
++            h = _IpcHandle.from_buffer_copy(raw)
++            rp = ctypes.c_void_p()
++            self._check(lib.cudaIpcOpenMemHandle(ctypes.byref(rp), h, _LAZY_PEER), f"cudaIpcOpenMemHandle (rank {p})")
++            self.remote[p] = int(rp.value)
++            self.theirs[p] = [torch.cuda.Event.from_ipc_handle(dev, bytes(s.get(f"{self.key}/ev/{p}/{k}")))
++                              for k in range(SLOTS)]
++
++    def _unlink(self) -> None:
++        if self._name:
++            try:
++                os.unlink(self._name)
++            except OSError:
++                pass
++            self._name = None
++
++    def _probe(self) -> None:
++        """One exchange of rank-numbered data through every peer slot and both regions (two steps), checked on every
++        rank; every rank reaches every vote whatever fails, and the probe's waits give up after 60 s."""
++
++        problem = ""
++        timeout, self.timeout = self.timeout, min(self.timeout, 60.0)
++        try:
++            for step in range(2):
++                n = 3 + step
++                sends = {p: [torch.full((n,), float(1000 * self.rank + 10 * p + step), dtype=torch.float32,
++                                        device=self.device)] for p in self.peers}
++                recvs = {p: [torch.full((n,), -1.0, dtype=torch.float32, device=self.device)] for p in self.peers}
++                self.exchange_all(sends, recvs)
++                for p in self.peers:
++                    if not bool(torch.all(recvs[p][0] == float(1000 * p + 10 * self.rank + step))):
++                        raise RuntimeError(f"the startup pattern from rank {p} did not arrive (step {step})")
++            self._sync()
++        except Exception as exc:                       # noqa: BLE001
++            problem = f"{type(exc).__name__}: {exc}"
++        finally:
++            self.timeout = timeout
++        self._vote("probe", problem)
++
++    # -- the protocol ------------------------------------------------------------------------------------------------
++    def _await(self, idx: int, target: int, what: str) -> None:
++        tab = self.tab
++        if tab[idx] >= target:
++            return
++        t0 = time.monotonic()
++        spins = 0
++        while tab[idx] < target:
++            spins += 1
++            if spins > 2000:
++                time.sleep(0.00002)
++                if spins % 4096 == 0 and time.monotonic() - t0 > self.timeout:
++                    raise RuntimeError(f"the copy-engine exchange: rank {self.rank} waited {self.timeout:.0f} s for "
++                                       f"{what} at step {target}; a rank stopped or the ranks are out of step")
++
++    def _step(self, copies: list[tuple[int, int, int]]) -> int:
++        """One step on the current stream: this rank's copies (dst, src, bytes) into the peers' arenas, its event,
++        then a wait for every peer's event of the same step (their copies into this rank's arena are then done).
++        Returns the step's number."""
++
++        e = self.step = self.step + 1
++        k = e % SLOTS
++        W = self.world
++        for q in self.peers:                     # every receiver waited on slot k's previous record
++            self._await(W + q * W + self.rank, e - SLOTS, f"rank {q}'s wait")
++        stream = self._stream()
++        for dst, src, nbytes in copies:
++            if nbytes:
++                self._copy(dst, src, nbytes, stream)
++        self._record(k, stream)
++        self.tab[self.rank] = e
++        for p in self.peers:
++            self._await(p, e, f"rank {p}'s copies")
++            self._wait(p, k, stream)
++            self.tab[W + self.rank * W + p] = e
++        return e
++
++    # the device operations (a CPU test replaces these)
++    def _sync(self) -> None:
++        torch.cuda.synchronize()
++
++    def _stream(self):
++        return torch.cuda.current_stream()
++
++    def _copy(self, dst: int, src: int, nbytes: int, stream) -> None:
++        self._check(self.lib.cudaMemcpyAsync(ctypes.c_void_p(dst), ctypes.c_void_p(src), nbytes, _D2D,
++                                             ctypes.c_void_p(stream.cuda_stream)), "cudaMemcpyAsync (to a peer)")
++
++    def _record(self, k: int, stream) -> None:
++        self.mine[k].record(stream)
++
++    def _wait(self, p: int, k: int, stream) -> None:
++        stream.wait_event(self.theirs[p][k])
++
++    # -- the API (comm.NCCL's) -----------------------------------------------------------------------------------------
++    def _region(self, receiver: int, sender: int, step: int) -> int:
++        """Byte offset in ``receiver``'s arena of ``sender``'s region for ``step``: slot (sender - receiver - 1) mod
++        N, region step mod 2."""
++
++        return (((sender - receiver - 1) % self.world) * 2 + step % 2) * self.region
++
++    def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
++        """Every ``sends[p][i]`` to peer p and ``recvs[p][i]`` from it, on the current stream (``comm.NCCL``'s
++        contract; here every call names every other rank, with the same byte count to each)."""
++
++        if self.poisoned is not None:
++            raise RuntimeError(f"the copy-engine exchange stopped after an error ({self.poisoned}); restart every rank")
++        if set(sends) != set(self.peers) or set(recvs) != set(self.peers):
++            raise ValueError("ce exchange_all: every other rank, each with its sends and receives")
++        payload = None
++        for p in self.peers:
++            if len(sends[p]) != len(recvs[p]):
++                raise ValueError("ce exchange_all: one receive per send")
++            for s, r in zip(sends[p], recvs[p]):
++                if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
++                    raise ValueError("ce exchange_all: each send and receive must be contiguous and alike")
++            size = layout(sends[p])[1]
++            if payload is not None and size != payload:
++                raise ValueError("ce exchange_all: the same bytes to every peer")
++            payload = size
++        try:
++            self._exchange(sends, recvs, payload or 0)
++        except Exception as exc:
++            self.poisoned = f"{type(exc).__name__}: {exc}"
++            raise
++
++    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
++        """``exchange_all`` with one peer: two ranks only (every call of this transport names every other rank)."""
++
++        if self.world != 2 or peer != self.peers[0]:
++            raise ValueError("ce exchange: one peer only at two ranks (use exchange_all)")
++        self.exchange_all({peer: list(sends)}, {peer: list(recvs)})
++
++    def _exchange(self, sends, recvs, payload: int) -> None:
++        R = self.region
++        steps = max(1, -(-payload // R))
++        lay = {p: layout(sends[p])[0] for p in self.peers}
++        for i in range(steps):
++            lo, hi = i * R, min(payload, (i + 1) * R)
++            e = self.step + 1                                  # the step _step will number
++            copies = []
++            for q in self.peers:
++                dst = self.remote[q] + self._region(q, self.rank, e)
++                for t, at in zip(sends[q], lay[q]):
++                    a, z = max(lo, at), min(hi, at + t.numel() * t.element_size())
++                    if a < z:
++                        copies.append((dst + a - lo, t.data_ptr() + a - at, z - a))
++            if self._step(copies) != e:
++                raise RuntimeError("the copy-engine exchange's step count moved under a call")
++            for p in self.peers:                               # this step's bytes from p into its receives
++                src = self._region(self.rank, p, e)
++                for t, at in zip(recvs[p], lay[p]):
++                    a, z = max(lo, at), min(hi, at + t.numel() * t.element_size())
++                    if a < z:
++                        dst = t.view(-1).view(torch.uint8)
++                        dst[a - at:z - at].copy_(self.arena[src + a - lo:src + z - lo])
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index 5740102..c46a5c0 100644
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -6,7 +6,11 @@ TF_NCCL_EXCHANGE_ENV (optional, e.g. ``NCCL_P2P_DISABLE=1``): the paired sends a
+ copy of the library with these NCCL_* settings (space separated) in effect for it alone. NCCL reads its settings once a
+ process, so one library cannot run its all-gathers over one transport and its sends over another; on PCIe hosts where
+ NCCL's peer-to-peer all-gathers are fast but its peer-to-peer send/receive path is slow (two channels a peer), this keeps
+-every collective on peer-to-peer and the bulk swaps on shared memory. The same bytes move in the same order."""
++every collective on peer-to-peer and the bulk swaps on shared memory. The same bytes move in the same order.
++
++TENSORFOLD_EXCHANGE=ce (``ce_comm``): the paired sends and receives go over the GPUs' copy engines through CUDA IPC
++instead of any NCCL communicator (every rank on one host, each process seeing every GPU); TF_NCCL_EXCHANGE_ENV is then
++not used. ``nccl`` (default): NCCL as above."""
+ 
+ from __future__ import annotations
+ 
+@@ -133,9 +137,35 @@ class NCCL:
+         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
+         torch.cuda.current_device()
+         self.comm = self._init(self.lib, key)
+-        # the paired sends and receives' communicator (TF_NCCL_EXCHANGE_ENV), else this one
++        # the paired sends and receives' communicator (TF_NCCL_EXCHANGE_ENV), else this one; or the copy engines
++        # (TENSORFOLD_EXCHANGE=ce), every rank alike (checked here, before anything waits on another rank's setup)
+         self.xlib, self.xcomm = self.lib, self.comm
+-        settings = exchange_env()
++        self.ce = None
++        from .ce_comm import slot_bytes, transport
++
++        try:                                         # a setting this rank refuses still reaches the others
++            mine = transport()
++            told = mine if mine == "nccl" else f"ce, regions of {slot_bytes() >> 20} MiB"
++        except ValueError as exc:
++            self.store.set(f"tf_xt/{rank}", f"not valid ({exc})")
++            raise
++        self.store.set(f"tf_xt/{rank}", told)
++        theirs = [self.store.get(f"tf_xt/{r}") for r in range(world)]
++        theirs = [t.decode() if isinstance(t, bytes) else str(t) for t in theirs]
++        if any(t != told for t in theirs):
++            raise RuntimeError("TENSORFOLD_EXCHANGE / TENSORFOLD_CE_SLOT_MIB differ between the ranks: "
++                               + ", ".join(f"rank {r} {t}" for r, t in enumerate(theirs))
++                               + "; give every rank the same")
++        settings = exchange_env() if mine == "nccl" else {}
++        if mine == "ce":
++            from .ce_comm import CeTransport
++
++            self.ce = CeTransport(rank, world, self.store)
++            if rank == 0:
++                note = " (TF_NCCL_EXCHANGE_ENV not used)" if exchange_env() else ""
++                print(f"[tensorfold] paired sends and receives over copy engines through CUDA IPC "
++                      f"({self.ce.arena_bytes >> 20} MiB receive arena a GPU, TENSORFOLD_EXCHANGE=ce){note}; "
++                      "all-gathers on NCCL", flush=True)
+         if settings:
+             saved = {k: os.environ.get(k) for k in settings}
+             os.environ.update(settings)              # read by the second library's first calls, once
+@@ -208,13 +238,16 @@ class NCCL:
+ 
+     def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
+         """One NCCL group on the current stream: every ``sends[i]`` to ``peer`` and ``recvs[i]`` from it (contiguous
+-        tensors; the peer's matching call has the same count, sizes and dtypes in the same order)."""
++        tensors; the peer's matching call has the same count, sizes and dtypes in the same order). Under
++        TENSORFOLD_EXCHANGE=ce only two ranks may call it (``exchange_all`` takes more)."""
+ 
+         if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
+             raise ValueError("exchange: one receive per send, from another rank")
+         for s, r in zip(sends, recvs):
+             if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                 raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
++        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce
++            return self.ce.exchange(sends, recvs, peer)
+         stream = torch.cuda.current_stream().cuda_stream
+         x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
+         self._check(x.ncclGroupStart(), x)
+@@ -229,7 +262,9 @@ class NCCL:
+     def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
+         """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
+         ``recvs[p][i]`` from it (an all-to-all of row blocks; each peer's matching call names this rank with the
+-        same sizes and dtypes in the same order)."""
++        same sizes and dtypes in the same order). Under TENSORFOLD_EXCHANGE=ce every other rank must be named and
++        each gets as many bytes as every other (the row split's exchanges); NCCL also takes subsets and sizes that
++        differ by peer."""
+ 
+         if set(sends) != set(recvs) or any(p == self.rank or not 0 <= p < self.world for p in sends):
+             raise ValueError("exchange_all: sends and receives with the same other ranks")
+@@ -239,6 +274,8 @@ class NCCL:
+             for s, r in zip(sends[p], recvs[p]):
+                 if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                     raise ValueError("exchange_all: each send and receive must be contiguous and alike")
++        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce
++            return self.ce.exchange_all(sends, recvs)
+         stream = torch.cuda.current_stream().cuda_stream
+         x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
+         self._check(x.ncclGroupStart(), x)
+diff --git tensorfold/families/glm5_next/cuda/ce.py tensorfold/families/glm5_next/cuda/ce.py
+index 056b209..018720d 100644
+--- tensorfold/families/glm5_next/cuda/ce.py
++++ tensorfold/families/glm5_next/cuda/ce.py
+@@ -16,15 +16,22 @@ staging into place. Every rank runs the same steps in the same order, so a step
+ shared-memory table (one int64 per sender: the last step it recorded; one per receiver and sender: the last step the
+ receiver waited for) makes a receiver wait for the record of the right step (a stream wait refers to the event's last
+ record at the time of the call) and keeps a sender from re-recording one of its SLOTS events before every receiver has
+-waited on its previous use. A staging area is never overwritten while its reader may still need it: the next write
+-into it needs the whole next block computed, which needs this rank's rows, which it sends only after reading.
++waited on its previous use. A staging area is never overwritten while its reader may still need it: a rank issues all
++its steps in its stream order (one stream, or streams joined by stream waits between kinds of chunk) and a step's copies
++start after its stream waited for every peer's record of the step before; a reader's last read of a staging area (its
++local row copies, or hc_post on a partials block, which its next rows step waits for through ev_glue) sits before one of
++its own later records, and the next write into that area comes only after a step that waited for that record.
+ 
+ Exact: the same bytes land in the same places NCCL's exchange put them; the consumers are unchanged (transport only).
++A failed step (a peer that stopped, a CUDA error, a timeout) poisons the exchange: every later step raises, and the
++ranks must be restarted together. GPU-side waits on a peer that died mid-step do not time out (as with NCCL); the
++host-side ones do (TF_GLM_CE_TIMEOUT_S). The same protocol, with its own staging, also runs behind comm.exchange /
++exchange_all as a transport of the communicator (``tensorfold.cuda.ce_comm``, TENSORFOLD_EXCHANGE=ce).
+ 
+ Needs: every rank on one host, each process seeing every GPU (its own first: TensorFold uses device 0) with peer
+-access between them, and room in each GPU's BAR1 for the arena (about R x D x 10 bytes: 64 MiB at 2,048 rows,
+-TF_GLM_CE_ARENA_MIB caps it, default 192). The startup check exchanges a pattern and stops the server, on every rank,
+-if anything is missing or wrong."""
++access between them, and room in each GPU's BAR1 for the arena (about 7 x R x D bytes: 56 MiB at 2,048 rows, 112 MiB
++at 4,096; TF_GLM_CE_ARENA_MIB caps it, default 192). The startup check exchanges a pattern and stops the server, on
++every rank, if anything is missing or wrong."""
+ 
+ from __future__ import annotations
+ 
+@@ -32,7 +39,6 @@ import ctypes
+ import glob
+ import mmap
+ import os
+-import socket
+ import time
+ import uuid
+ 
+@@ -138,15 +144,20 @@ class CeExchange:
+         self.key = f"tf_{tag}"
+         self.device = "cuda"
+         self.lib = None
++        self.poisoned: str | None = None
++        self._name = None
+         # two phases with a vote after each: every key a rank reads in ``_connect`` was written before the first
+         # vote passed, so a rank that fails early never leaves the others blocked on the store
+-        for label, phase in (("local", self._local), ("connect", self._connect)):
+-            problem = ""
+-            try:
+-                phase()
+-            except Exception as exc:                   # noqa: BLE001  (every rank learns it and stops)
+-                problem = f"{type(exc).__name__}: {exc}"
+-            self._vote(label, problem)
++        try:
++            for label, phase in (("local", self._local), ("connect", self._connect)):
++                problem = ""
++                try:
++                    phase()
++                except Exception as exc:               # noqa: BLE001  (every rank learns it and stops)
++                    problem = f"{type(exc).__name__}: {exc}"
++                self._vote(label, problem)
++        finally:
++            self._unlink()                             # rank 0's table: every rank has mapped it by now, or never will
+         self._probe()
+ 
+     # -- setup ---------------------------------------------------------------------------------------------------------
+@@ -168,7 +179,9 @@ class CeExchange:
+         if bad:
+             raise RuntimeError("TF_GLM_HC_EXCHANGE=ce could not start (" + "; ".join(bad) + "). It needs every rank "
+                                "on one host, each process seeing every GPU (its own first) with peer access, and "
+-                               "BAR1 room for the arena; TF_GLM_HC_EXCHANGE=p2p is NCCL's exchange.")
++                               f"BAR1 room for the arena ({(self.rs_bytes + self.ag_bytes) >> 20} MiB a GPU beside "
++                               "NCCL's peer buffers: nvidia-smi -q -d MEMORY shows BAR1; shorter prompt chunks "
++                               "shrink it); TF_GLM_HC_EXCHANGE=p2p is NCCL's exchange.")
+ 
+     def _local(self) -> None:
+         """This rank's part: the arena (allocated and exported), its events (exported), its host identity; rank 0
+@@ -181,9 +194,9 @@ class CeExchange:
+         torch.cuda.current_device()
+         self.lib = lib = _cudart()
+         s = self.store
+-        # one host: the ranks' host identities must match (the table is host shared memory)
++        # one host (the table is host shared memory): the kernel's boot id, the same in every container on it
+         with open("/proc/sys/kernel/random/boot_id") as f:
+-            self.host = socket.gethostname() + ":" + f.read().strip()
++            self.host = f.read().strip()
+         s.set(f"{self.key}/host/{self.rank}", self.host)
+         # the receive arena, exported
+         ptr = ctypes.c_void_p()
+@@ -223,8 +236,11 @@ class CeExchange:
+                 raise RuntimeError(f"rank {r} runs on another host")
+         name = s.get(f"{self.key}/table")
+         name = name.decode() if isinstance(name, bytes) else str(name)
+-        self._fd = os.open(name, os.O_RDWR)
+-        self._map = mmap.mmap(self._fd, 8 * self._entries())
++        fd = os.open(name, os.O_RDWR)
++        try:
++            self._map = mmap.mmap(fd, 8 * self._entries())
++        finally:
++            os.close(fd)                                        # the mapping keeps the file
+         self.tab = np.ndarray((self._entries(),), dtype=np.int64, buffer=self._map)
+         self.remote = {}
+         self.theirs = {}
+@@ -240,18 +256,30 @@ class CeExchange:
+             self.theirs[p] = [torch.cuda.Event.from_ipc_handle(dev, bytes(s.get(f"{self.key}/ev/{p}/{k}")))
+                               for k in range(SLOTS)]
+ 
++    def _unlink(self) -> None:
++        if self._name:
++            try:
++                os.unlink(self._name)
++            except OSError:
++                pass
++            self._name = None
++
+     def _probe(self) -> None:
+         """Every rank writes its rank number into its slot of each peer's partials staging, through one step; each
+-        checks what arrived; then the table is unlinked (every rank has it mapped)."""
++        checks what arrived. Every rank reaches every vote whatever fails (no rank is left waiting on another's key),
++        and the probe's own waits give up after 60 s."""
+ 
++        d, n = self.width, min(self.H, 2)
+         problem = ""
+         try:
+-            d = self.width
+-            n = min(self.H, 2)
+             src = torch.full((n, d), float(self.rank + 1), dtype=torch.float32, device=self.device)
+             self.rs[:self.world * n * d].zero_()
+             self._sync()
+-            self._vote("zeroed", "")
++        except Exception as exc:                       # noqa: BLE001
++            problem = f"{type(exc).__name__}: {exc}"
++        self._vote("zeroed", problem)
++        timeout, self.timeout = self.timeout, min(self.timeout, 60.0)
++        try:
+             copies = [(self.remote[q] + (self.rank * n * d) * 4, src.data_ptr(), n * d * 4) for q in self.peers]
+             self.exchange(copies)
+             got = self.rs[:self.world * n * d].view(self.world, n, d)
+@@ -261,14 +289,11 @@ class CeExchange:
+             self._sync()
+         except Exception as exc:                       # noqa: BLE001
+             problem = f"{type(exc).__name__}: {exc}"
++        finally:
++            self.timeout = timeout
+         self._vote("probe", problem)
+-        if self.rank == 0 and getattr(self, "_name", None):
+-            try:
+-                os.unlink(self._name)
+-            except OSError:
+-                pass
+ 
+-    # -- the protocol ----------------------------------------------------------------------------------------------------
++    # -- the protocol ------------------------------------------------------------------------------------------------
+     def _await(self, idx: int, target: int, what: str) -> None:
+         tab = self.tab
+         if tab[idx] >= target:
+@@ -287,6 +312,15 @@ class CeExchange:
+         """One step on the current stream: this rank's copies (dst, src, bytes) into the peers' arenas, its event,
+         then a wait for every peer's event of the same step (its copies into this rank's arena are then done)."""
+ 
++        if self.poisoned is not None:
++            raise RuntimeError(f"TF_GLM_HC_EXCHANGE=ce stopped after an error ({self.poisoned}); restart every rank")
++        try:
++            self._exchange(copies)
++        except Exception as exc:
++            self.poisoned = f"{type(exc).__name__}: {exc}"
++            raise
++
++    def _exchange(self, copies: list[tuple[int, int, int]]) -> None:
+         e = self.step = self.step + 1
+         k = e % SLOTS
+         W = self.world
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 72c3e7a..19f8715 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -122,6 +122,7 @@ class Engine:
+         self.w = w
+         self.grid = grid
+         w.meta["long_context"] = long_context
++        w.meta["prompt_grid"] = grid                         # prompt chunks' grid (``lanes`` cut on it)
+         from . import l2pf
+ 
+         pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture
+@@ -552,7 +553,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+     from . import digest as _digest
+ 
+     if _digest.ON and not replay:                        # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
+-        _digest.prompt_digest(w, st, len(prompt), last)
++        _digest.prompt_digest(w, st, len(prompt), last, drafter)
+     if keep_head:
+         e.head = last.clone()
+     if e.constraint is not None:                         # the first token's row, under the reply's grammar
+@@ -563,11 +564,13 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+ 
+ 
+ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, feed=None,
+-                  mtp: bool = False, head: bool = True) -> torch.Tensor | None:
++                  mtp: bool = False, head: bool = True, reads: Sequence[int] | None = None) -> torch.Tensor | None:
+     """Commit prompt rows start .. start + R (at e.st.pos == start): the chunk's forward, DFlash2's taps, the MTP
+     head's rows (``mtp``: the next tokens are the prompt's), the commit; a copy of the head's logits of its last
+     row, taken before anything else reuses the buffers, with ``head``, else None. ``prefill`` runs a prompt as these;
+-    so do concurrent streams' prompt steps (``multi``), one chunk at a time."""
++    so do concurrent streams' prompt steps (``multi``), one chunk at a time. ``reads``: where DFlash2's context of
++    this prompt is read later (its end, the default, and every point a state is kept at): with
++    TF_GLM_DRAFT_PROMPT_SKIP the taps of rows no such point's window reaches are skipped (``draft_skip``)."""
+ 
+     w, st, b = e.w, e.st, e.pbuf
+     chunk = list(prompt[start:start + R])
+@@ -577,7 +580,13 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, draft
+     out = out.clone() if head else None
+     e.last_hidden = b.fnormed[R - 1:R].clone()
+     if drafter is not None:
+-        drafter.add_taps(e.tap_rows(R, b))
++        from .draft_skip import skip_rows
++
++        k = skip_rows(drafter, start, R, reads if reads is not None else (len(prompt),))
++        if k:
++            drafter.skip_taps(k)
++        if k < R:
++            drafter.add_taps(torch.cat([t[k:R] for t in b.taps], dim=1) if k else e.tap_rows(R, b))
+     if mtp:
+         nxt = list(prompt[start + 1:start + R + 1])
+         if nxt:
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index 69d2268..eaaf689 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -414,6 +414,17 @@ class Drafter:
+             self.vc[i].index_copy_(1, idx, v)
+         self.pos_dev += n
+ 
++    def skip_taps(self, n: int) -> None:
++        """Advance the context end over n committed rows without their context update: rows no later block pass
++        reads (TF_GLM_DRAFT_PROMPT_SKIP, ``draft_skip``)."""
++
++        if n <= 0:
++            return
++        if self.context_end + n > self.capacity:
++            raise ValueError("drafter context past its capacity")
++        self.pos_dev += n
++        self.context_end += n
++
+     @torch.no_grad()
+     def add_taps(self, taps: torch.Tensor) -> None:
+         """Committed rows' taps [n, 5 * D] (bf16) at positions context_end, context_end + 1, ..."""
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index 10c53b5..d60c927 100644
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -85,6 +85,9 @@ def _dattn_seg_kernel(Q, K, V, OUT, POS, SLOT, window, scale, L, SLOT_ROWS,
+     tl.store(OUT + (seg * N + qr[:, None]) * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
+ 
+ 
++TABLE_RING = 64        # pinned context-update tables in the ring (TF_GLM_DRAFT_PROMPT_SKIP): a 4,096-row chunk's launches
++
++
+ class DraftContext:
+     """One stream's DFlash2 context: its slot of the shared ring pool (``kc`` / ``vc`` per layer are views
+     [kv heads, ring rows, head_dim]) and where its committed rows end. Stands in for a solo ``Drafter`` wherever one
+@@ -109,6 +112,17 @@ class DraftContext:
+         """This stream's committed rows' taps alone (a prompt's chunks): ``MultiDrafter.commit`` of one stream."""
+         self.owner.commit([(self, taps)])
+ 
++    def skip_taps(self, n: int) -> None:
++        """Advance this stream's context end (and its device mirror) over n committed rows without their context
++        update: rows no later block pass reads (TF_GLM_DRAFT_PROMPT_SKIP, ``draft_skip``)."""
++
++        if n <= 0:
++            return
++        if self.context_end + n > self.capacity:
++            raise ValueError("drafter context past its capacity")
++        self.pos_dev += n
++        self.context_end += n
++
+     def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
+                 beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
+         return self.owner.propose([DraftRequest(self, pending, depth, sampling, confidence, beta, round_ms)])[0]
+@@ -164,6 +178,13 @@ class MultiDrafter:
+         self.t_meta = torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, device=self.dev)
+         self.t_host = torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, pin_memory=pinned)
+         self.t_ready = torch.cuda.Event() if pinned else None
++        # TF_GLM_DRAFT_PROMPT_SKIP: a ring of pinned tables, each waited on only when it comes round again (a prompt
++        # chunk's updates then queue behind its forward instead of waiting for it on the host one launch at a time)
++        from .draft_skip import ON as ring_on
++
++        self.t_ring = ([(torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, pin_memory=pinned),
++                         torch.cuda.Event() if pinned else None) for _ in range(TABLE_RING)] if ring_on else None)
++        self.t_next = 0
+         self.tap_in = torch.zeros((T, d.tap_in.shape[1]), dtype=torch.bfloat16, device=self.dev)
+         m = n - 1
+         self.cand_n = d.gathered * streams * m * 2 * d.top_k
+@@ -312,9 +333,15 @@ class MultiDrafter:
+     # -- the context ---------------------------------------------------------------------------------------------
+     def _launch_taps(self, pieces: list[tuple[DraftContext, torch.Tensor, int]]) -> None:
+         St, Tm = self.streams, self.t_max
+-        if self.t_ready is not None:
+-            self.t_ready.synchronize()                   # the last update's table has left t_host
+-        h = self.t_host
++        if self.t_ring is not None:                      # TF_GLM_DRAFT_PROMPT_SKIP: the ring's next table
++            h, ready = self.t_ring[self.t_next]
++            self.t_next = (self.t_next + 1) % len(self.t_ring)
++            if ready is not None:
++                ready.synchronize()                      # its last update's table has left it (a ring ago)
++        else:
++            if self.t_ready is not None:
++                self.t_ready.synchronize()               # the last update's table has left t_host
++            h, ready = self.t_host, self.t_ready
+         h[2 * Tm:2 * Tm + St].fill_(St)
+         h[2 * Tm + St:].zero_()
+         off = 0
+@@ -335,8 +362,8 @@ class MultiDrafter:
+             h[off:T] = 0
+             h[Tm + off:Tm + T] = St * self.cap + torch.arange(off, T, dtype=torch.int64)
+         self.t_meta.copy_(h, non_blocking=True)
+-        if self.t_ready is not None:
+-            self.t_ready.record()
++        if ready is not None:
++            ready.record()
+         if g is not None:
+             g.replay()
+         else:
+diff --git tensorfold/families/glm5_next/cuda/digest.py tensorfold/families/glm5_next/cuda/digest.py
+index c5a507b..1a48b6e 100644
+--- tensorfold/families/glm5_next/cuda/digest.py
++++ tensorfold/families/glm5_next/cuda/digest.py
+@@ -7,7 +7,8 @@ mod 2^64: any single changed bit changes it). It reads state only (and syncs the
+ no reply; leave it off in service.
+ 
+ The lines read
+-  [tensorfold] prefill digest rank R tokens N logits <hex> kda <hex> conv <hex> latent <hex> pools <hex>"""
++  [tensorfold] prefill digest rank R tokens N logits <hex> kda <hex> conv <hex> latent <hex> pools <hex> draft <hex>
++(draft: DFlash2's window rows a draft at N reads, when the prompt drafts; "-" otherwise)."""
+ 
+ from __future__ import annotations
+ 
+@@ -57,10 +58,16 @@ class _Acc:
+         return f"{a:016x}{b:016x}"
+ 
+ 
+-def prompt_digest(w, st, n: int, logits: torch.Tensor | None) -> None:
+-    """Print rank w.rank's digests of the prompt of ``n`` tokens just prefilled into ``st`` (its stream's state)."""
++def prompt_digest(w, st, n: int, logits: torch.Tensor | None, drafter=None) -> None:
++    """Print rank w.rank's digests of the prompt of ``n`` tokens just prefilled into ``st`` (its stream's state);
++    with ``drafter`` (its DFlash2 context) also of the drafter's window rows a draft at n reads."""
+ 
+-    parts = {name: _Acc() for name in ("logits", "kda", "conv", "latent", "pools")}
++    parts = {name: _Acc() for name in ("logits", "kda", "conv", "latent", "pools", "draft")}
++    if drafter is not None and int(getattr(drafter, "context_end", -1)) == n:
++        from .multi import draft_window
++
++        for t in draft_window(drafter, n):
++            parts["draft"].add(t)
+     parts["logits"].add(logits)
+     for li in range(len(st.cur)):
+         parts["kda"].add(st.rec[st.cur[li], li])
+diff --git tensorfold/families/glm5_next/cuda/draft_skip.py tensorfold/families/glm5_next/cuda/draft_skip.py
+new file mode 100644
+index 0000000..516ef3f
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/draft_skip.py
+@@ -0,0 +1,67 @@
++"""TF_GLM_DRAFT_PROMPT_SKIP=1 (patch 0124): a prompt's DFlash2 context rows that no later draft reads are not
++computed, and a prompt chunk's context updates queue without a host sync each.
++
++DFlash2's attention is a sliding window (its config's sliding_window: 2,048 for GLM-5.3-Flash's): a block pass at
++context end P reads the keys and values of positions P - window - 1 .. P - 1 only (``dflash2._dattn_kernel``; a kept
++state copies exactly those, ``decode._drafter_views`` / ``_ring_slots``). A prompt's context is read at its end (the
++first drafts) and at every point where a state is kept (its window rows are copied then); a row before every such
++point's window is never read again. Without this setting every prompt row still went through the drafter's context
++update: the fc projection of the five tapped layers (5 x 4,096 -> 4,096, replicated: about 170 MFLOP a row on every
++rank) and the KV projections of the drafter's layers, in launches of up to 64 rows; and with --parallel each launch
++first waited on the host for the previous launch's table to leave its one pinned buffer, which, right after a prompt
++chunk's forward, meant waiting for the whole forward, so the next chunk could only be queued once the chunk's launches
++had gone through one at a time.
++
++With it, the rows of a prompt chunk before the earliest window a later read point needs are skipped (``skip_rows``;
++the drafter's context end advances over them, ``skip_taps``), and the rows from there on go through the same calls as
++before. Each row's update is row-independent (the drafter's matmuls fix their K splits by shape; its norm, rotary and
++cache writes are per row), so every row any draft reads holds the same bits and the drafts are the same. With
++--parallel the context updates take their tables from a ring of pinned buffers, each one waited on only when it comes
++round again (``dflash2_multi.MultiDrafter``).
++
++Exact: drafts only propose, and here they do not even change; replies are the same, token for token. The prompt-state
++digests (TF_GLM_PREFILL_DIGEST) include the drafter's window at each prompt's end."""
++
++from __future__ import annotations
++
++import os
++from typing import Iterable
++
++MARGIN = 64          # rows computed before the earliest window a read point needs, past what it reads
++
++
++def enabled(value: str | None = None) -> bool:
++    value = (os.environ.get("TF_GLM_DRAFT_PROMPT_SKIP", "") if value is None else value).strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_DRAFT_PROMPT_SKIP: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++ON = enabled()
++
++
++def code() -> list[int]:
++    return [int(ON)]
++
++
++def describe() -> str:
++    return ("prompt chunks skip the DFlash2 context rows no later draft reads (outside every read point's sliding "
++            "window), context updates queue without a host sync each")
++
++
++def skip_rows(drafter, start: int, rows: int, reads: Iterable[int]) -> int:
++    """How many leading rows of prompt rows start .. start + rows no draft will read: rows before the earliest
++    window (window + 1 rows and MARGIN) of the read points past ``start`` (``reads``: the prompt's end and every point
++    where its state is kept). 0 when the setting is off, the drafter attends without a window, or no read point
++    lies past ``start``."""
++
++    if not ON or drafter is None:
++        return 0
++    window = int(getattr(drafter, "window", -1))
++    if window < 0:
++        return 0
++    later = [int(p) for p in reads if int(p) > start]
++    if not later:
++        return 0
++    first = min(later) - window - 1 - MARGIN
++    return max(0, min(int(rows), first - int(start)))
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 9fafdbc..9c72aed 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -646,9 +646,12 @@ class GlmEngine:
+         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
+ 
+         mine += index_split_settings().code()
+-        from . import lanes as lanes_mod                              # patch 0123: TF_GLM_PREFILL_LANES*
++        from . import lanes as lanes_mod                # patches 0123, 0128: TF_GLM_PREFILL_LANES*, TF_GLM_KDA_OVERLAP
+ 
+         mine += lanes_mod.code()
++        from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
++
++        mine += draft_skip_mod.code()
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -662,7 +665,7 @@ class GlmEngine:
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
+-                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS): "
++                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -755,6 +758,8 @@ class GlmEngine:
+                           "(only shorter ones split)", flush=True)
+         if rank == 0 and index_split_settings().on and world > 1:
+             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
++        if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
++            print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+         if rank == 0 and lanes_mod.LANES > 1:
+             print(f"[tensorfold] {lanes_mod.describe()}"
+                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
+diff --git tensorfold/families/glm5_next/cuda/index_split.py tensorfold/families/glm5_next/cuda/index_split.py
+index 5baebba..a309ca7 100644
+--- tensorfold/families/glm5_next/cuda/index_split.py
++++ tensorfold/families/glm5_next/cuda/index_split.py
+@@ -19,12 +19,13 @@ TF_GLM_INDEX_SPLIT_CHECK=1 also runs the unsplit selection and stops the server
+ it costs the full selection again and a device sync a layer).
+ 
+ When: prompt chunks only (eager, ``host_pos`` known), every row of the piece past the dense limit, at least two
+-blocks (R > SELECT_ROWS), the piece's first position at least TF_GLM_INDEX_SPLIT_FROM (default 16,384: shorter
+-contexts score few pools, where the gather costs more than it saves), two or more ranks. Every rank decides from the
+-same numbers, so they all take the same branch; the startup comparison holds the settings (``code``).
++blocks of 64+ rows (``split_block``), the piece's first position at least TF_GLM_INDEX_SPLIT_FROM (default
++16,384: shorter contexts score few pools, where the gather costs more than it saves), two or more ranks. Every rank
++decides from the same numbers, so they all take the same branch; the startup comparison holds the settings (``code``).
+ 
+-Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap
+-(``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else on the current stream."""
++Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap and NCCL
++exchanges (``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else (no overlap,
++or copy-engine exchanges, which take no NCCL call) on the current stream."""
+ 
+ from __future__ import annotations
+ 
+@@ -80,21 +81,45 @@ def settings() -> IndexSplit:
+ def applies(w, b, R: int, host_pos: int | None, all_sparse: bool, sparse_np: int | None) -> bool:
+     """Whether a piece of R rows from ``host_pos`` selects split (the same answer on every rank)."""
+ 
+-    from .sparse import SELECT_ROWS
+-
+     s = settings()
+     world = int(getattr(w, "world", 1))
++    # at least two selection blocks of 64+ rows (``split_block``; patch 0127: from 128 rows, so a 1,024-row chunk's
++    # 512-row lanes split too)
+     return (s.on and world > 1 and getattr(w, "comm", None) is not None and b.prefill and sparse_np is None
+-            and host_pos is not None and all_sparse and host_pos >= s.start and R > SELECT_ROWS)
++            and host_pos is not None and all_sparse and host_pos >= s.start and R >= 128
++            and R > split_block(R, world))
+ 
+ 
+ def _side_stream(b):
+-    """The row split's second stream while a split prompt chunk runs (its NCCL calls go there), else None."""
++    """The row split's second stream while a split prompt chunk runs and its exchanges are NCCL calls (every NCCL call
++    of the chunk then stays on that stream, in one order on every rank), else None: the current stream. With the
++    copy-engine transport the split's exchanges take no NCCL call, so the gather need not queue behind them (behind
++    the other lane's exchange, with TF_GLM_PREFILL_LANES)."""
+ 
+     sp = getattr(b, "split", None)
+-    if sp is not None and getattr(sp, "active", False) and getattr(sp, "stream", None) is not None:
+-        return sp.stream
+-    return None
++    if sp is None or not getattr(sp, "active", False) or getattr(sp, "stream", None) is None:
++        return None
++    if getattr(sp, "ce", None) is not None:              # TF_GLM_HC_EXCHANGE=ce
++        return None
++    comm = getattr(sp.w, "comm", None)
++    if not getattr(sp, "gather", False) and getattr(getattr(comm, "nccl", comm), "ce", None) is not None:
++        return None                                       # TENSORFOLD_EXCHANGE=ce under the p2p exchanges
++    return sp.stream
++
++
++def split_block(R: int, world: int) -> int:
++    """Rows of the split's selection blocks for a piece of R rows (patch 0125): the piece's rows a rank, rounded up to
++    64, at most SELECT_ROWS (512), so a 1,024-row piece still gives each of four ranks a block; SELECT_ROWS itself
++    when that would leave a last block under 64 rows. Every block size gives a row the same pools (blocks of 64 rows
++    or more take the same kernels and constexprs; a shorter block takes the decode-sized path, which selects the same
++    pools, as the unsplit chunk's own short last block already does: tests/test_index_split_cpu.py covers both ways);
++    the rule only keeps the split's blocks on the prompt kernels."""
++
++    from .sparse import SELECT_ROWS
++
++    b = min(SELECT_ROWS, max(64, -(-(-(-int(R) // int(world))) // 64) * 64))
++    tail = int(R) % b
++    return SELECT_ROWS if 0 < tail < 64 else b
+ 
+ 
+ def deal(blocks: int, world: int, rank: int) -> tuple[list[int], int]:
+@@ -114,7 +139,7 @@ def select(w, b, qr: torch.Tensor, xs_qr: torch.Tensor, qb, qi: torch.Tensor, wt
+ 
+     s = settings()
+     world, rank = int(w.world), int(w.rank)
+-    sel = PromptSelect(qi, wts, pk, host_pos, R, np_max, pos_dev)
++    sel = PromptSelect(qi, wts, pk, host_pos, R, np_max, pos_dev, block=split_block(R, world))
+     starts = list(sel.blocks())
+     mine, slots = deal(len(starts), world, rank)
+     if s.check:
+diff --git tensorfold/families/glm5_next/cuda/lanes.py tensorfold/families/glm5_next/cuda/lanes.py
+index c4884f8..910796c 100644
+--- tensorfold/families/glm5_next/cuda/lanes.py
++++ tensorfold/families/glm5_next/cuda/lanes.py
+@@ -21,17 +21,25 @@ row-independent kernels, run on the exchange stream instead of the main one (eve
+ When: chunks that run split (TF_GLM_HC_SPLIT=1), of one prompt (multi-prompt chunks run as before), with every row
+ past the dense limit (a prompt's first 2,051 tokens run as before), two lanes of at least TF_GLM_LANE_MIN_ROWS rows
+ (default 512) that each split into whole shares a rank. Pair it with 4,096-row chunks (TF_GLM_PREFILL_ROWS): each
+-lane then has the rows of a 2,048-row chunk and the index split (TF_GLM_INDEX_SPLIT) still gives every rank a block."""
++lane then has the rows of a 2,048-row chunk and the index split (TF_GLM_INDEX_SPLIT) still gives every rank a block.
++
++TF_GLM_KDA_OVERLAP (patch 0128, off by default): a KDA layer's chunked recurrence runs one block a head (16 blocks a
++rank at TP4) through the lane's 32-row sub-chunks in order, so the GPU is mostly idle while it runs, and lane B's
++recurrence waits for lane A's (it starts from the state lane A leaves). With the setting, the recurrences run on a
++stream of their own: lane A's beside lane B's input projections, lane B's beside lane A's output projection (1), and
++with 2 also lane B's output projection follows on that stream while the main stream runs lane A's MLP / MoE block.
++The same calls on the same rows and states in the same order on every buffer (``kda_lanes``): the same bits."""
+ 
+ from __future__ import annotations
+ 
+ import copy
++import math
+ import os
+ from types import SimpleNamespace
+ 
+ import torch
+ 
+-from . import glue
++from . import glue, prof
+ from .hcsplit import HcSplit, SplitSettings
+ 
+ # Buffers attributes whose first axis is the window's rows: a lane views its rows of each
+@@ -57,25 +65,43 @@ def lane_min_rows(value: str | None = None) -> int:
+     return int(value)
+ 
+ 
++def kda_overlap(value: str | None = None) -> int:
++    """TF_GLM_KDA_OVERLAP (patch 0128): 0 (off, the default); 1: a KDA layer's recurrence runs on a stream of its own,
++    lane A's beside lane B's input projections and lane B's beside lane A's output projection; 2: as 1, and lane B's
++    output projection follows its recurrence on that stream, beside lane A's MLP / MoE block. Same bits (scheduling
++    only); used where the lanes run (TF_GLM_PREFILL_LANES=2)."""
++
++    value = (os.environ.get("TF_GLM_KDA_OVERLAP", "") if value is None else value).strip() or "0"
++    if value not in ("0", "1", "2"):
++        raise ValueError(f"TF_GLM_KDA_OVERLAP: 0 (off), 1 or 2, not {value!r}")
++    return int(value)
++
++
+ LANES = lane_count()
+ MIN_ROWS = lane_min_rows()
+-GRID = 64                       # lanes start on the prompt grid (TF_GLM_PROMPT_GRID's 64; a multiple of 32 and 16)
++KDA_OVERLAP = kda_overlap()
++GRID = 64                       # lanes start on a multiple of this and of the prompt grid (TF_GLM_PROMPT_GRID)
+ 
+ 
+ def code() -> list[int]:
+-    return [LANES, MIN_ROWS if LANES > 1 else 0]
++    return [LANES, MIN_ROWS if LANES > 1 else 0, KDA_OVERLAP if LANES > 1 else 0]
+ 
+ 
+ def describe() -> str:
+-    return (f"prompt chunks in two lanes interleaved block by block (each lane's exchange and glue beside the other "
++    what = (f"prompt chunks in two lanes interleaved block by block (each lane's exchange and glue beside the other "
+             f"lane's compute; lanes of {MIN_ROWS}+ rows)")
++    if KDA_OVERLAP:
++        what += ("; KDA recurrences on a stream of their own beside the projections"
++                 + (" and the other lane's MLP / MoE block" if KDA_OVERLAP == 2 else "") + " (TF_GLM_KDA_OVERLAP)")
++    return what
+ 
+ 
+-def cut(R: int, world: int) -> int | None:
+-    """Lane A's rows of a chunk of R: about half, on the 64-row grid; None when the chunk does not take lanes (a lane
+-    under MIN_ROWS, or a lane that does not split into whole shares a rank)."""
++def cut(R: int, world: int, grid: int = 0) -> int | None:
++    """Lane A's rows of a chunk of R: about half, on a multiple of 64 and of the prompt grid; None when the chunk does
++    not take lanes (a lane under MIN_ROWS, or a lane that does not split into whole shares a rank)."""
+ 
+-    ra = -(-(R // 2) // GRID) * GRID
++    unit = math.lcm(GRID, int(grid or 0) or GRID)
++    ra = -(-(R // 2) // unit) * unit
+     rb = R - ra
+     if ra < MIN_ROWS or rb < MIN_ROWS or ra % world or rb % world:
+         return None
+@@ -85,9 +111,12 @@ def cut(R: int, world: int) -> int | None:
+ def applies(w, b, R: int, host_pos: int | None, sparse_np, mixer) -> bool:
+     """Whether this chunk runs in lanes (the same answer on every rank: settings and the chunk's numbers only)."""
+ 
++    from . import latent
++
+     sp = b.split
+-    return (LANES > 1 and b.prefill and sp is not None and mixer is None and sparse_np is None and host_pos is not None
+-            and host_pos >= w.cfg.dense_limit and sp.applies(R) and cut(R, int(w.world)) is not None)
++    return (LANES > 1 and latent.ENABLED and b.prefill and sp is not None and mixer is None and sparse_np is None
++            and host_pos is not None and host_pos >= w.cfg.dense_limit and sp.applies(R)
++            and cut(R, int(w.world), w.meta.get("prompt_grid", 0)) is not None)
+ 
+ 
+ def rows_view(b, lo: int, hi: int):
+@@ -120,7 +149,10 @@ def rows_view(b, lo: int, hi: int):
+     lat.qa, lat.ol, lat.rows = b.lat_s.qa[lo:hi], b.lat_s.ol[lo:hi], n
+     v.lat_s = lat
+     d = b.part.shape[1]
+-    v.gath = b.gath[lo * d:]          # the split's staging blocks: lane A's N x HA rows first, then lane B's
++    # the split's staging in the all-gather buffer: lane A's from its start, lane B's past every rank's whole partial
++    # of lane A's rows (N x RA rows: the gather exchange's layout; the p2p blocks take N x HA = RA rows), so the two
++    # never overlap; world x rows x D holds N x RA + N x RB rows
++    v.gath = b.gath[int(b.world) * lo * d:]
+     v.split = None
+     return v
+ 
+@@ -135,6 +167,8 @@ class LaneSplit(HcSplit):
+         self.stream = stream
+         self.ev_fill = [torch.cuda.Event()]
+         self.ev_done = torch.cuda.Event()
++        self.ev_front = torch.cuda.Event()       # TF_GLM_KDA_OVERLAP: the lane's KDA projections written (main)
++        self.ev_rec = torch.cuda.Event()         # ... and its recurrence's read-outs (the recurrence stream)
+         self.ce = parent.ce
+         self.ce_at = ce_at
+ 
+@@ -176,7 +210,7 @@ def _lanes(w, b, R: int):
+     """The chunk's two lanes (row views, splits), cached on the prompt buffers by their row ranges."""
+ 
+     sp = b.split
+-    ra = cut(R, int(w.world))
++    ra = cut(R, int(w.world), w.meta.get("prompt_grid", 0))
+     cache = getattr(sp, "_lanes", None)
+     if cache is None:
+         cache = sp._lanes = {}
+@@ -193,6 +227,56 @@ def _lanes(w, b, R: int):
+     return cache[key], sp._lane_stream
+ 
+ 
++def _rec_stream(sp):
++    """The KDA recurrences' stream (TF_GLM_KDA_OVERLAP), made once a split. High priority: a recurrence keeps one
++    block a head busy for the lane's whole length, so its blocks should start as soon as an SM frees up."""
++
++    rec = getattr(sp, "_rec_stream", None)
++    if rec is None:
++        rec = sp._rec_stream = torch.cuda.Stream(priority=-1)
++    return rec
++
++
++def kda_lanes(layer, w, run, main, rec, mode: int) -> None:
++    """A KDA layer's block for both lanes with its recurrences on ``rec`` (TF_GLM_KDA_OVERLAP = ``mode``).
++
++    Main stream: lane A's input projections, lane B's, then each lane's output projection (mode 1), or lane A's only
++    (mode 2: lane B's runs on ``rec`` after its recurrence); each output projection's partials and glue then go to the
++    exchange stream as ``_mixer`` leaves them. Recurrence stream: lane A's recurrence after its projections, then lane
++    B's after its own (lane B starts from the state and conv window lane A's leaves, as in ``lane_layers``).
++
++    Same bits: the calls of ``forward.kda_block`` on the same rows and states in the same order on each buffer; only
++    the streams differ, and events order every buffer one call writes and another reads. The projections write the
++    lane's kproj / ka / kg / xs rows, which its recurrence reads (ev_front); its recurrence writes the lane's read-outs
++    (kscratch rows), which its output projection reads (ev_rec in mode 1, stream order in mode 2), and the layer's KDA
++    state and conv window, which lane B's recurrence reads next (stream order). The lane's next projections, of a later
++    layer, come after its output projection on the main stream (mode 1) or after the main stream waited for its glue,
++    which waited for that projection's partials (mode 2), so they never overwrite rows a recurrence still reads."""
++
++    from .forward import kda_front, kda_rows, out_proj
++
++    outs = []
++    for view, ls, lst, n, nch in run:
++        ls.wait()                                  # the lane's normed rows (its last glue)
++        with prof.timed("kda"):                    # (TF_GLM_PROFILE's timers sync: they serialize the streams)
++            with prof.timed("kda: projections"):
++                kda_front(layer, view, 0, n)
++            ls.ev_front.record(main)
++            rec.wait_event(ls.ev_front)
++            with torch.cuda.stream(rec):
++                outs.append(kda_rows(layer, w, lst, view, 0, n))
++                ls.ev_rec.record(rec)
++    first = run[0][1]
++    for (view, ls, lst, n, nch), out in zip(run, outs):
++        on_rec = mode == 2 and ls is not first
++        if not on_rec:
++            main.wait_event(ls.ev_rec)
++        with torch.cuda.stream(rec if on_rec else main):
++            with prof.timed("kda"), prof.timed("kda: out + all-gather"):
++                out_proj(w, view, out, layer.kda.o, None, n, site=(layer.index, "a"))
++            ls.glue_async(layer.ffn_hc, layer.post_norm)
++
++
+ def _lane_state(st, lo: int):
+     """The chunk's state seen from row ``lo`` (lane B): the same caches, KDA states, conv windows and parity list,
+     its first row's position on the host and on the device."""
+@@ -221,7 +305,10 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
+         ls.begin(hi - lo)
+         lst = _lane_state(st, lo)
+         run.append((view, ls, lst, hi - lo, chunks_for(lst, hi - lo)))
++    rec = _rec_stream(b.split) if KDA_OVERLAP else None
+     stream.wait_stream(main)
++    if rec is not None:
++        rec.wait_stream(main)                 # the states and conv windows as the main stream left them
+     try:
+         layers = w.layers
+         first, h = layers[0], layers[0].attn_hc
+@@ -229,10 +316,13 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
+                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+         for i, layer in enumerate(layers):
+             nxt = layers[i + 1] if i + 1 < len(layers) else None
+-            for view, ls, lst, n, nch in run:     # attention blocks: lane A's, then lane B's (it reads A's caches)
+-                ls.wait()
+-                _mixer(layer, w, lst, view, n, nch, lst.pos, None, None)
+-                ls.glue_async(layer.ffn_hc, layer.post_norm)
++            if rec is not None and layer.kind == "kda":
++                kda_lanes(layer, w, run, main, rec, KDA_OVERLAP)
++            else:
++                for view, ls, lst, n, nch in run:     # attention blocks: lane A's, then lane B's (reads A's caches)
++                    ls.wait()
++                    _mixer(layer, w, lst, view, n, nch, lst.pos, None, None)
++                    ls.glue_async(layer.ffn_hc, layer.post_norm)
+             for view, ls, lst, n, nch in run:     # MLP / MoE blocks
+                 ls.wait()
+                 _ffn(layer, w, view, n, None)
+@@ -242,5 +332,7 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
+             ls.wait()
+     finally:
+         main.wait_stream(stream)
++        if rec is not None:
++            main.wait_stream(rec)
+         for view, ls, lst, n, nch in run:
+             ls.active = False
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index e649ae8..9eebb01 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -45,6 +45,7 @@ from tensorfold.cuda.scheduler import Scheduler, Waiting
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+ from . import digest as _digest, multi_prefill
++from . import prof as _prefill_prof
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .segments import window_rows
+@@ -760,6 +761,12 @@ class MultiDecoder:
+         """The lane's slot's DFlash2 context."""
+         return self.drafts.contexts[lane.slot]
+ 
++    @staticmethod
++    def _reads(lane: Lane) -> list[int]:
++        """Where the lane's DFlash2 context is read later in its prompt: every point its state is kept at, and the
++        prompt's end (TF_GLM_DRAFT_PROMPT_SKIP skips the taps of rows no such point's window reaches)."""
++        return sorted(set(lane.stops) | {len(lane.s.prompt)})
++
+     # -- kept prompts ------------------------------------------------------------------------------------------------------
+     def _kept_by_id(self, kid: int):
+         for c in self.kept:
+@@ -1195,14 +1202,24 @@ class MultiDecoder:
+             if replay:
+                 out, lane.head = lane.head, None
+             else:
+-                out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+-                                    feed=lane.feed, mtp=False, head=stop == n)
++                _prefill_prof.active = _prefill_prof.ENABLED     # TF_GLM_PROFILE: the prompt chunks of --parallel too
++                try:
++                    out = prefill_chunk(e, prompt, start, stop - start,
++                                        drafter=self._ctx(lane) if lane.dflash else None, reads=self._reads(lane),
++                                        feed=lane.feed, mtp=False, head=stop == n)
++                finally:
++                    _prefill_prof.active = False
++                if _prefill_prof.ENABLED:
++                    self._prof_rows = getattr(self, "_prof_rows", 0) + stop - start
++                    if stop == n:                 # one report a prompt (its chunks and any chunk between them)
++                        _prefill_prof.report(self._prof_rows)
++                        self._prof_rows = 0
+             if stop < n:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+                 return None
+             if _digest.ON and not replay:                 # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
+-                _digest.prompt_digest(self.w, lane.st, n, out[:1])
++                _digest.prompt_digest(self.w, lane.st, n, out[:1], self._ctx(lane) if lane.dflash else None)
+             if lane.point == n and not replay:
+                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+             logits = out[:1]
+@@ -1249,7 +1266,8 @@ class MultiDecoder:
+             if not start < stop <= n or stop - start > e.prefill_rows:
+                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+-                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
++                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n,
++                                              reads=self._reads(lane)))
+         t = time.perf_counter()
+         heads = multi_prefill.prefill_pieces(e, pieces)
+         parts, who = [], []
+@@ -1260,7 +1278,7 @@ class MultiDecoder:
+                     self._keep(lane, stop)
+                 continue
+             if _digest.ON:                                # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
+-                _digest.prompt_digest(self.w, lane.st, n, out[:1])
++                _digest.prompt_digest(self.w, lane.st, n, out[:1], self._ctx(lane) if lane.dflash else None)
+             if lane.point == n:
+                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+             logits = out[:1]
+diff --git tensorfold/families/glm5_next/cuda/multi_prefill.py tensorfold/families/glm5_next/cuda/multi_prefill.py
+index da57788..e4da68f 100644
+--- tensorfold/families/glm5_next/cuda/multi_prefill.py
++++ tensorfold/families/glm5_next/cuda/multi_prefill.py
+@@ -73,6 +73,7 @@ class Piece:
+     tokens: list[int]
+     drafter: Any = None
+     head: bool = False
++    reads: Any = None                            # where its DFlash2 context is read later (default: the piece's end)
+     lo: int = field(default=0, init=False)       # its first row in the chunk
+ 
+     @property
+@@ -177,9 +178,16 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
+             heads.append(mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone())
+         else:
+             heads.append(None)
++    from .draft_skip import skip_rows
++
+     for p in pieces:
+         if p.drafter is not None:
+-            p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
++            start = p.st.pos
++            k = skip_rows(p.drafter, start, p.rows, p.reads if p.reads is not None else (start + p.rows,))
++            if k:
++                p.drafter.skip_taps(k)
++            if k < p.rows:
++                p.drafter.add_taps(torch.cat([t[p.lo + k:p.lo + p.rows] for t in b.taps], dim=1))
+     for p in pieces:
+         commit(w, p.st, b, p.rows, p.rows)
+     return heads
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index bbb060a..cdcf66b 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -387,13 +387,15 @@ class PromptSelect:
+     same kernels, grids, constexprs and arguments: patch 0120 only cut the loop body in two)."""
+ 
+     def __init__(self, qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
+-                 pos_dev: torch.Tensor) -> None:
++                 pos_dev: torch.Tensor, block: int | None = None) -> None:
+         self.qi, self.wts, self.R, self.pos_dev = qi, wts, int(R), pos_dev
+         self.dev = qi.device
+         self.NP = pool_count(pos, R, np_max)
+         # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the
+-        # same bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
+-        self.B = min(R, SELECT_ROWS)
++        # same bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory.
++        # ``block`` (the index split's, patch 0125): smaller blocks of at least 64 rows; the same kernels, constexprs
++        # and per-row arithmetic (a row's scores, selection and tokens read only its own query, weights and position)
++        self.B = min(R, block or SELECT_ROWS)
+         self.buf = torch.empty((self.B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=self.dev)
+         self.H = wts.shape[1]
+         self.D = qi.shape[1] // self.H

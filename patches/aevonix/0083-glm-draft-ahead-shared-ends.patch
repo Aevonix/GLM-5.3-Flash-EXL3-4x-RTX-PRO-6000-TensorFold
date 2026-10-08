@@ -1,0 +1,18 @@
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 43840e8..d36a657 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1531,7 +1531,12 @@ class MultiDecoder:
+ 
+         reqs = []
+         for l in lanes:
+-            if l.s.done or not l.dflash or l.depth <= 0:
++            # Not ``l.s.done``: rank 0 alone sets it for a stop string or a client that left (``Stream.emit``), and
++            # a request list that differs between the ranks misaligns the pass's collectives (every rank then waits
++            # forever). A stream's own end (its count: depth 0; an end token) is the same on every rank. Rank 0's
++            # stopped stream leaves on every rank with the next plan; its draft here is only unused work.
++            s = l.s
++            if not l.dflash or l.depth <= 0 or (s.out and s.out[-1] in self._ends(l)):
+                 continue
+             if l.copies is not None and l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)):
+                 continue

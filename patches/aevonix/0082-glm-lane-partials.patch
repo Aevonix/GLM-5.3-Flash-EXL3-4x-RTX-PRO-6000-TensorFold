@@ -1,0 +1,462 @@
+diff --git tensorfold/families/glm5_next/cuda/ce.py tensorfold/families/glm5_next/cuda/ce.py
+index 76c3ee1..5d1a663 100644
+--- tensorfold/families/glm5_next/cuda/ce.py
++++ tensorfold/families/glm5_next/cuda/ce.py
+@@ -34,6 +34,8 @@ for the rows), which the receiver's own projections then read (``inputs``, ``sta
+ rule (its readers run on the exchange stream before this rank's next record). TF_GLM_LANE_DIRECT (the same patch):
+ row buffers that live in the arena ("homes", after the staging) take the peers' rows straight from their copies
+ (``rows(direct=True)``): no staging and no local copies for them (their readers' order: ``lane_inputs``).
++TF_GLM_LANE_PARTIALS=bf16 (patch 0293, ``lane_partials``): the partials' step moves bf16 rows into a bf16 staging
++[N, H, D] (a slot a sender) and widens them into the fp32 staging block hc_post reads (``partials(partb=...)``).
+ 
+ Needs: every rank on one host, each process seeing every GPU (its own first: TensorFold uses device 0) with peer
+ access between them, and room in each GPU's BAR1 for the arena (about 7 x R x D bytes: 56 MiB at 2,048 rows, 112 MiB
+@@ -153,7 +155,7 @@ class CeExchange:
+     """One rank's copy-engine exchange for a prompt buffer's row split (set up collectively by every rank)."""
+ 
+     def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce",
+-                 narrow: int = 0, inputs: int = 0, homes: dict | None = None) -> None:
++                 narrow: int = 0, inputs: int = 0, homes: dict | None = None, pbf16: bool = False) -> None:
+         self.rank, self.world, self.store = int(rank), int(world), store
+         self.narrow = int(narrow)            # bytes a row of narrow row buffers ``rows`` carries (0: none)
+         self.inp_row = int(inputs)           # bytes a row of the input staging (TF_GLM_LANE_INPUTS; 0: none)
+@@ -169,6 +171,12 @@ class CeExchange:
+         # TF_GLM_LANE_DIRECT: row buffers living in the arena ({name: bytes}), each from a 256-byte boundary past the
+         # staging; a peer writes its rows into them directly (``home``, ``rows(direct=True)``)
+         end = self.rs_bytes + self.ag_bytes
++        # TF_GLM_LANE_PARTIALS=bf16: the partials' bf16 staging [N, H, D] (sender r's rows in slot r), from 256 bytes
++        self.pb_off = 0
++        self.pbf16 = bool(pbf16)
++        if self.pbf16:
++            self.pb_off = -(-end // 256) * 256
++            end = self.pb_off + self.world * self.H * self.width * 2
+         self.home_off: dict[str, int] = {}
+         self.home_size: dict[str, int] = {}
+         for name, nbytes in (homes or {}).items():
+@@ -178,6 +186,7 @@ class CeExchange:
+         self.total = end
+         self.timeout = timeout_s()
+         self.step = 0
++        self.sent = self.sent_steps = 0      # bytes this rank's steps sent (TF_GLM_CE_COUNT=1: ``report``)
+         self.key = f"tf_{tag}"
+         self.device = "cuda"
+         self.lib = None
+@@ -250,6 +259,9 @@ class CeExchange:
+         # TF_GLM_LANE_INPUTS: the input staging (bytes), empty without it
+         self.inp = arena[self.inp_off:self.inp_off + (self.world - 1) * self.H * self.inp_row] if self.inp_row \
+             else arena[:0]
++        # TF_GLM_LANE_PARTIALS=bf16: the partials' bf16 staging, None without it
++        self.pb = arena[self.pb_off:self.pb_off + self.world * self.H * self.width * 2].view(torch.bfloat16).view(
++            self.world, self.H, self.width) if self.pbf16 else None
+         handle = _IpcHandle()
+         self._check(lib.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(self.base)), "cudaIpcGetMemHandle")
+         s.set(f"{self.key}/mem/{self.rank}", bytes(handle))
+@@ -329,6 +341,15 @@ class CeExchange:
+             for p in self.peers:
+                 if not bool(torch.all(got[p] == float(p + 1))):
+                     raise RuntimeError(f"the startup pattern from rank {p} did not arrive")
++            if self.pbf16:                             # TF_GLM_LANE_PARTIALS=bf16: the bf16 staging, one step
++                fp = torch.full((self.world * n, d), float(self.rank + 11), dtype=torch.float32, device=self.device)
++                fb = fp.to(torch.bfloat16)
++                self.rs[:self.world * n * d].zero_()
++                self.partials(fp, n, 0, n, partb=fb)
++                got = self.block(0, n)
++                for p in self.peers:
++                    if not bool(torch.all(got[p] == float(p + 11))):
++                        raise RuntimeError(f"the startup bf16 pattern from rank {p} did not arrive")
+             if self.inp_row:                           # TF_GLM_LANE_INPUTS: the input staging too, one step
+                 k = self.inp_row // 2
+                 x = torch.full((self.world * n, k), float(self.rank + 1), dtype=torch.bfloat16, device=self.device)
+@@ -342,6 +363,7 @@ class CeExchange:
+         finally:
+             self.timeout = timeout
+         self._vote("probe", problem)
++        self.sent = self.sent_steps = 0
+ 
+     # -- the protocol ------------------------------------------------------------------------------------------------
+     def _await(self, idx: int, target: int, what: str) -> None:
+@@ -380,6 +402,8 @@ class CeExchange:
+         for dst, src, nbytes in copies:
+             if nbytes:
+                 self._copy(dst, src, nbytes, stream)
++                self.sent += nbytes
++        self.sent_steps += 1
+         self._record(k, stream)
+         self.tab[self.rank] = e
+         for p in self.peers:
+@@ -387,6 +411,15 @@ class CeExchange:
+             self._wait(p, k, stream)
+             self.tab[W + self.rank * W + p] = e
+ 
++    def report(self, label: str) -> None:
++        """TF_GLM_CE_COUNT=1 (patch 0293, a diagnostic): one line with the bytes this rank's steps sent since the last
++        line (counted on the host as the copies are issued), then the count starts again."""
++
++        if os.environ.get("TF_GLM_CE_COUNT", "") == "1" and self.sent:
++            print(f"[tensorfold] ce bytes rank {self.rank}: {label}: {self.sent} bytes out in {self.sent_steps} steps",
++                  flush=True)
++        self.sent = self.sent_steps = 0
++
+     # the device operations (a CPU test replaces these)
+     def _sync(self) -> None:
+         torch.cuda.synchronize()
+@@ -405,10 +438,13 @@ class CeExchange:
+         stream.wait_event(self.theirs[p][k])
+ 
+     # -- the row split's two exchanges ---------------------------------------------------------------------------------
+-    def partials(self, part: torch.Tensor, H: int, off: int, n: int, at: int | None = None) -> None:
++    def partials(self, part: torch.Tensor, H: int, off: int, n: int, at: int | None = None,
++                 partb: torch.Tensor | None = None) -> None:
+         """Piece (off, n): this rank's fp32 partial rows of each peer q (part[q H + off ..]) into q's staging block
+         of the piece ([N, n, D] at N x ``at`` rows of the arena, ``at`` = off unless given; this rank's slot); the
+-        peers' into this rank's."""
++        peers' into this rank's. ``partb`` (TF_GLM_LANE_PARTIALS=bf16): the rows to send as bf16 rows of the same
++        layout (rounded by the caller); they land in the bf16 staging and are widened into the block's peer slots
++        (exactly: a bf16 value is an fp32 value)."""
+ 
+         d = self.width
+         if part.shape[1] != d or part.dtype != torch.float32 or not part.is_contiguous():
+@@ -416,6 +452,19 @@ class CeExchange:
+         at = off if at is None else at
+         if at + n > self.H:
+             raise ValueError(f"ce partials: arena rows {at} .. {at + n} past its {self.H}")
++        if partb is not None:
++            if self.pb is None:
++                raise ValueError("ce partials: bf16 rows need the arena's bf16 staging (TF_GLM_LANE_PARTIALS=bf16)")
++            if partb.shape[1] != d or partb.dtype != torch.bfloat16 or not partb.is_contiguous():
++                raise ValueError("ce partials: contiguous bf16 rows of the arena's width")
++            row = d * 2
++            copies = [(self.remote[q] + self.pb_off + (self.rank * self.H + at) * row, partb[q * H + off].data_ptr(),
++                       n * row) for q in self.peers]
++            self.exchange(copies)
++            block = self.block(at, n)
++            for p in self.peers:
++                block[p].copy_(self.pb[p, at:at + n])
++            return
+         row = d * 4
+         copies = [(self.remote[q] + (self.world * at + self.rank * n) * row, part[q * H + off].data_ptr(), n * row)
+                   for q in self.peers]
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 88f1a3a..f80e013 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -711,12 +711,14 @@ class GlmEngine:
+                 return -1, str(exc)
+ 
+         from . import exl3_stream as _exl3_stream
++        from . import lane_partials as _lane_partials           # patch 0293: TF_GLM_LANE_PARTIALS
+         from . import segprof as _segprof
+ 
+         mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
+                 quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
+                 quiet(_exl3_stream.code),
+-                quiet(_segprof.code), quiet(lane_inputs_mod.mask)]
++                quiet(_segprof.code), quiet(lane_inputs_mod.mask),
++                quiet(_lane_partials.mask)]
+         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
+         tables = [row[0] for row in got]
+         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
+@@ -729,7 +731,7 @@ class GlmEngine:
+             raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
+                                "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
+                                "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF*, "
+-                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask) by rank "
++                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask), TF_GLM_LANE_PARTIALS by rank "
+                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
+                                + ": give every rank the same valid values")
+         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
+@@ -803,6 +805,8 @@ class GlmEngine:
+             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+         if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
+             print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
++        if rank == 0 and _lane_partials.on():
++            print(f"[tensorfold] {_lane_partials.describe()}", flush=True)
+         if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
+             print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
+         if rank == 0 and lanes_mod.LANES > 1:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index c64e8cb..3ef1028 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, moe_glue, prof, qmm, sparse, tp
++from . import glue, index_split, kda as kda_mod, kv8, l2pf, lane_partials, lanes, latent, moe_glue, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ from . import twoshot                     # noqa: E402  (TF_GLM_TWOSHOT_ROWS: decode partials in two shots)
+@@ -143,6 +143,13 @@ class Buffers:
+         # rank partials
+         self.part = torch.empty((rows, D), dtype=f32, device=dev)
+         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
++        # TF_GLM_LANE_PARTIALS=bf16 (lane_partials.py): the partial's bf16 rows (rounded before every exchange); decode
++        # buffers also all-gather them (bf16, widened into b.gath); prompt buffers' rare unsplit chunks gather fp32
++        # (attributes only with the setting: without it the buffers are exactly as before)
++        if lane_partials.on():
++            self.partb = torch.empty((rows, D), dtype=bf, device=dev)
++            if not prefill and w.world > 1:
++                self.gathb = torch.empty((w.world * rows * D,), dtype=bf, device=dev)
+         # TF_GLM_TWOSHOT_ROWS (twoshot.py): a decode buffer's windows of that many rows or more exchange their partials
+         # in two shots, the same bits; None: one all-gather a site
+         self.twoshot = None if prefill else twoshot.attach(w, rows)
+@@ -426,7 +433,19 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     if w.comm is None:
+         return b.part[:R].view(1, R, d)
+     ts = getattr(b, "twoshot", None)
+-    if ts is not None and ts.applies(R):          # the branch where rank 0's partial sits, -0.0 for the others
++    two = ts is not None and ts.applies(R)
++    pb = getattr(b, "partb", None)
++    if pb is not None:                            # TF_GLM_LANE_PARTIALS=bf16: this rank's partial rounded to bf16
++        lane_partials.to_bf16(pb[:R], b.part[:R])
++        gb = getattr(b, "gathb", None)
++        if gb is not None and not two:            # a decode buffer: the all-gather moves the bf16 rows
++            out = b.gath[:b.world * R * d]
++            got = gb[:b.world * R * d]
++            w.comm.all_gather(pb[:R].reshape(-1), got)
++            lane_partials.widen(out, got)
++            return out.view(b.world, R, d)
++        lane_partials.widen(b.part[:R], pb[:R])   # else fp32 rows holding the bf16 values (the same sums)
++    if two:                                       # the branch where rank 0's partial sits, -0.0 for the others
+         # (inside the layer loop the glue takes a split exchange: TF_GLM_TWOSHOT_SPLIT, ``_hc_post``)
+         return ts.exchange(b.part, R, split=getattr(b, "hc_split_ok", False))
+     out = b.gath[:b.world * R * d]
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index b6ca1ed..0dd9ddf 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -39,7 +39,7 @@ from typing import Callable
+ 
+ import torch
+ 
+-from . import glue
++from . import glue, lane_partials
+ 
+ EXCHANGES = ("p2p", "gather", "ce")
+ 
+@@ -212,7 +212,8 @@ class HcSplit:
+             # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it);
+             # TF_GLM_LANE_INPUTS: an input staging of the widest chosen projection input (0 bytes without it)
+             self.ce = CeExchange(self.rank, self.world, store, rows, b.part.shape[1],
+-                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes)
++                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes,
++                                 pbf16=lane_partials.on())        # TF_GLM_LANE_PARTIALS=bf16: a bf16 staging
+             for name in homes:                   # the buffers move into the arena (nothing holds the old ones)
+                 old = getattr(b, name)
+                 setattr(b, name, self.ce.home(name, old.dtype, tuple(old.shape)))
+@@ -267,6 +268,8 @@ class HcSplit:
+         if self.stream is not None and self.active:
+             torch.cuda.current_stream().wait_stream(self.stream)
+         self.active = False
++        if self.ce is not None:                         # TF_GLM_CE_COUNT=1: the chunk's copy-engine bytes
++            self.ce.report(f"split chunk of {self.R} rows")
+ 
+     def mine(self) -> int:
+         return self.rank * self.H
+@@ -284,8 +287,11 @@ class HcSplit:
+ 
+         off, n = self.pieces[j]
+         b = self.b
++        bf16 = lane_partials.on()
++        if bf16:                                        # TF_GLM_LANE_PARTIALS=bf16: the rows that go, rounded
++            self._round_sent(j)
+         if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
+-            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off)
++            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off, partb=b.partb if bf16 else None)
+             return
+         if self.world > 2:
+             if self.gather:                             # every rank's whole partial (one piece)
+@@ -302,6 +308,25 @@ class HcSplit:
+         else:
+             self.w.comm.exchange([send], [self.got[j]], self.peer)
+ 
++    def _round_sent(self, j: int) -> None:
++        """TF_GLM_LANE_PARTIALS=bf16 (``lane_partials``): the rows of this rank's partial that piece j sends, rounded
++        to bf16 right before they go, on the exchange's stream after the fill that wrote them: into b.partb for the
++        copy engines (which move bf16 rows), in place for NCCL (fp32 rows that hold bf16 values). This rank's own
++        rows are rounded where hc_post's caller reads them (``_post``), after their own fill."""
++
++        off, n = self.pieces[j]
++        b = self.b
++        if self.ce is not None:
++            for q in self.peers:
++                lo = q * self.H + off
++                lane_partials.to_bf16(b.partb[lo:lo + n], b.part[lo:lo + n])
++            return
++        if self.world > 2 and self.gather:              # the whole partial goes, this rank's rows too
++            lane_partials.round_(b.part[:self.Rp], b.partb[:self.Rp])
++            return
++        for lo in ([p * self.H + off for p in self.peers] if self.world > 2 else [self.theirs() + off]):
++            lane_partials.round_(b.part[lo:lo + n], b.partb[lo:lo + n])
++
+     def _swap_rows(self, j: int, outs: list[torch.Tensor], narrow: tuple | list = ()) -> None:
+         """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares).
+         ``narrow``: narrow row buffers moved in the same copy-engine step (TF_GLM_MOE_GLUE rowsplit; ce only)."""
+@@ -366,6 +391,8 @@ class HcSplit:
+         b = self.b
+         x = b.x[lo:hi]
+         own = b.part[lo:hi]
++        if lane_partials.on():                          # TF_GLM_LANE_PARTIALS=bf16: this rank's rows rounded too
++            lane_partials.round_(own, b.partb[lo:hi])
+         if self.world == 2 and not self.blocks:
+             got = self.got[j]
+             g0, g1 = (own, got) if self.rank == 0 else (got, own)
+diff --git tensorfold/families/glm5_next/cuda/lane_partials.py tensorfold/families/glm5_next/cuda/lane_partials.py
+new file mode 100644
+index 0000000..1ca3999
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/lane_partials.py
+@@ -0,0 +1,103 @@
++"""TF_GLM_LANE_PARTIALS=bf16 (patch 0293): every rank's partial of a row-parallel projection is rounded to bf16 before
++the ranks exchange it, and the partials are added in fp32 in rank order as before. A NEW REFERENCE (it changes bits);
++off by default.
++
++Today each of a forward's 90 exchange sites sums the ranks' fp32 partials rank 0 first in fp32 and rounds the sum to
++bf16 (hc_post: branch = bf16(((g0 + g1) + g2) + g3)). With the setting each partial is rounded to bf16 first (round to
++nearest even, the conversion every GPU and torch use) and the sum is the same fp32 chain of the rounded values:
++branch = bf16(((r(g0) + r(g1)) + r(g2)) + r(g3)), r(g) = fp32(bf16(g)). That is what a tensor-parallel all-reduce in
++bf16 does (vLLM's TP all-reduce sums bf16 partials too), with a fixed order instead of a ring's.
++
++What moves (four ranks, bytes a rank sends a row of a site):
++  prompt lanes on the copy engines (TF_GLM_HC_EXCHANGE=ce): the partials 3 x 16 KiB -> 3 x 8 KiB (the copy engines move
++      bf16 rows; the receiver widens them into the fp32 staging block hc_post reads). With TF_GLM_LANE_INPUTS the
++      sites it covers exchange inputs as before and only round the partials they compute.
++  the row split's other exchanges (first chunks, multi-prompt chunks: copy engines in pieces): bf16 the same way;
++      on NCCL (TF_GLM_HC_EXCHANGE p2p / gather): fp32 rows that hold bf16 values (the same sums, no bytes saved).
++  decode windows and unsplit prompt chunks (one all-gather a site): decode buffers all-gather bf16 rows and widen them
++      (half the bytes); prompt buffers' rare unsplit chunks all-gather fp32 rows that hold bf16 values.
++  TF_GLM_TWOSHOT_ROWS windows: the scatter carries fp32 rows that hold bf16 values (its second shot is bf16 already).
++
++Deterministic and batch-invariant: the rounding is per element and the sum's order is fixed (rank order, fp32), so a
++row's bits never depend on the rows beside it, its chunk, its window or its batch: prompt chunks stay chunk-invariant
++(every prompt path rounds alike), drafted rounds equal serial ones and concurrent streams equal solo ones, under the
++new references. The rounding is placed with the exchange that already reads those rows, on its stream (the rows a
++rank sends right before it sends them, its own rows where hc_post's caller reads them), so it adds no ordering.
++
++Value: unset, "0", "off" or "fp32": off (today's fp32 partials, unchanged); "bf16": on. Every rank must be given the
++same value (the engine compares it at start).
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold's row split, prompt lanes and copy-engine
++exchange (patches 0122, 0123, 0126) and the two-shot decode exchange (0261)."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++OFF = ("", "0", "off", "fp32", "none")
++_ENV = "TF_GLM_LANE_PARTIALS"
++_on: bool | None = None
++
++
++def parse(value: str | None) -> bool:
++    v = (value or "").strip().lower()
++    if v in OFF:
++        return False
++    if v == "bf16":
++        return True
++    raise ValueError(f"{_ENV}: bf16, or 0 / fp32 (off), not {value!r}")
++
++
++def on() -> bool:
++    """The setting (read once; ``reset`` for tests). Never raises: a value that is not valid is off here and the
++    start's comparison (``mask``) refuses it on every rank."""
++
++    global _on
++    if _on is None:
++        try:
++            _on = parse(os.environ.get(_ENV, ""))
++        except ValueError:
++            _on = False
++    return _on
++
++
++def reset(value: str | None = None) -> None:
++    global _on
++    if value is not None:
++        os.environ[_ENV] = value
++    _on = None
++
++
++def mask() -> int:
++    """The setting as an integer for the start's comparison across ranks (ValueError when it is not valid)."""
++
++    return int(parse(os.environ.get(_ENV, "")))
++
++
++def describe() -> str:
++    return ("rank partials rounded to bf16 before every exchange, summed in fp32 in rank order (TF_GLM_LANE_PARTIALS="
++            "bf16: a new reference; prompt lanes and decode all-gathers move bf16 rows)")
++
++
++def to_bf16(dst: torch.Tensor, src: torch.Tensor) -> None:
++    """``dst`` (bf16) = ``src`` (fp32) rounded to nearest even, element by element."""
++
++    dst.copy_(src)
++
++
++def widen(dst: torch.Tensor, src: torch.Tensor) -> None:
++    """``dst`` (fp32) = ``src`` (bf16), exactly."""
++
++    dst.copy_(src)
++
++
++def round_(t: torch.Tensor, scratch: torch.Tensor | None = None) -> None:
++    """fp32 rows rounded to bf16 values in place (``scratch``: bf16 rows of the same shape, else a temporary)."""
++
++    if scratch is None:
++        t.copy_(t.to(torch.bfloat16))
++        return
++    to_bf16(scratch, t)
++    widen(t, scratch)
+diff --git tensorfold/families/glm5_next/cuda/lanes.py tensorfold/families/glm5_next/cuda/lanes.py
+index a8e6131..d1f8391 100644
+--- tensorfold/families/glm5_next/cuda/lanes.py
++++ tensorfold/families/glm5_next/cuda/lanes.py
+@@ -49,8 +49,8 @@ from .hcsplit import HcSplit, SplitSettings
+ # Buffers attributes whose first axis is the window's rows: a lane views its rows of each
+ ROWS = ("ids", "ids_host", "hin", "x", "normed", "xs", "post", "comb", "hcpart", "ka", "kg", "xs_fa", "xs_ga", "kxs",
+         "dp", "qr", "xs_qr", "lat", "xs_lat", "q", "kn", "vn", "xs_ao", "ikr", "igr", "qi", "gu", "act", "xs_act",
+-        "mlog", "pick", "wts", "ey", "sgu", "sact", "sxs", "sy", "part", "hidden", "fnormed", "fxs", "me", "mcat",
+-        "mxs", "mx")
++        "mlog", "pick", "wts", "ey", "sgu", "sact", "sxs", "sy", "part", "partb", "hidden", "fnormed", "fxs", "me",
++        "mcat", "mxs", "mx")
+ # handled one by one below
+ SPECIAL = ("eact", "kproj", "taps", "kscratch", "lat_s", "gath", "split", "rows", "alloc_rows")
+ 
+@@ -133,6 +133,9 @@ def rows_view(b, lo: int, hi: int):
+     v = SimpleNamespace()
+     for name, value in vars(b).items():
+         if name in ROWS:
++            if value is None:                    # a row buffer a setting did not allocate (TF_GLM_LANE_PARTIALS)
++                setattr(v, name, None)
++                continue
+             if value.shape[0] != alloc:
+                 raise RuntimeError(f"prefill lanes: buffer {name} has {value.shape[0]} rows, not {alloc}")
+             setattr(v, name, value[lo:hi])
+@@ -236,12 +239,16 @@ class LaneSplit(HcSplit):
+         """Each peer's fp32 partial of this rank's rows: its staged input rows times its slice of the weight (the
+         prompt matmul, as the peer's own ``fill`` runs it), into its slot of the staging block."""
+ 
++        from . import lane_partials
+         from .forward import mm
+ 
+         block = self.got[0]
+         k = x.shape[1]
++        bf16 = lane_partials.on()
+         for p in self.peers:
+             mm(self.b, self.ce.staged(p, k, self.ce_at, self.H), ranks[p], None, block[p], f32=True)
++            if bf16:                     # TF_GLM_LANE_PARTIALS=bf16: the peer's partial rounded as the peer would
++                lane_partials.round_(block[p], self.b.partb[p * self.H:(p + 1) * self.H])
+ 
+     def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
+         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
+@@ -405,3 +412,6 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
+             main.wait_stream(rec)
+         for view, ls, lst, n, nch in run:
+             ls.active = False
++        ce = getattr(b.split, "ce", None)
++        if ce is not None:                       # TF_GLM_CE_COUNT=1: the chunk's copy-engine bytes
++            ce.report(f"lane chunk of {R} rows")

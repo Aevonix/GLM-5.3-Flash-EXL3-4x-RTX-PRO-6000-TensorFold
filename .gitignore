@@ -1,0 +1,12 @@
+/TensorFold/
+/.state/
+/logs/
+/.env
+/scripts/local.sh
+**/__pycache__/
+*.pyc
+/tools/bench/results/
+/tools/bench/references/
+/bench-references/
+/results/
+/.apply-check-*/

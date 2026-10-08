@@ -1,0 +1,159 @@
+0087-glm-port-stage2-routes: TensorFold v0.6.5 compatibility.
+Preserve GLM route guards and seed salt; keep upstream asymmetric NCCL exchange (c3d92bb) alongside the optional symmetric copy-engine transport.
+
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index c46a5c0..6a3118d 100644
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -244,9 +244,11 @@ class NCCL:
+         if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
+             raise ValueError("exchange: one receive per send, from another rank")
+         for s, r in zip(sends, recvs):
+-            if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+-                raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
+-        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce
++            if s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
++                raise ValueError("exchange: each send and receive must be contiguous and alike in dtype")
++        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce needs symmetric buffers
++            if any(s.numel() != r.numel() for s, r in zip(sends, recvs)):
++                raise ValueError("copy-engine exchange requires equal send and receive sizes")
+             return self.ce.exchange(sends, recvs, peer)
+         stream = torch.cuda.current_stream().cuda_stream
+         x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
+@@ -255,6 +257,7 @@ class NCCL:
+             for s, r in zip(sends, recvs):
+                 if s.numel():
+                     self._check(x.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, xc, stream), x)
++                if r.numel():
+                     self._check(x.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, xc, stream), x)
+         finally:
+             self._check(x.ncclGroupEnd(), x)
+diff --git tensorfold/cuda/incremental.py tensorfold/cuda/incremental.py
+index 74e1469..bef94f7 100644
+--- tensorfold/cuda/incremental.py
++++ tensorfold/cuda/incremental.py
+@@ -46,7 +46,12 @@ class Rendered:
+     state: Any
+     reused: int = 0
+ 
+-    def seed(self, salt: int = 0) -> int:
++    def seed(self, salt: int | None = None) -> int:
++        """engine.exact_sampling.seed_for(self.ids, salt) from the kept hash state (``salt``: TENSORFOLD_SEED_SALT by
++        default, as seed_for's)."""
++
++        if salt is None:
++            from tensorfold.engine.exact_sampling import SEED_SALT as salt
+         state = self.state.copy()
+         state.update(f"|{salt}".encode())
+         return int.from_bytes(state.digest()[:8], "little") & ((1 << 63) - 1)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 9f113f3..d1253d3 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -810,6 +810,8 @@ class GlmEngine:
+             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+         if rank == 0 and moe_glue_mod.on():
+             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
++        elif rank == 0 and moe_glue_mod.not_used():
++            print(f"[tensorfold] {moe_glue_mod.not_used()}", flush=True)
+         if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
+             print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
+         if rank == 0 and _lane_partials.on():
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 3ef1028..07c4183 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -914,10 +914,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+ 
+         if l2pf.ACTIVE is not None and done is None:
+             # TF_GLM_L2PF_EXPERT_MB (exl3_stream): the routed experts' first MiB into L2 on the prefetcher's side
+-            # stream while the shared expert runs (it only reads)
+-            from . import exl3_stream
++            # stream while the shared expert runs (it only reads); GLM's own route only (it reads GLM's plan and
++            # trellis words: the universal route has neither)
++            if b.plan is not None:
++                from . import exl3_stream
+ 
+-            exl3_stream.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
++                exl3_stream.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
+             # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
+             # bits), while the L2 still holds what site "a" prefetched for it
+             shared_front(layer, w, b, 0, R)
+diff --git tensorfold/families/glm5_next/cuda/moe_glue.py tensorfold/families/glm5_next/cuda/moe_glue.py
+index 4899594..0266ad9 100644
+--- tensorfold/families/glm5_next/cuda/moe_glue.py
++++ tensorfold/families/glm5_next/cuda/moe_glue.py
+@@ -64,6 +64,10 @@ MAX_ROWS = 10240                                  # the fused route's rows a cal
+ 
+ _wanted: frozenset | None = None
+ _decided: dict[str, bool] = {}
++# The EXL3 expert route this process serves (weights.exl3_route, set by the loader): the glue is GLM's own route's
++# (its fused route builds GLM's plan and its MoE block calls GLM's kernels, exl3_mm); on the universal route
++# (0.6.1's any-width path: no plan) TF_GLM_MOE_GLUE asks for nothing and the MoE blocks run as without it.
++_route: str | None = None
+ 
+ 
+ def parse(value: str | None) -> frozenset:
+@@ -94,20 +98,46 @@ def rowsplit_on() -> bool:
+             and (env.get("TF_GLM_PREFILL_LANES", "") or "1").strip() == "2")
+ 
+ 
+-def wanted() -> frozenset:
++def asked() -> frozenset:
++    """TF_GLM_MOE_GLUE's parts as set (ValueError when not valid), whatever the route."""
++
+     global _wanted
+     if _wanted is None:
+         _wanted = parse(os.environ.get("TF_GLM_MOE_GLUE", ""))
+     return _wanted
+ 
+ 
++def wanted() -> frozenset:
++    """The parts that run: those asked for, none on the universal EXL3 route (``exl3_route``)."""
++
++    parts = asked()
++    return frozenset() if _route == "universal" else parts
++
++
++def exl3_route(route: str) -> None:
++    """The loader's EXL3 expert route (``glm``, ``universal`` or "" for other formats), before any buffer is made."""
++
++    global _route
++    _route = route or None
++
++
++def not_used() -> str | None:
++    """A line for the start when TF_GLM_MOE_GLUE asks for parts the universal route does not run, else None."""
++
++    if _route == "universal" and asked():
++        return ("TF_GLM_MOE_GLUE: not used on the universal EXL3 route (GLM's own EXL3 kernels only); the MoE blocks "
++                "run as without it")
++    return None
++
++
+ def reset(value: str | None = None) -> None:
+     """Forget the setting and the kernel decisions (tests); ``value``: set TF_GLM_MOE_GLUE first."""
+ 
+-    global _wanted, _side_stream
++    global _wanted, _side_stream, _route
+     if value is not None:
+         os.environ["TF_GLM_MOE_GLUE"] = value
+     _wanted = None
++    _route = None
+     _side_stream = None
+     _decided.clear()
+     _states.clear()
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 510ca51..e6fe13c 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -581,6 +581,9 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
+         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head, tp=lay)
+         w.meta.update(layers=which, exl3_route=route)
++        from . import moe_glue                  # GLM-route-only glue: told the route before any buffer is made
++
++        moe_glue.exl3_route(route)
+     finally:
+         rd.close()
+     torch.cuda.empty_cache()

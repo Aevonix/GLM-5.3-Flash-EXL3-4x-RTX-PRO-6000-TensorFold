@@ -1,0 +1,132 @@
+0061-glm-prefill-digest: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: families/glm5_next/cuda/decode.py, families/glm5_next/cuda/digest.py, families/glm5_next/cuda/multi.py.
+
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index b5642e0..316cbb6 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -527,6 +527,10 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         prof.report(len(prompt) - begin)
+     if not sample:
+         return None
++    from . import digest as _digest
++
++    if _digest.ON and not replay:                        # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
++        _digest.prompt_digest(w, st, len(prompt), last)
+     if keep_head:
+         e.head = last.clone()
+     if e.constraint is not None:                         # the first token's row, under the reply's grammar
+diff --git tensorfold/families/glm5_next/cuda/digest.py tensorfold/families/glm5_next/cuda/digest.py
+new file mode 100644
+index 0000000..c5a507b
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/digest.py
+@@ -0,0 +1,74 @@
++"""TF_GLM_PREFILL_DIGEST=1 (patch 0121, a test setting): after each prompt's prefill, every rank prints integer
++digests of what the prompt left behind: the head's logits row it samples its first token from (this rank's
++vocabulary shard), the KDA recurrent states and conv windows of its stream slot, and, for every DSA layer, the
++latent cache and the indexer's pooled keys over the prompt's tokens. Two runs whose digests match, rank by rank and
++prompt by prompt, left bit-identical prompt states (a digest is a sum and a position-weighted sum of the 32-bit words,
++mod 2^64: any single changed bit changes it). It reads state only (and syncs the device once a prompt), so it changes
++no reply; leave it off in service.
++
++The lines read
++  [tensorfold] prefill digest rank R tokens N logits <hex> kda <hex> conv <hex> latent <hex> pools <hex>"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++_STEP = 1 << 23          # words a slice (the digest's temporaries stay small next to a full KV pool)
++
++
++def enabled() -> bool:
++    value = os.environ.get("TF_GLM_PREFILL_DIGEST", "0").strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_PREFILL_DIGEST: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++ON = enabled()
++
++
++class _Acc:
++    def __init__(self) -> None:
++        self.total = None
++        self.weighted = None
++        self.at = 0
++
++    def add(self, x: torch.Tensor | None) -> None:
++        if x is None:
++            return
++        flat = x.detach().contiguous().view(-1).view(torch.uint8)
++        pad = -flat.numel() % 4
++        if pad:
++            flat = torch.cat([flat, flat.new_zeros(pad)])
++        words = flat.view(torch.int32)
++        for lo in range(0, words.numel(), _STEP):
++            w = words[lo:lo + _STEP].to(torch.int64)
++            k = torch.arange(self.at + lo, self.at + lo + w.numel(), device=w.device, dtype=torch.int64) % 65521 + 1
++            s, t = w.sum(), (w * k).sum()
++            self.total = s if self.total is None else self.total + s
++            self.weighted = t if self.weighted is None else self.weighted + t
++        self.at += words.numel()
++
++    def hex(self) -> str:
++        if self.total is None:
++            return "-"
++        a, b = int(self.total.item()) & (2 ** 64 - 1), int(self.weighted.item()) & (2 ** 64 - 1)
++        return f"{a:016x}{b:016x}"
++
++
++def prompt_digest(w, st, n: int, logits: torch.Tensor | None) -> None:
++    """Print rank w.rank's digests of the prompt of ``n`` tokens just prefilled into ``st`` (its stream's state)."""
++
++    parts = {name: _Acc() for name in ("logits", "kda", "conv", "latent", "pools")}
++    parts["logits"].add(logits)
++    for li in range(len(st.cur)):
++        parts["kda"].add(st.rec[st.cur[li], li])
++    parts["conv"].add(st.conv)
++    for kc in st.kc:
++        parts["latent"].add(kc[:n])
++    if st.index is not None:
++        for trio in st.index:
++            parts["pools"].add(trio[2][:n // 4])
++    line = " ".join(f"{k} {v.hex()}" for k, v in parts.items())
++    print(f"[tensorfold] prefill digest rank {w.rank} tokens {n} {line}", flush=True)
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index e376c3a..2ab9825 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -42,7 +42,7 @@ import torch
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill
++from . import digest as _digest, multi_prefill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .segments import window_rows
+@@ -1074,6 +1074,8 @@ class MultiDecoder:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+                 return None
++            if _digest.ON and not replay:                 # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
++                _digest.prompt_digest(self.w, lane.st, n, out[:1])
+             if lane.point == n and not replay:
+                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+             logits = out[:1]
+@@ -1130,6 +1132,8 @@ class MultiDecoder:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+                 continue
++            if _digest.ON:                                # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
++                _digest.prompt_digest(self.w, lane.st, n, out[:1])
+             if lane.point == n:
+                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+             logits = out[:1]

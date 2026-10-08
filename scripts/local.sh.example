@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Copy to scripts/local.sh. Exported environment values take precedence.
+# All defaults and engine switches are documented in scripts/config.sh.
+PORT=8020
+GPUS=0,1,2,3
+DENSE=fp8                     # q4 is faster, with lower dense-weight fidelity
+DRAFT_POLICY=fnc7:0.3
+PARALLEL=40
+CONTEXT=1048576
+KV=fp8
+THINKING=0
+# Commercial use without DFlash2 weights:
+# DRAFTER=mtp
+# PARALLEL=1
+# Store downloaded weights and compiled kernels outside the checkout:
+# DATA_DIR=/mnt/models/glm53
+# HF_TOKEN may be exported for downloads; never commit it.

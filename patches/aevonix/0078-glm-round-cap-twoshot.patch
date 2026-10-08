@@ -1,0 +1,928 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 6d8bde5..3669248 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -306,7 +306,8 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+ 
+ from .segments import window_rows as _window_rows  # noqa: E402
+ 
+-PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel)
++PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel;
++                                      # a round holds at most the verify window's rows of streams: round_cap)
+ MULTI_WINDOW = _window_rows()         # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW;
+                                       # TF_GLM_MULTI_WINDOW, default 32)
+ 
+@@ -649,6 +650,9 @@ class GlmEngine:
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                  KV_KINDS.index(kv), MULTI_WINDOW]
++        from . import twoshot as twoshot_mod                          # TF_GLM_TWOSHOT_*: the decode exchange
++
++        mine += twoshot_mod.code()
+         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
+ 
+         mine += index_split_settings().code()
+@@ -872,6 +876,9 @@ class GlmEngine:
+                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                       f"{self.multi.tune.describe()}", flush=True)
+                 print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
++                if parallel > MULTI_WINDOW:     # more streams than window rows: rounds rotate them (round_cap)
++                    print(f"[tensorfold] --parallel {parallel} over a {MULTI_WINDOW}-row window "
++                          f"(TF_GLM_MULTI_WINDOW): {self.multi._round_cap().describe()}", flush=True)
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 311ed64..1f2c00f 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -17,6 +17,7 @@ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, moe_glue, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
++from . import twoshot                     # noqa: E402  (TF_GLM_TWOSHOT_ROWS: decode partials in two shots)
+ 
+ 
+ # rows a prompt chunk's dense latent attention runs at once (its partials' rows; the startup estimate's)
+@@ -142,6 +143,9 @@ class Buffers:
+         # rank partials
+         self.part = torch.empty((rows, D), dtype=f32, device=dev)
+         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
++        # TF_GLM_TWOSHOT_ROWS (twoshot.py): a decode buffer's windows of that many rows or more exchange their partials
++        # in two shots, the same bits; None: one all-gather a site
++        self.twoshot = None if prefill else twoshot.attach(w, rows)
+         # split-K partials of BF16 / FP8 projections (``mm``): a prompt chunk's 4-bit ones run the prompt matmul, which
+         # keeps none, so an MLX checkpoint's and TF_GLM_DENSE=q4's prompt buffers hold none (the FP8 head's one row
+         # allocates its few itself); a partials buffer holds scratch only, so where it lives never changes a bit
+@@ -421,6 +425,10 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     d = b.part.shape[1]
+     if w.comm is None:
+         return b.part[:R].view(1, R, d)
++    ts = getattr(b, "twoshot", None)
++    if ts is not None and ts.applies(R):          # the branch where rank 0's partial sits, -0.0 for the others
++        # (inside the layer loop the glue takes a split exchange: TF_GLM_TWOSHOT_SPLIT, ``_hc_post``)
++        return ts.exchange(b.part, R, split=getattr(b, "hc_split_ok", False))
+     out = b.gath[:b.world * R * d]
+     w.comm.all_gather(b.part[:R].reshape(-1), out)
+     return out.view(b.world, R, d)
+@@ -989,6 +997,11 @@ def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
+ 
+     x = b.x[:R]
+     _hc_flush(b, R)                      # (never pending here: every hc_post is followed by an hc_pre or a flush)
++    if isinstance(g, twoshot.Split):     # TF_GLM_TWOSHOT_SPLIT: the first rows now, the rest once gathered (_hc_pre)
++        r = g.R1
++        glue.hc_post(x[:r], x[:r], g.view[:, :r], b.post[:r], b.comb[:r])
++        b.hc_split = g
++        return
+     if (not b.prefill and getattr(b, "hcx", None) is not None and fuse.asks("hc") and R <= fuse.hc_rows()
+             and R <= b.hcx.shape[0] and glue.hc_post_pre_ok(x, g)):
+         b.hc_pending = g                 # the gathered partials: read by the next hc_pre, before the next gather
+@@ -997,6 +1010,11 @@ def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
+ 
+ 
+ def _hc_flush(b: Buffers, R: int) -> None:
++    s = getattr(b, "hc_split", None)
++    if s is not None:                    # a split exchange's last rows (their gather has landed)
++        b.hc_split = None
++        s.wait()
++        glue.hc_post(b.x[s.R1:R], b.x[s.R1:R], s.view[:, s.R1:R], b.post[s.R1:R], b.comb[s.R1:R])
+     g = getattr(b, "hc_pending", None)
+     if g is not None:
+         b.hc_pending = None
+@@ -1005,6 +1023,16 @@ def _hc_flush(b: Buffers, R: int) -> None:
+ 
+ def _hc_pre(b: Buffers, R: int, c, h, norm: torch.Tensor) -> None:
+     x = b.x[:R]
++    s = getattr(b, "hc_split", None)
++    if s is not None:                    # TF_GLM_TWOSHOT_SPLIT: the first rows' pre while the rest are gathered, then
++        b.hc_split = None                # the rest's post and pre (row-independent kernels: the unsplit bits)
++        for lo, hi in ((0, s.R1), (s.R1, R)):
++            if lo:
++                s.wait()
++                glue.hc_post(x[lo:hi], x[lo:hi], s.view[:, lo:hi], b.post[lo:hi], b.comb[lo:hi])
++            glue.hc_pre(x[lo:hi], h.fn, h.base, h.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
++                        b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
++        return
+     g = getattr(b, "hc_pending", None)
+     if g is not None:
+         from . import fuse
+@@ -1113,6 +1141,7 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
+             split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
+     else:
+         b.hc_pending = None
++        b.hc_split, b.hc_split_ok = None, True        # the layers' glue takes split exchanges (TF_GLM_TWOSHOT_SPLIT)
+         for layer in w.layers:
+             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
+             taps = b.tap_at.get(layer.index, ())
+@@ -1121,6 +1150,7 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
+             for slot in taps:
+                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
+         _hc_flush(b, R)
++        b.hc_split_ok = False
+         glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index 2eea48e..b003ac5 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -253,13 +253,14 @@ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD
+ 
+ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
+             comb: torch.Tensor) -> None:
+-    """gathered: [world, R, D] fp32 partials (contiguous). x and xout may be the same tensor."""
++    """gathered: [world, R, D] fp32 partials, each rank's rows contiguous, the ranks ``gathered.stride(0)`` elements
++    apart (R x D when contiguous; the two-shot exchange's view, ``twoshot``). x and xout may be the same tensor."""
+ 
+     world, rows, d = gathered.shape
+     s = x.shape[1] // d
+     block = min(1024, d)
+-    _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
+-                                 num_warps=4)
++    _hc_post[(rows, d // block)](x, xout, gathered, post, comb, gathered.stride(0), D=d, S=s, WORLD=world,
++                                 BLOCK=block, num_warps=4)
+ 
+ 
+ def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
+@@ -403,9 +404,12 @@ def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: t
+ 
+ 
+ def residual_add(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor) -> None:
++    """gathered: as ``hc_post``'s (the ranks ``gathered.stride(0)`` elements apart)."""
++
+     world, rows, d = gathered.shape
+     block = min(1024, d)
+-    _residual_add[(rows, d // block)](x, xout, gathered, rows * d, D=d, WORLD=world, BLOCK=block, num_warps=4)
++    _residual_add[(rows, d // block)](x, xout, gathered, gathered.stride(0), D=d, WORLD=world, BLOCK=block,
++                                      num_warps=4)
+ 
+ 
+ @triton.jit
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 45e5295..1301e2a 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -12,8 +12,9 @@ decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a fo
+ TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
+ stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
+ budget). A round: each
+-decoding stream (admission order) proposes drafts under its own DFlash2 policy (copy drafts first), the combined
+-window is capped at ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows
++decoding stream (admission order; at most ``MAX_WINDOW`` streams, the others in the next rounds: ``round_cap``)
++proposes drafts under its own DFlash2 policy (copy drafts first), the combined window is capped at ``MAX_WINDOW``
++rows (the longest tails trimmed), one verify over every stream's rows
+ (``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through the segmented KDA and
+ DSA kernels, or ``verify.SerialVerify``, the reference running each window as its own forward; TF_GLM_MULTI_VERIFY),
+ one packed all-gather for the samplers, each stream accepts and commits its own.
+@@ -49,6 +50,7 @@ from . import digest as _digest, multi_prefill
+ from . import prof as _prefill_prof
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
++from .round_cap import RoundCap
+ from .segments import window_rows
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+@@ -161,8 +163,12 @@ def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[
+ 
+ def trim(drafts: list[list[int]], cap: int = MAX_WINDOW) -> list[list[int]]:
+     """Cut drafts until every window (a pending token and its drafts) fits ``cap`` rows together: one draft at a
+-    time off the longest window (the latest of equals)."""
++    time off the longest window (the latest of equals). A pending row is never cut: a round holds at most ``cap``
++    streams (``round_cap``), and more raise here, on every rank alike, before the window is staged."""
+ 
++    if len(drafts) > cap:
++        raise ValueError(f"a round of {len(drafts)} streams in a {cap}-row window: a round holds at most the window's "
++                         "rows of streams (round_cap)")
+     drafts = [list(d) for d in drafts]
+     total = sum(1 + len(d) for d in drafts)
+     while total > cap:
+@@ -438,6 +444,8 @@ class MultiDecoder:
+         self.outbox: list[int] = []
+         self.idle = True
+         self.broken: Exception | None = None
++        # X3: which decoding streams a round holds, at most MAX_WINDOW (rank 0 plans; rank 1 applies the plan)
++        self.cap = RoundCap(MAX_WINDOW, classes=self.arbiter is not None)
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+         self.eos = tuple(self.w.cfg.eos)
+         self.dflash_code = encode_policy(DFLASH_POLICY)
+@@ -457,13 +465,25 @@ class MultiDecoder:
+ 
+     def health(self) -> dict:
+         lanes = list(self.lanes.values())
++        cap = getattr(self, "cap", None)
+         return {"streams": {"decoding": sum(l.decoding and not l.paused for l in lanes),
+                             "filling": sum(not l.decoding for l in lanes),
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+                 "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"lanes": self._class_counts(lanes), "arbiter": dict(self.arbiter.counts)}
+-                   if self.arbiter is not None else {})}
++                   if self.arbiter is not None else {}),
++                **({"round_cap": {"rows": cap.rows, **cap.counts}} if cap is not None and self.count > cap.rows
++                   else {})}
++
++    def _round_cap(self) -> RoundCap:
++        """Rank 0's round planner (``round_cap``): at most MAX_WINDOW streams a round, by class when the priority
++        lanes are on (made here for a decoder built without ``__init__``, as the scheduler simulations build one)."""
++
++        cap = getattr(self, "cap", None)
++        if cap is None:
++            cap = self.cap = RoundCap(MAX_WINDOW, classes=getattr(self, "arbiter", None) is not None)
++        return cap
+ 
+     @staticmethod
+     def _class_counts(lanes: Sequence[Lane]) -> dict:
+@@ -1061,7 +1081,7 @@ class MultiDecoder:
+             if prof is not None:
+                 prof.fill(time.perf_counter() - t)
+             return [lane.s] if lane.s.done else []
+-        lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
++        lanes = decoding = [l for l in self.lanes.values() if l.decoding and not l.s.done]
+         t_begin = time.perf_counter()
+         heads = self._heads(lanes)            # priority lanes: a realtime reply's head decodes in rounds of its own,
+         if heads and self.full_at is None:
+@@ -1076,6 +1096,8 @@ class MultiDecoder:
+         for l in lanes:                       # room for this round's widest window, else paused
+             l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
+         active = [l for l in lanes if not l.paused]
++        if active:                            # at most MAX_WINDOW streams (a pending row each); the others wait
++            active = self._round_cap().take(active, decoding, full=len(lanes) == everyone)
+         if not active:
+             done = []
+             if lanes and not any(not l.decoding for l in self.lanes.values()):
+@@ -1100,7 +1122,7 @@ class MultiDecoder:
+         self._round(active, lone=lone)
+         if self.arbiter is not None:
+             self.arbiter.rounded()
+-            if len(lanes) == everyone:
++            if len(lanes) == everyone and self._round_cap().settled():     # every stream had its round
+                 self.full_at = self.clock()
+         return [l.s for l in active if l.s.done]
+ 
+@@ -1347,11 +1369,13 @@ class MultiDecoder:
+         drafts: list[list[int]] = []
+         copied: list[bool] = []
+         asks = []
+-        for l in lanes:
+-            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None else []
++        room = MAX_WINDOW - len(lanes)       # rows left for drafts: 0 when the pending rows fill the window (trim would
++        for l in lanes:                      # cut every draft), so none is proposed (both ranks alike: no block pass)
++            c = (l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and room > 0
++                 else [])
+             copied.append(bool(c))
+             drafts.append(list(c))
+-            if not c and l.dflash and l.depth > 0:
++            if not c and l.dflash and l.depth > 0 and room > 0:
+                 conf = l.policy.confidence
+                 if tune.depth == "scale":
+                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
+@@ -1538,6 +1562,8 @@ class MultiDecoder:
+         x = lane.extent
+         x.owner = None
+         self._settle(x)
++        if getattr(self, "cap", None) is not None:
++            self.cap.forget(sid)
+         lane.s.finished = lane.s.finished or time.perf_counter()
+ 
+     def _give_back(self) -> list[Stream]:
+diff --git tensorfold/families/glm5_next/cuda/round_cap.py tensorfold/families/glm5_next/cuda/round_cap.py
+new file mode 100644
+index 0000000..c0e3b75
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/round_cap.py
+@@ -0,0 +1,144 @@
++"""The per-round stream cap of GLM-5.3-Flash's concurrent decode rounds (--parallel): a round's verify window holds
++at most ``rows`` rows (TF_GLM_MULTI_WINDOW) and every decoding stream brings at least its pending token, so a round
++takes at most ``rows`` streams; the others wait for the next rounds.
++
++Before the cap a round took every decoding stream and ``multi.trim`` cut drafts only, never a stream's pending row:
++with more decoding streams than window rows the batched verify refused the window (its buffers hold ``rows``), the
++round failed on every rank, and the ``broken`` latch failed every live stream until the ranks restarted. A startup
++refusal of --parallel above the window stood in for this cap until it existed.
++
++The streams wait in a queue: a stream joins it at the back when it starts decoding and goes to the back again each
++time a round serves it (streams a round serves keep their order among themselves). When a round cannot hold every
++stream it may hold (``RoundCap.take``), it takes them in this order:
++
++1. the streams a round left out and that no round has served since, the longest waiting first whatever their class,
++   so a stream left out goes first in the next round that may hold it: with 2 x rows streams or fewer it never waits
++   two rounds in a row, and with more it waits at most ceil(streams / rows) rounds;
++2. the sooner class when the priority lanes are on (realtime, interactive, normal, background): the room the left
++   out streams leave goes to the sooner classes first; with the lanes off (TENSORFOLD_PRIORITY=0) every stream counts
++   alike;
++3. the queue's order: the longest waiting first.
++
++The round holds the chosen streams in admission order. A round whose streams all fit takes them all, as before, so a
++setting whose window holds --parallel rows (the default recipe's 40 streams in 63 rows) runs exactly the rounds it ran
++without the cap. With one class, 40 streams in a 32-row window each get 4 rounds of every 5, and 64 streams every
++other round.
++
++The priority lanes' round gap (TENSORFOLD_PRIORITY_ROUND_GAP_MS: decoding streams get a round at least this often,
++even while realtime heads hold rounds of their own) counts from the end of the last round that served every
++decoding stream. Under the cap that takes a cycle of rounds of every stream: the first such round after the gap's
++mark opens it with the streams it could hold, each later one ticks off the streams it serves, and the cycle closes
++(``settled``) when every one was served; a stream waiting for room, or gone, leaves the cycle, as a round of every
++stream always counted the streams it paused.
++
++Exactness (bit-identical): a stream's tokens never depend on which round it lands in. The batched verify gives each
++stream's rows the bits of its own window alone, sampling draws by position, and a stream's drafts (which never change
++its reply) and its depth policy advance only in rounds it is in. Rank 0 decides the rounds and sends each round's
++streams; rank 1 applies them, so this planner runs on rank 0 only and reaches no request's arithmetic.
++
++Pure Python (no torch): the tests drive it directly."""
++
++from __future__ import annotations
++
++from typing import Any, Sequence
++
++NORMAL = 2                                   # cuda.priority.NORMAL: the class of a stream that names none
++
++
++def klass(lane: Any) -> int:
++    """A stream's priority class (``lane.s.priority``; normal when it has none)."""
++
++    s = getattr(lane, "s", None)
++    k = getattr(s, "priority", NORMAL)
++    return NORMAL if k is None or k < 0 else int(k)
++
++
++class RoundCap:
++    """Rank 0's planner of which decoding streams each round holds (see the module docstring).
++
++    ``rows``: the verify window's rows (a round holds at most that many streams); ``classes``: order by priority
++    class (the priority lanes are on). Streams are duck-typed: ``sid``, ``order`` and ``s.priority``."""
++
++    def __init__(self, rows: int, classes: bool = True) -> None:
++        if int(rows) < 1:
++            raise ValueError(f"a round of {rows} rows")
++        self.rows = int(rows)
++        self.classes = bool(classes)
++        self.round = 0                       # rounds planned
++        self.seq = 0                         # the queue's last place given
++        self.place: dict[int, int] = {}      # sid -> its place in the queue (lower: waiting longer)
++        self.owed: set[int] = set()          # streams a round left out and no round has served since
++        self.cover: set[int] | None = None   # the open cycle's streams not served yet (None: no cycle open)
++        self.counts = {"capped": 0, "left_out": 0, "cycles": 0}
++
++    def _back(self) -> int:
++        self.seq += 1
++        return self.seq
++
++    def take(self, candidates: Sequence[Any], decoding: Sequence[Any] | None = None, full: bool = True) -> list:
++        """The streams this round holds, at most ``rows``, in admission order.
++
++        ``candidates``: the streams the round may hold (every decoding stream, or a realtime reply's heads, with the
++        ones waiting for room left out), in admission order; ``decoding``: every decoding stream (default the
++        candidates), so a stream that left is forgotten and one that just started joins the queue; ``full``: the
++        round is a round of every decoding stream (it opens or continues the round gap's cycle; a heads round does
++        neither)."""
++
++        self.round += 1
++        everyone = list(candidates) if decoding is None else list(decoding)
++        live = {l.sid for l in everyone} | {l.sid for l in candidates}
++        for sid in [sid for sid in self.place if sid not in live]:
++            del self.place[sid]
++        for l in list(everyone) + list(candidates):     # a stream that just started: at the queue's back
++            if l.sid not in self.place:
++                self.place[l.sid] = self._back()
++        self.owed &= live
++        ranked = sorted(candidates, key=self._key)
++        if len(ranked) <= self.rows:
++            chosen, left = list(candidates), []
++        else:
++            ranked = ranked[:self.rows]
++            keep = {id(l) for l in ranked}
++            chosen = [l for l in candidates if id(l) in keep]
++            left = [l for l in candidates if id(l) not in keep]
++            self.counts["capped"] += 1
++            self.counts["left_out"] += len(left)
++        took = {l.sid for l in chosen}
++        self.owed = (self.owed | {l.sid for l in left}) - took
++        if full:
++            # the round gap's cycle: opened by this round when none is open, then every stream it may hold ticked
++            # off as served; a stream waiting for room (not a candidate) leaves it
++            here = {l.sid for l in candidates}
++            opened = self.cover is None
++            cover = (here if opened else self.cover & here) - took
++            if opened and cover:
++                self.counts["cycles"] += 1
++            self.cover = cover or None
++        elif self.cover is not None:
++            self.cover = (self.cover & live) or None
++        for l in ranked:                                 # served: to the queue's back, in the order they were taken
++            self.place[l.sid] = self._back()
++        return chosen
++
++    def _key(self, lane: Any) -> tuple:
++        if lane.sid in self.owed:                        # left out before: the longest waiting first, any class
++            return (0, 0, self.place[lane.sid], lane.order)
++        return (1, klass(lane) if self.classes else 0, self.place[lane.sid], lane.order)
++
++    def forget(self, sid: int) -> None:
++        """A stream left (finished, cancelled, given back): no place in the queue, no turn, out of the open cycle."""
++
++        self.place.pop(sid, None)
++        self.owed.discard(sid)
++        if self.cover is not None:
++            self.cover.discard(sid)
++            self.cover = self.cover or None
++
++    def settled(self) -> bool:
++        """Whether no cycle is open: every stream the last cycle's rounds could hold has been served."""
++
++        return self.cover is None
++
++    def describe(self) -> str:
++        return (f"rounds hold at most {self.rows} streams (one pending row each); the others take the next rounds, "
++                f"those left out first, then {'by class, then ' if self.classes else ''}the longest waiting")
+diff --git tensorfold/families/glm5_next/cuda/twoshot.py tensorfold/families/glm5_next/cuda/twoshot.py
+new file mode 100644
+index 0000000..7fd78d0
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/twoshot.py
+@@ -0,0 +1,485 @@
++"""TF_GLM_TWOSHOT_ROWS: a decode window's rank partials exchanged in two shots instead of one all-gather, with the
++same bits (X6a).
++
++Today each of a decode forward's 90 sites all-gathers every rank's fp32 partial [R, D] (16 KiB a row a rank, so a
++rank receives 48 KiB a row at four ranks), and hc_post sums the four partials rank 0 first and rounds the sum to
++bf16: branch = bf16(((g0 + g1) + g2) + g3). The all-gather's bytes grow with the rows, so wide windows pay for them.
++
++Two shots. Rank r owns the rows [r H, r H + H) of the window, H = ceil(R / ranks) (the row split of the prompt
++chunks' exchanges, ``hcsplit``):
++
++1. scatter: every rank sends each other rank its partial of that rank's rows (one NCCL group of sends and receives,
++   on the all-gather communicator or on patch 0103's second one, TF_GLM_TWOSHOT_SCATTER);
++2. the owner adds the ranks' partials of its rows rank 0 first in fp32, exactly as hc_post adds them (the same Triton
++   add chain: add.f32, no flush to zero), and rounds the sum to bf16 (cvt.rn.bf16.f32, as hc_post does);
++3. an all-gather of the owners' rows (in place, the engine's all-gather: NCCL, or CUDA IPC under TF_GLM_COMM=ipc;
++   TF_GLM_TWOSHOT_GATHER) gives every rank every row's branch: bf16 (TF_GLM_TWOSHOT_KIND=bf16, then widened to fp32
++   by one small kernel) or the same values as fp32 (f32);
++4. the exchange hands hc_post a [ranks, R, D] fp32 view whose rank 0 holds the branch and whose other ranks hold -0.0
++   (fixed buffers, written once). hc_post's sum is then ((b + -0) + -0) + -0 = b for every value b (IEEE: x + -0 is x,
++   for +0, -0, infinities and NaN too; the owner's sum was rounded by the same flags, so b is never a value hc_post's
++   add would treat otherwise), and bf16(b) is b: hc_post, its fused form (refused for this view, so it runs unfused)
++   and the MTP block's residual_add compute exactly the bits they compute from the four partials. The consumers are
++   unchanged; only their stride between ranks comes from the tensor (``glue``).
++
++Bytes a rank receives a row at four ranks: 12 KiB (scatter) + 6 KiB (bf16) or 12 KiB (f32), against 48 KiB; latency:
++two collectives and one or two small kernels instead of one collective. On the one-all-gather curve measured on the
++target box (about 19 us + 0.027 us a KiB received) that breaks even near 26 rows; the GPU test measures it.
++
++Exactness: bit-identical (the same bits as the one all-gather, for every row count; the GPU test proves it at every
++row count from 1 to the window's rows, in CUDA graphs and eagerly, with special values: -0, denormals, infinities,
++NaN). Settings (every rank the same; the engine compares them at start):
++
++  TF_GLM_TWOSHOT_ROWS      0 (default): off; N: decode windows of N rows or more exchange in two shots
++  TF_GLM_TWOSHOT_KIND      bf16 (default): the second shot moves bf16 rows; f32: their fp32 copies (no widening)
++  TF_GLM_TWOSHOT_SCATTER   nccl (default): the first shot on the all-gather communicator (peer to peer under
++                           NCCL_P2P_LEVEL); exchange: on the second communicator (TF_NCCL_EXCHANGE_ENV, patch 0103)
++  TF_GLM_TWOSHOT_GATHER    comm (default): the engine's all-gather (NCCL, or CUDA IPC under TF_GLM_COMM=ipc);
++                           nccl: NCCL's even under TF_GLM_COMM=ipc
++
++Every buffer is allocated once a decode buffer (``forward.Buffers``), so CUDA graphs capture the exchange; each row
++count's sizes are fixed (a graph a row count). Memory a decode buffer, H = ceil(window rows / ranks): ranks x (H + 2)
++x D x 4 bytes of received partials, ranks x ranks x (H + 1) x D x 4 bytes for the view (all but one rank's place
++-0.0) and ranks x (H + 1) x D x 2 bytes of bf16 rows: about 24 MiB for a 256-row window at four ranks, 6 MiB for 63.
++
++TF_GLM_TWOSHOT_SPLIT (X6c, a prototype, default off; needs TF_GLM_TWOSHOT_ROWS): windows of that many rows or more
++gather their second shot in two halves, rows [0, R1) (R1 a multiple of the ranks, about half) and [R1, R): one scatter,
++then the first half's owner sum and gather; the second half's on a side stream after it, while the first half's
++hyper-connection glue (hc_post, then the next site's hc_pre) runs (``forward``: ``Split``). Every row's arithmetic is
++the unsplit exchange's and the glue kernels are row-independent, so the bits are the same; whether the overlap beats
++the second gather's own latency is what the GPU test's bench measures (with and without a stand-in for the next
++block's input projection, which a full X6c would overlap too)."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++import torch
++import triton
++import triton.language as tl
++
++KINDS = ("bf16", "f32")
++SCATTERS = ("nccl", "exchange")
++GATHERS = ("comm", "nccl")
++BLOCK = 1024                     # columns a program of the owner's sum (hc_post's block)
++
++
++@dataclass(frozen=True)
++class Settings:
++    rows: int = 0                # 0: off; else the fewest rows a window exchanges in two shots
++    kind: str = "bf16"
++    scatter: str = "nccl"
++    gather: str = "comm"
++    split: int = 0               # X6c prototype: 0 off; else the fewest rows whose second shot runs in two halves
++
++    @classmethod
++    def from_env(cls, env=None) -> "Settings":
++        env = os.environ if env is None else env
++
++        def pick(name: str, options: tuple[str, ...]) -> str:
++            v = (env.get(name, "") or options[0]).strip().lower()
++            if v not in options:
++                raise ValueError(f"{name}: {' or '.join(options)}, not {v!r}")
++            return v
++
++        raw = (env.get("TF_GLM_TWOSHOT_ROWS", "") or "0").strip()
++        if not raw.isdecimal() or int(raw) > 65536:
++            raise ValueError(f"TF_GLM_TWOSHOT_ROWS: 0 (off) or the fewest rows a decode window exchanges in two shots, "
++                             f"not {raw!r}")
++        split = (env.get("TF_GLM_TWOSHOT_SPLIT", "") or "0").strip()
++        if not split.isdecimal() or int(split) > 65536:
++            raise ValueError(f"TF_GLM_TWOSHOT_SPLIT: 0 (off) or the fewest rows whose second shot runs in two halves, "
++                             f"not {split!r}")
++        if int(split) and not int(raw):
++            raise ValueError("TF_GLM_TWOSHOT_SPLIT splits the two-shot exchange's second shot: it needs "
++                             "TF_GLM_TWOSHOT_ROWS")
++        return cls(int(raw), pick("TF_GLM_TWOSHOT_KIND", KINDS), pick("TF_GLM_TWOSHOT_SCATTER", SCATTERS),
++                   pick("TF_GLM_TWOSHOT_GATHER", GATHERS), int(split))
++
++    def code(self) -> list[int]:
++        """What every rank must agree on (the engine's start comparison)."""
++        return [self.rows, KINDS.index(self.kind), SCATTERS.index(self.scatter), GATHERS.index(self.gather),
++                self.split]
++
++    def describe(self) -> str:
++        if not self.rows:
++            return "decode partials: one all-gather a site (TF_GLM_TWOSHOT_ROWS=0)"
++        return (f"decode partials of windows of {self.rows}+ rows: two shots (each rank sums its rows' partials rank 0 "
++                f"first, then a {self.kind} all-gather; scatter on the "
++                f"{'all-gather' if self.scatter == 'nccl' else 'send/receive'} communicator, gather by "
++                f"{'the engine' if self.gather == 'comm' else 'NCCL'}), the same bits (TF_GLM_TWOSHOT_ROWS)"
++                + (f"; prototype: windows of {self.split}+ rows gather their second half while the first half's "
++                   f"hyper-connection glue runs (TF_GLM_TWOSHOT_SPLIT)" if self.split else ""))
++
++
++_SETTINGS: Settings | None = None
++
++
++def settings() -> Settings:
++    """TF_GLM_TWOSHOT_* (read once)."""
++    global _SETTINGS
++    if _SETTINGS is None:
++        _SETTINGS = Settings.from_env()
++    return _SETTINGS
++
++
++def code() -> list[int]:
++    return settings().code()
++
++
++# -- kernels -----------------------------------------------------------------------------------------------------------
++@triton.jit
++def _owner_sum(PART, RECV, OUT, row0, RECV_RS, rrow, D: tl.constexpr, WORLD: tl.constexpr, RANK: tl.constexpr,
++               BLOCK: tl.constexpr, BF16: tl.constexpr):
++    """Row i of this rank's rows (window row row0 + i), columns of block cb: the ranks' partials added rank 0 first in
++    fp32 (glue._hc_post's chain: the first load, then one add a rank), this rank's own from PART, the others' from
++    row rrow + i of their RECV slots; rounded to bf16 and stored at OUT's row row0 + i as bf16 (BF16) or as its fp32
++    copy."""
++
++    i = tl.program_id(0)
++    cb = tl.program_id(1)
++    d = cb * BLOCK + tl.arange(0, BLOCK)
++    if RANK == 0:
++        acc = tl.load(PART + (row0 + i) * D + d)
++    else:
++        acc = tl.load(RECV + (rrow + i) * D + d)
++    for k in tl.static_range(1, WORLD):
++        if k == RANK:
++            acc = acc + tl.load(PART + (row0 + i) * D + d)
++        else:
++            acc = acc + tl.load(RECV + k * RECV_RS + (rrow + i) * D + d)
++    branch = acc.to(tl.bfloat16)
++    if BF16:
++        tl.store(OUT + (row0 + i) * D + d, branch)
++    else:
++        tl.store(OUT + (row0 + i) * D + d, branch.to(tl.float32))
++
++
++@triton.jit
++def _widen(SRC, DST, n, BLOCK: tl.constexpr):
++    """DST[:n] = SRC[:n] (bf16 to fp32: exact)."""
++
++    j = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    m = j < n
++    tl.store(DST + j, tl.load(SRC + j, mask=m).to(tl.float32), mask=m)
++
++
++# -- the exchange ------------------------------------------------------------------------------------------------------
++def rows_of(owner: int, R: int, world: int, first: int = 0) -> tuple[int, int]:
++    """(first row, rows) of the window rows ``owner`` sums: [owner H, owner H + H) cut at R, H = ceil(R / world);
++    ``first``: of the rows first .. R instead (the split's second half)."""
++
++    H = -(-(int(R) - first) // int(world))
++    lo = first + owner * H
++    return lo, max(0, min(H, R - lo))
++
++
++def split_rows(R: int, world: int) -> int | None:
++    """X6c: the split's first half, rows 0 .. R1 (R1 a multiple of the ranks, so its gather carries no pad row that
++    could land on the second half's rows), about half the window; None when the window is too small to split."""
++
++    R1 = world * -(-int(R) // (2 * world))
++    return R1 if 0 < R1 < R else None
++
++
++def nccl_of(comm):
++    """The NCCL object under the engine's communicator (``comm.NCCL``, or ``ipc.IpcComm``'s), else None."""
++
++    for c in (comm, getattr(comm, "nccl", None)):
++        if c is not None and all(hasattr(c, a) for a in ("lib", "comm", "xlib", "xcomm", "all_gather")):
++            return c
++    return None
++
++
++class NcclP2P:
++    """Shot 1's transport: one NCCL group of sends and receives on the current stream, on the all-gather
++    communicator (``which`` "nccl") or on the send/receive one (TF_NCCL_EXCHANGE_ENV; "exchange")."""
++
++    def __init__(self, nccl, which: str = "nccl") -> None:
++        self.nccl = nccl
++        self.lib, self.comm = (nccl.lib, nccl.comm) if which == "nccl" else (nccl.xlib, nccl.xcomm)
++
++    def sendrecv(self, sends: dict, recvs: dict) -> None:
++        """``sends[p]`` (a list of contiguous tensors) to rank p and ``recvs[p]`` from it, in list order (NCCL matches
++        a peer's sends and receives in order; empty ones are skipped, as the peer's matching call skips them), peers
++        in rank order."""
++
++        from tensorfold.cuda.comm import _DTYPES
++
++        lib, xc, check = self.lib, self.comm, self.nccl._check
++        stream = torch.cuda.current_stream().cuda_stream
++        check(lib.ncclGroupStart(), lib)
++        try:
++            for p in sorted(set(sends) | set(recvs)):
++                for s in sends.get(p, ()):
++                    if s.numel():
++                        check(lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, xc, stream), lib)
++                for r in recvs.get(p, ()):
++                    if r.numel():
++                        check(lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, xc, stream), lib)
++        finally:
++            check(lib.ncclGroupEnd(), lib)
++
++
++class TritonKernels:
++    """The exchange's two kernels (``_owner_sum``, ``_widen``); tests may stand in another implementation."""
++
++    @staticmethod
++    def owner_sum(part, recv, out, lo: int, n: int, recv_rs: int, rrow: int, D: int, world: int, rank: int) -> None:
++        _owner_sum[(n, D // BLOCK)](part, recv, out, lo, recv_rs, rrow, D=D, WORLD=world, RANK=rank, BLOCK=BLOCK,
++                                    BF16=out.dtype == torch.bfloat16, num_warps=4)
++
++    @staticmethod
++    def widen(src, dst, m: int) -> None:
++        _widen[(triton.cdiv(m, 4096),)](src, dst, m, BLOCK=4096, num_warps=4)
++
++
++class TwoShot:
++    """One decode buffer's two-shot exchange (see the module docstring): windows of ``rows_from`` .. ``rows_max``
++    rows; ``comm``: the engine's communicator (its NCCL object does the scatter); ``settings``: the transport and
++    kind (default TF_GLM_TWOSHOT_*)."""
++
++    def __init__(self, comm, rank: int, world: int, rows_max: int, width: int, settings_: Settings | None = None,
++                 *, check: bool = True, device=None, p2p=None, kernels=None) -> None:
++        """``p2p`` / ``kernels``: shot 1's transport and the two kernels (default ``NcclP2P`` on the communicator
++        TF_GLM_TWOSHOT_SCATTER names, ``TritonKernels``); ``check``: the start check (``check``)."""
++
++        s = settings_ if settings_ is not None else settings()
++        self.s = s
++        self.comm, self.rank, self.world = comm, int(rank), int(world)
++        self.nccl = nccl_of(comm)
++        if self.nccl is None and p2p is None:
++            raise ValueError("TF_GLM_TWOSHOT_ROWS: the two-shot exchange needs the engine's NCCL communicator "
++                             "(TF_GLM_COMM=nccl or ipc)")
++        if self.world < 2 or width % BLOCK:
++            raise ValueError(f"TF_GLM_TWOSHOT_ROWS: {self.world} ranks and a width of {width}: two or more ranks and "
++                             f"a multiple of {BLOCK} columns")
++        self.rows_from = max(1, int(s.rows))
++        self.rows_max, self.D = int(rows_max), int(width)
++        dev = torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device)
++        H = self.Hmax = -(-self.rows_max // self.world)
++        # rows a received slot holds (the split's two halves need up to two more) and the elements between the ranks'
++        # places in the view (the split's second gather may end up to ranks - 1 rows past the window)
++        self.Hcap = H + 2
++        self.RS = self.world * (H + 1) * self.D
++        self.recv = torch.empty((self.world, self.Hcap, self.D), dtype=torch.float32, device=dev)
++        # the view's buffer: rank 0's place holds the branch (and, f32, the second shot's rows); the others -0.0
++        self.fbuf = torch.full((self.world * self.RS,), -0.0, dtype=torch.float32, device=dev)
++        self.fbuf[:self.RS].zero_()
++        self.gbuf = (torch.empty((self.RS,), dtype=torch.bfloat16, device=dev) if s.kind == "bf16" else None)
++        self.p2p = p2p if p2p is not None else NcclP2P(self.nccl, s.scatter)
++        self.k = kernels if kernels is not None else TritonKernels()
++        self.calls = 0
++        # X6c (TF_GLM_TWOSHOT_SPLIT): the second half's owner sum and gather run on a side stream (none on the CPU:
++        # the tests run the split in order)
++        self.side = self.ev_a = self.ev_b = None
++        if s.split and dev.type == "cuda":
++            self.side = torch.cuda.Stream(device=dev)
++            self.ev_a, self.ev_b = torch.cuda.Event(), torch.cuda.Event()
++        if check:
++            self.check()                                 # (its exchanges also open the scatter's connections)
++        elif dev.type == "cuda":
++            self.warm()
++
++    @torch.no_grad()
++    def warm(self) -> None:
++        """One exchange of the widest window, every rank together, outside any CUDA graph capture: NCCL opens the
++        scatter's peer connections on their first use, which must not happen inside a capture."""
++
++        self.exchange(torch.zeros((self.rows_max, self.D), dtype=torch.float32, device=self.fbuf.device),
++                      self.rows_max)
++        torch.cuda.synchronize()
++
++    def applies(self, R: int) -> bool:
++        return self.rows_from <= R <= self.rows_max
++
++    # -- the two shots ---------------------------------------------------------------------------------------------
++    def _scatter(self, part: torch.Tensor, halves: list[tuple[int, int]]) -> None:
++        """Shot 1: for each half (first row, end) of the window (one, or two when split), this rank's partial of each
++        other rank's rows to it and the others' partials of this rank's rows into their ``recv`` slots, the halves one
++        after the other in each slot (one group of sends and receives on the current stream)."""
++
++        sends: dict = {p: [] for p in range(self.world) if p != self.rank}
++        recvs: dict = {p: [] for p in sends}
++        at = 0
++        for first, end in halves:
++            _, n_me = rows_of(self.rank, end, self.world, first)
++            for p in sends:
++                lo, n = rows_of(p, end, self.world, first)
++                sends[p].append(part[lo:lo + n].reshape(-1))
++                recvs[p].append(self.recv[p, at:at + n_me].reshape(-1))
++            at += -(-(end - first) // self.world)
++        self.p2p.sendrecv(sends, recvs)
++
++    def _gather(self, buf: torch.Tensor, H: int, first: int = 0) -> None:
++        """Shot 2: every rank's H rows of ``buf`` from row ``first`` (its own at its place), in place."""
++
++        n, base = H * self.D, first * self.D
++        send, recv = buf[base + self.rank * n:base + (self.rank + 1) * n], buf[base:base + self.world * n]
++        if self.s.gather == "nccl" and self.nccl is not None:
++            self.nccl.all_gather(send, recv)
++        else:
++            self.comm.all_gather(send, recv)
++
++    def exchange(self, part: torch.Tensor, R: int, split: bool = False):
++        """Every rank's fp32 partial ``part[:R]`` ([rows, D], contiguous) to the [ranks, R, D] fp32 view hc_post reads:
++        rank 0's place the rows' branch bf16(((g0 + g1) + g2) + g3) (exact in fp32), the others' -0.0. ``split``: the
++        caller takes a ``Split`` (TF_GLM_TWOSHOT_SPLIT, for windows that wide)."""
++
++        if (not self.applies(R) or part.dtype != torch.float32 or not part.is_contiguous() or part.dim() != 2
++                or part.shape[1] != self.D or part.shape[0] < R):
++            raise ValueError(f"two-shot exchange of {R} rows of {tuple(part.shape)} {part.dtype}: {self.rows_from} to "
++                             f"{self.rows_max} rows of a contiguous fp32 [rows, {self.D}] partial")
++        self.calls += 1
++        R1 = split_rows(R, self.world) if split and self.s.split and R >= self.s.split else None
++        if R1 is not None:
++            return self._exchange_split(part, R, R1)
++        H = -(-R // self.world)
++        lo, n = rows_of(self.rank, R, self.world)
++        self._scatter(part, [(0, R)])
++        out = self.gbuf if self.gbuf is not None else self.fbuf
++        if n:
++            self.k.owner_sum(part, self.recv, out, lo, n, self.Hcap * self.D, 0, self.D, self.world, self.rank)
++        self._gather(out, H)
++        if self.gbuf is not None:
++            self.k.widen(self.gbuf, self.fbuf, R * self.D)
++        return self.view(R)
++
++    def _exchange_split(self, part: torch.Tensor, R: int, R1: int) -> "Split":
++        """X6c: one scatter for both halves; the first half's owner sum, gather (and widening) on the current stream;
++        the second half's on the side stream once the first half's gather is done (so no two gathers of a rank ever
++        run at once), its end marked by ``ev_b``. The rows' arithmetic is the unsplit exchange's: the same view."""
++
++        D, w = self.D, self.world
++        HA, HB = R1 // w, -(-(R - R1) // w)
++        self._scatter(part, [(0, R1), (R1, R)])
++        out = self.gbuf if self.gbuf is not None else self.fbuf
++        lo, n = rows_of(self.rank, R1, w)
++        self.k.owner_sum(part, self.recv, out, lo, n, self.Hcap * D, 0, D, w, self.rank)
++        self._gather(out, HA)
++        if self.gbuf is not None:
++            self.k.widen(self.gbuf, self.fbuf, R1 * D)
++        lo, n = rows_of(self.rank, R, w, R1)
++
++        def second() -> None:
++            if n:
++                self.k.owner_sum(part, self.recv, out, lo, n, self.Hcap * D, HA, D, w, self.rank)
++            self._gather(out, HB, R1)
++            if self.gbuf is not None:
++                self.k.widen(self.gbuf[R1 * D:], self.fbuf[R1 * D:], (R - R1) * D)
++
++        if self.side is None:
++            second()
++            return Split(self.view(R), R1, None)
++        self.ev_a.record()
++        self.side.wait_event(self.ev_a)
++        with torch.cuda.stream(self.side):
++            second()
++            self.ev_b.record()
++        return Split(self.view(R), R1, self.ev_b)
++
++    def view(self, R: int) -> torch.Tensor:
++        return self.fbuf.as_strided((self.world, R, self.D), (self.RS, self.D, 1))
++
++    # -- the start check ---------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def check(self, rows=None) -> None:
++        """Every rank together: hc_post and residual_add on the two-shot view against the one all-gather's partials,
++        bit for bit, at a few row counts, on partials spread over many magnitudes with -0.0, denormal, infinite and
++        NaN entries; raises on every rank when any rank differs."""
++
++        from . import glue
++
++        dev = self.fbuf.device
++        bad = 0
++        S = 4
++        rows = rows or sorted({self.rows_from, min(self.rows_max, self.rows_from + 1), self.rows_max,
++                               max(self.rows_from, min(self.rows_max, self.world + 1)),
++                               *([max(self.rows_from, min(self.rows_max, self.s.split))] if self.s.split else [])})
++        gather = self.nccl.all_gather if self.nccl is not None else self.comm.all_gather
++        gen = torch.Generator(device=dev)
++        for R in rows:
++            gen.manual_seed(7000 + 31 * R + self.rank)
++            part = special(torch.randn((R, self.D), device=dev, generator=gen) *
++                           torch.exp2(torch.randint(-20, 21, (R, self.D), device=dev, generator=gen).float()),
++                           gen, self.rank)
++            gathered = torch.empty((self.world * R * self.D,), dtype=torch.float32, device=dev)
++            gather(part.reshape(-1), gathered)
++            gathered = gathered.view(self.world, R, self.D)
++            view = self.exchange(part, R)
++            gen.manual_seed(9000 + R)                       # the same streams, post and comb on every rank
++            x0 = torch.randn((R, S * self.D), device=dev, generator=gen).to(torch.bfloat16)
++            post = torch.rand((R, S), device=dev, generator=gen) * 2.0
++            comb = torch.rand((R, S * S), device=dev, generator=gen) * 0.5
++            a, b = x0.clone(), x0.clone()
++            glue.hc_post(a, a, gathered, post, comb)
++            glue.hc_post(b, b, view, post, comb)
++            bad += int(not torch.equal(a.view(torch.int16), b.view(torch.int16)))
++            r0 = x0[:, :self.D].contiguous()
++            ra, rb = r0.clone(), r0.clone()
++            glue.residual_add(ra, ra, gathered)
++            glue.residual_add(rb, rb, view)
++            bad += int(not torch.equal(ra.view(torch.int16), rb.view(torch.int16)))
++            if self.s.split and R >= self.s.split and split_rows(R, self.world):     # X6c: the split's view too
++                whole = view.clone()
++                sp = self.exchange(part, R, split=True)
++                sp.wait()
++                bad += int(not torch.equal(whole.view(torch.int32), sp.view.view(torch.int32)))
++        verdict = torch.tensor([bad], dtype=torch.int32, device=dev)
++        every = torch.empty((self.world,), dtype=torch.int32, device=dev)
++        gather(verdict, every)
++        if dev.type == "cuda":
++            torch.cuda.synchronize()
++        if int(every.sum()):
++            raise RuntimeError("TF_GLM_TWOSHOT_ROWS: the two-shot exchange's hc_post differs from the all-gather's on "
++                               f"rank {[r for r, v in enumerate(every.tolist()) if v]} at {list(rows)} rows: "
++                               "set TF_GLM_TWOSHOT_ROWS=0")
++
++
++class Split:
++    """X6c: a two-shot exchange whose rows R1 .. R are still being gathered on a side stream. ``view``: as
++    ``TwoShot.exchange``'s; rows 0 .. R1 may be read now, the rest after ``wait()`` (on the reading stream)."""
++
++    def __init__(self, view: torch.Tensor, R1: int, event) -> None:
++        self.view, self.R1, self.event = view, int(R1), event
++
++    def wait(self) -> None:
++        if self.event is not None:
++            torch.cuda.current_stream().wait_event(self.event)
++
++
++def special(part: torch.Tensor, gen: torch.Generator, rank: int) -> torch.Tensor:
++    """Partials with the values that would show another rounding or flush: -0.0 on every rank in some columns (their
++    sum is -0.0), denormal sums, sums past the largest fp32, one rank's infinity and one rank's NaN in a few."""
++
++    p = part.clone()
++    tiny = torch.finfo(torch.float32).tiny
++    p[:, 0:8] = -0.0
++    p[:, 8:16] = tiny * 0.25 * (1 + rank)                    # denormal partials and sums
++    p[:, 16:24] = -tiny * 0.5 if rank % 2 else tiny * 0.375
++    p[:, 24:32] = torch.finfo(torch.float32).max * 0.6       # their sum overflows
++    if rank == 1:
++        p[:, 32:34] = float("inf")
++    if rank == 2:
++        p[:, 34:36] = float("nan")
++    return p
++
++
++_TOLD = False
++
++
++def attach(w, rows: int) -> TwoShot | None:
++    """A decode buffer's exchange (``forward.Buffers``): None unless TF_GLM_TWOSHOT_ROWS is on, the engine runs on
++    two ranks or more and the buffer holds windows that wide. Every rank builds its decode buffers together, so the
++    start check's collectives meet (the ranks' TF_GLM_TWOSHOT_* settings are compared before, with the engine's)."""
++
++    global _TOLD
++    s = settings()
++    if not s.rows or w.comm is None or w.world < 2 or rows < s.rows:
++        return None
++    ts = TwoShot(w.comm, w.rank, w.world, rows, w.cfg.hidden, s)
++    if w.rank == 0 and not _TOLD:
++        _TOLD = True
++        print(f"[tensorfold] {s.describe()}; checked bit for bit at start against the all-gather", flush=True)
++    return ts

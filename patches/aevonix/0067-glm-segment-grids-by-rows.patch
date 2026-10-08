@@ -1,0 +1,57 @@
+0067-glm-segment-grids-by-rows: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: families/glm5_next/cuda/sparse.py, families/glm5_next/cuda/verify.py.
+
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index 0d8d9a4..19348d5 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -749,7 +749,8 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
+     scores = scratch.scores
+     grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
+     pkv, pks, rs, fp8 = kv8.parts(pk)
+-    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
++    # a window of R rows holds at most R segments: no programs for the table's unused (0-row) segments
++    _seg_scores[(min(rows.max_segs, R), grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
+                                        rows.sparse, rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools,
+                                        D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+                                        G=grid, RS=rs, FP8=fp8, num_warps=4)
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 64dbc7c..ca15202 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -182,6 +182,12 @@ class BatchedVerify:
+         self._write_table([(len(s.tokens), s.st.slot, s.st.cur[0] if s.st.cur else 0, s.st.slot,
+                             len(s.tokens) if keeps is None else keeps[k]) for k, s in enumerate(segments)])
+ 
++    def _kseg(self, R: int) -> torch.Tensor:
++        """The KDA segment table's first min(segments, R) rows (a view: graphs see the in-place writes): a window of R
++        rows holds at most R segments, so the segmented kernels' grids need no more (the rest have 0 rows and would
++        only launch empty blocks; --parallel 32 or 40 at a few rows otherwise pays for every unused slot)."""
++        return self.kseg[:min(self.kseg.shape[0], max(1, int(R)))]
++
+     def _span(self, st, pos: int, n: int) -> tuple:
+         """SegRows' segment of ``n`` rows of ``st`` from ``pos``: its extent's base, and its slot's ring base."""
+         caches = self.e.caches
+@@ -253,7 +259,7 @@ class BatchedVerify:
+         e = self.e
+         if layer.kind == "kda":
+             with prof.timed("kda"):
+-                return kda_segments(layer, self.w, self.b, R, self.kseg, e.slots, self.proj, self.scratch,
++                return kda_segments(layer, self.w, self.b, R, self._kseg(R), e.slots, self.proj, self.scratch,
+                                     self.kda_index[layer.index])
+         caches = e.caches
+         di = self.dsa_index[layer.index]
+@@ -280,8 +286,8 @@ class BatchedVerify:
+         if self.scratch is not None:
+             self._tables(segments, keeps)
+             if any(k < len(s.tokens) for s, k in zip(segments, keeps)):
+-                kda_mod.replay_layers_segments(self.kseg, e.slots.rec, self.scratch)
+-            conv_shift_segments(e.slots.conv, self.proj, self.kseg)
++                kda_mod.replay_layers_segments(self._kseg(self.R), e.slots.rec, self.scratch)
++            conv_shift_segments(e.slots.conv, self.proj, self._kseg(self.R))
+         for seg, keep in zip(segments, keeps):
+             st = seg.st
+             if st.cur:

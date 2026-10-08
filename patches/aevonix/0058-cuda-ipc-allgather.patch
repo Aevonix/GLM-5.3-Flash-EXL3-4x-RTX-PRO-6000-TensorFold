@@ -1,0 +1,769 @@
+0058-cuda-ipc-allgather.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/cuda/ipc.cpp tensorfold/cuda/ipc.cpp
+new file mode 100644
+index 0000000..fb66cd2
+--- /dev/null
++++ tensorfold/cuda/ipc.cpp
+@@ -0,0 +1,196 @@
++// One rank's side of the CUDA IPC one-shot all-gather (ipc.cu): the exported region, the peers' mapped regions,
++// the local control words (epoch, arrival count, poison) and the mapped host error record.
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cstring>
++#include <vector>
++
++#include "ipc.h"
++
++namespace {
++
++void cuda_ok(cudaError_t code, const char* what) {
++    if (code != cudaSuccess) {
++        cudaGetLastError();                     // an API error is not sticky: clear it before raising
++        TORCH_CHECK(false, "CUDA IPC all-gather: ", what, ": ", cudaGetErrorString(code));
++    }
++}
++
++}  // namespace
++
++// The launch geometry from the byte count alone, so every rank's launch of a gather matches: one block for each
++// block_bytes of the shard (at least one, at most MAX_BLOCKS), the shard's 16-byte packs split into equal
++// contiguous runs, and no empty block.
++std::vector<int64_t> plan(int64_t nbytes, int64_t block_bytes) {
++    TORCH_CHECK(nbytes > 0 && block_bytes > 0, "CUDA IPC all-gather: plan needs positive sizes");
++    const int64_t packs = (nbytes + PACK_BYTES - 1) / PACK_BYTES;
++    int64_t grid = (nbytes + block_bytes - 1) / block_bytes;
++    grid = std::max<int64_t>(1, std::min<int64_t>({grid, (int64_t)MAX_BLOCKS, packs}));
++    const int64_t chunk = (packs + grid - 1) / grid;
++    grid = (packs + chunk - 1) / chunk;
++    return {grid, chunk};
++}
++
++class Gather {
++  public:
++    Gather(int64_t world, int64_t rank, int64_t slot_bytes, int64_t timeout_ns, int64_t block_bytes, int64_t threads)
++        : world_(world), rank_(rank), slot_bytes_(slot_bytes), timeout_ns_(timeout_ns), block_bytes_(block_bytes),
++          threads_(threads) {
++        TORCH_CHECK(2 <= world && world <= MAX_WORLD, "CUDA IPC all-gather: 2 to ", MAX_WORLD, " ranks, not ", world);
++        TORCH_CHECK(0 <= rank && rank < world, "CUDA IPC all-gather: rank ", rank, " of ", world);
++        TORCH_CHECK(slot_bytes > 0 && slot_bytes % 256 == 0, "CUDA IPC all-gather: slot bytes a multiple of 256");
++        TORCH_CHECK(block_bytes >= PACK_BYTES, "CUDA IPC all-gather: block bytes at least ", PACK_BYTES);
++        check_threads(threads);
++        TORCH_CHECK(timeout_ns > 0, "CUDA IPC all-gather: a positive wait limit");
++        cuda_ok(cudaGetDevice(&device_), "cudaGetDevice");
++        region_bytes_ = DATA_OFFSET + 2LL * (world - 1) * slot_bytes;
++        std::memset(&regions_, 0, sizeof(regions_));
++        cuda_ok(cudaMalloc(&region_, (size_t)region_bytes_), "cudaMalloc (the IPC region)");
++        cuda_ok(cudaMalloc(&ctl_, 256), "cudaMalloc (control words)");
++        cuda_ok(cudaHostAlloc(reinterpret_cast<void**>(&err_host_), 64, cudaHostAllocMapped | cudaHostAllocPortable),
++                "cudaHostAlloc (error record)");
++        std::memset(err_host_, 0, 64);
++        cuda_ok(cudaHostGetDevicePointer(reinterpret_cast<void**>(&err_dev_), err_host_, 0),
++                "cudaHostGetDevicePointer");
++        cuda_ok(cudaMemset(region_, 0, (size_t)region_bytes_), "cudaMemset (the IPC region)");
++        cuda_ok(cudaMemset(ctl_, 0, 256), "cudaMemset (control words)");
++        cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize");   // zeroed before any peer can write a flag
++        regions_.base[rank] = static_cast<char*>(region_);
++    }
++
++    ~Gather() { close(); }
++
++    // this rank's region as a CUDA IPC handle (CPU uint8 tensor)
++    at::Tensor handle() const {
++        TORCH_CHECK(region_ != nullptr, "CUDA IPC all-gather: closed");
++        const c10::cuda::CUDAGuard guard(device_);
++        cudaIpcMemHandle_t h;
++        cuda_ok(cudaIpcGetMemHandle(&h, region_), "cudaIpcGetMemHandle");
++        at::Tensor out = at::empty({(int64_t)sizeof(h)}, at::TensorOptions().dtype(at::kByte));
++        std::memcpy(out.data_ptr(), &h, sizeof(h));
++        return out;
++    }
++
++    // every rank's handle, in rank order (this rank's own is skipped): map the peers' regions
++    void connect(const std::vector<at::Tensor>& handles) {
++        TORCH_CHECK((int64_t)handles.size() == world_, "CUDA IPC all-gather: one handle a rank");
++        TORCH_CHECK(opened_.empty(), "CUDA IPC all-gather: already connected");
++        const c10::cuda::CUDAGuard guard(device_);
++        for (int64_t r = 0; r < world_; ++r) {
++            if (r == rank_) continue;
++            const at::Tensor h = handles[r].contiguous().to(at::kCPU);
++            TORCH_CHECK(h.numel() * h.element_size() == (int64_t)sizeof(cudaIpcMemHandle_t),
++                        "CUDA IPC all-gather: a handle is ", sizeof(cudaIpcMemHandle_t), " bytes");
++            cudaIpcMemHandle_t handle;
++            std::memcpy(&handle, h.data_ptr(), sizeof(handle));
++            void* p = nullptr;
++            const cudaError_t code = cudaIpcOpenMemHandle(&p, handle, cudaIpcMemLazyEnablePeerAccess);
++            if (code != cudaSuccess) {
++                cudaGetLastError();
++                unmap();
++                TORCH_CHECK(false, "CUDA IPC all-gather: cudaIpcOpenMemHandle (rank ", r, "'s region): ",
++                            cudaGetErrorString(code));
++            }
++            opened_.push_back(p);
++            regions_.base[r] = static_cast<char*>(p);
++        }
++    }
++
++    // recv [world * n] <- every rank's send [n] in rank order; contiguous CUDA tensors on this device, n bytes at
++    // most slot_bytes. block_bytes / threads: the defaults when negative (every rank must pass the same block_bytes)
++    void run(const at::Tensor& send, at::Tensor recv, int64_t block_bytes, int64_t threads) {
++        TORCH_CHECK(!opened_.empty(), "CUDA IPC all-gather: not connected");
++        TORCH_CHECK(send.is_cuda() && recv.is_cuda() && send.is_contiguous() && recv.is_contiguous(),
++                    "CUDA IPC all-gather: contiguous CUDA tensors");
++        TORCH_CHECK(send.get_device() == device_ && recv.get_device() == device_,
++                    "CUDA IPC all-gather: tensors on the region's device");
++        const int64_t nbytes = send.numel() * (int64_t)send.element_size();
++        TORCH_CHECK(nbytes > 0 && nbytes <= slot_bytes_, "CUDA IPC all-gather: 1 to ", slot_bytes_, " bytes a rank, not ",
++                    nbytes);
++        TORCH_CHECK(recv.numel() * (int64_t)recv.element_size() == world_ * nbytes,
++                    "CUDA IPC all-gather: recv must hold world x send bytes");
++        const int64_t t = threads < 0 ? threads_ : threads;
++        check_threads(t);
++        const std::vector<int64_t> geometry = plan(nbytes, block_bytes < 0 ? block_bytes_ : block_bytes);
++        const c10::cuda::CUDAGuard guard(device_);
++        auto* ctl = static_cast<char*>(ctl_);
++        ipc_gather_cuda(send, recv, nbytes, geometry[1], (int)geometry[0], (int)t, regions_, slot_bytes_,
++                        reinterpret_cast<unsigned long long*>(ctl), reinterpret_cast<unsigned*>(ctl + 8),
++                        reinterpret_cast<unsigned*>(ctl + 16), err_dev_, timeout_ns_, (int)world_, (int)rank_);
++    }
++
++    // the mapped host error record's address: {failed sequence (0: none), peer, block, waited ns}
++    int64_t error_address() const { return reinterpret_cast<int64_t>(err_host_); }
++
++    std::vector<int64_t> error() const {
++        if (err_host_ == nullptr) return {0, 0, 0, 0};
++        const volatile long long* e = err_host_;
++        return {e[0], e[1], e[2], e[3]};
++    }
++
++    int64_t region_bytes() const { return region_bytes_; }
++
++    // the wait limit of later launches (a captured graph keeps the value it was captured with)
++    void set_timeout(int64_t timeout_ns) {
++        TORCH_CHECK(timeout_ns > 0, "CUDA IPC all-gather: a positive wait limit");
++        timeout_ns_ = timeout_ns;
++    }
++
++    void close() {
++        if (region_ == nullptr && opened_.empty() && ctl_ == nullptr && err_host_ == nullptr) return;
++        cudaSetDevice(device_);
++        unmap();
++        if (region_ != nullptr) cudaFree(region_);
++        if (ctl_ != nullptr) cudaFree(ctl_);
++        if (err_host_ != nullptr) cudaFreeHost(err_host_);
++        region_ = ctl_ = nullptr;
++        err_host_ = err_dev_ = nullptr;
++        cudaGetLastError();                     // teardown at exit: nothing to report
++    }
++
++  private:
++    static void check_threads(int64_t threads) {
++        TORCH_CHECK(threads >= 32 && threads <= MAX_THREADS && threads % 32 == 0,
++                    "CUDA IPC all-gather: threads a block a multiple of 32 up to ", MAX_THREADS);
++    }
++
++    void unmap() {
++        for (void* p : opened_) cudaIpcCloseMemHandle(p);
++        opened_.clear();
++        for (int64_t r = 0; r < world_; ++r)
++            if (r != rank_) regions_.base[r] = nullptr;
++    }
++
++    int64_t world_, rank_, slot_bytes_, timeout_ns_, block_bytes_, threads_;
++    int device_ = 0;
++    int64_t region_bytes_ = 0;
++    void* region_ = nullptr;
++    void* ctl_ = nullptr;
++    long long* err_host_ = nullptr;
++    long long* err_dev_ = nullptr;
++    std::vector<void*> opened_;
++    Regions regions_;
++};
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("plan", &plan, "(grid, packs a block) of a gather of nbytes a rank");
++    m.def("layout", []() {
++        return std::vector<int64_t>{IPC_ABI, MAX_WORLD, MAX_BLOCKS, MAX_THREADS, PACK_BYTES, FLAG_BYTES, DATA_OFFSET,
++                                    (int64_t)sizeof(cudaIpcMemHandle_t)};
++    });
++    py::class_<Gather>(m, "Gather")
++        .def(py::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), py::arg("world"), py::arg("rank"),
++             py::arg("slot_bytes"), py::arg("timeout_ns"), py::arg("block_bytes"), py::arg("threads"))
++        .def("handle", &Gather::handle)
++        .def("connect", &Gather::connect)
++        .def("run", &Gather::run, py::arg("send"), py::arg("recv"), py::arg("block_bytes") = -1,
++             py::arg("threads") = -1)
++        .def("error_address", &Gather::error_address)
++        .def("error", &Gather::error)
++        .def("region_bytes", &Gather::region_bytes)
++        .def("set_timeout", &Gather::set_timeout)
++        .def("close", &Gather::close);
++}
+diff --git tensorfold/cuda/ipc.cu tensorfold/cuda/ipc.cu
+new file mode 100644
+index 0000000..6fe2db9
+--- /dev/null
++++ tensorfold/cuda/ipc.cu
+@@ -0,0 +1,206 @@
++// One-shot all-gather between the GPUs of one host over CUDA IPC (PCIe or NVLink peer to peer), for decode-sized
++// gathers. Same protocol as Mia's one-shot RoCE kernel (roce.cu: device epoch, two slots, acquire-polled flags, a
++// timeout that poisons), without a host proxy: each rank writes its shard straight into every peer's slot. The IPC
++// buffer handling follows b12x's PCIe one-shot collectives (https://github.com/local-inference-lab/b12x,
++// b12x/comm/pcie, Apache License 2.0); no b12x source is copied.
++//
++// Every rank exports one region (cudaMalloc, opened by the peers with cudaIpcOpenMemHandle):
++//   flags  u64 flag[slot 2][source MAX_WORLD][block MAX_BLOCKS]   written by the peers, polled here
++//   data   data[slot 2][source, peers only: world - 1][slot_bytes]  written by the peers, read here
++// One launch (grid and partition chosen from the byte count alone, so every rank's launch matches):
++//   0. every block reads the device epoch: seq = epoch + 1, slot = seq & 1 (a poisoned runtime returns at once);
++//   1. block b pushes its partition of the local shard into slot `slot` of every peer (plain stores; peer to peer
++//      writes, no atomics: P2P atomics need not be supported) and copies it to its own place in the output;
++//   2. every thread fences at system scope, the block meets, then one thread a peer writes the block's flag there
++//      with a system-scope release store: flag[slot][rank][b] = seq;
++//   3. one thread a peer polls its own flag[slot][peer][b] (relaxed system loads, then an acquire fence); a wait
++//      past the limit records the failure in mapped host memory and poisons the runtime;
++//   4. the block copies partition b of every peer's shard out of its own slots, rank by rank (the output layout
++//      is NCCL's: rank r's shard at r * nbytes), so the bytes equal NCCL's all-gather bit for bit;
++//   5. the last block to finish (a local arrival counter) advances the epoch, so CUDA graphs replay the exchange.
++// Why two slots and per-block flags are enough: a rank starts call n + 2 (slot n & 1 again) only after it has seen
++// every peer's flags of call n + 1, which a peer writes only after its launch n finished reading slot n & 1 (stream
++// order). Flags are 64-bit sequence numbers, so a stale flag never equals the awaited one.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++#include "ipc.h"
++
++namespace {
++
++__device__ __forceinline__ unsigned long long ld_relaxed_gpu_u64(const unsigned long long* p) {
++    unsigned long long v;
++    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
++    return v;
++}
++__device__ __forceinline__ unsigned ld_relaxed_gpu_u32(const unsigned* p) {
++    unsigned v;
++    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++    return v;
++}
++__device__ __forceinline__ unsigned long long ld_relaxed_sys_u64(const unsigned long long* p) {
++    unsigned long long v;
++    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
++    return v;
++}
++__device__ __forceinline__ uint4 ld_relaxed_sys_v4(const uint4* p) {
++    uint4 v;
++    asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
++                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
++    return v;
++}
++__device__ __forceinline__ void st_release_sys_u64(unsigned long long* p, unsigned long long v) {
++    asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
++}
++__device__ __forceinline__ void st_relaxed_sys_s64(long long* p, long long v) {
++    asm volatile("st.relaxed.sys.global.s64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
++}
++__device__ __forceinline__ void st_relaxed_gpu_u64(unsigned long long* p, unsigned long long v) {
++    asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
++}
++__device__ __forceinline__ void st_release_gpu_u32(unsigned* p, unsigned v) {
++    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++__device__ __forceinline__ void st_global_v4(void* p, uint4 v) {
++    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
++                 : "memory");
++}
++__device__ __forceinline__ void fence_acq_rel_sys() { asm volatile("fence.acq_rel.sys;" ::: "memory"); }
++__device__ __forceinline__ unsigned long long globaltimer() {
++    unsigned long long t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++
++// a 16-byte pack i of a byte range [base, base + nbytes): whole and aligned in one vector access, else byte by byte
++// (a tail pack, or a buffer that is not 16-byte aligned; only small gathers meet either)
++__device__ __forceinline__ uint4 load_pack(const unsigned char* base, long long i, long long nbytes, bool aligned) {
++    const long long off = i * PACK_BYTES;
++    if (aligned && off + PACK_BYTES <= nbytes) return *reinterpret_cast<const uint4*>(base + off);
++    unsigned long long lo = 0ull, hi = 0ull;                            // no indexed array: nothing on the stack
++    const int n = (int)min((long long)PACK_BYTES, nbytes - off);
++    for (int k = 0; k < n; ++k) {
++        const unsigned long long byte = base[off + k];
++        if (k < 8) lo |= byte << (8 * k);
++        else hi |= byte << (8 * (k - 8));
++    }
++    return make_uint4((unsigned)lo, (unsigned)(lo >> 32), (unsigned)hi, (unsigned)(hi >> 32));
++}
++__device__ __forceinline__ void store_pack(unsigned char* base, long long i, long long nbytes, bool aligned, uint4 v) {
++    const long long off = i * PACK_BYTES;
++    if (aligned && off + PACK_BYTES <= nbytes) {
++        *reinterpret_cast<uint4*>(base + off) = v;
++        return;
++    }
++    const unsigned long long lo = ((unsigned long long)v.y << 32) | v.x, hi = ((unsigned long long)v.w << 32) | v.z;
++    const int n = (int)min((long long)PACK_BYTES, nbytes - off);
++    for (int k = 0; k < n; ++k) base[off + k] = (unsigned char)(k < 8 ? lo >> (8 * k) : hi >> (8 * (k - 8)));
++}
++
++__device__ __forceinline__ long long data_offset(int slot, int source, int receiver, int world, long long slot_bytes) {
++    const int index = source < receiver ? source : source - 1;          // the receiver keeps no slot for itself
++    return DATA_OFFSET + ((long long)slot * (world - 1) + index) * slot_bytes;
++}
++
++__device__ __forceinline__ unsigned long long* flag_at(char* region, int slot, int source, int block) {
++    return reinterpret_cast<unsigned long long*>(region) + ((long long)slot * MAX_WORLD + source) * MAX_BLOCKS + block;
++}
++
++__global__ void __launch_bounds__(MAX_THREADS) ipc_gather_kernel(
++        const unsigned char* __restrict__ in, unsigned char* __restrict__ out, long long nbytes, long long chunk,
++        const __grid_constant__ Regions regions, long long slot_bytes, unsigned long long* epoch, unsigned* arrive,
++        unsigned* poison, long long* err, long long timeout_ns, int world, int rank) {
++    __shared__ unsigned long long s_seq;
++    __shared__ unsigned s_stop;
++    const int tid = threadIdx.x, b = blockIdx.x, nt = blockDim.x;
++    if (tid == 0) {
++        s_seq = ld_relaxed_gpu_u64(epoch) + 1ull;
++        s_stop = ld_relaxed_gpu_u32(poison);
++    }
++    __syncthreads();
++    // 0. a recorded timeout poisons the runtime: later launches do nothing until the host raises
++    if (s_stop != 0u) return;
++    const unsigned long long seq = s_seq;
++    const int slot = (int)(seq & 1ull);
++    const long long packs = (nbytes + PACK_BYTES - 1) / PACK_BYTES;
++    const long long lo = (long long)b * chunk, hi = min(packs, lo + chunk);
++    const bool in_aligned = (reinterpret_cast<uintptr_t>(in) & (PACK_BYTES - 1)) == 0;
++    unsigned char* own = out + (long long)rank * nbytes;
++    const bool own_aligned = (reinterpret_cast<uintptr_t>(own) & (PACK_BYTES - 1)) == 0;
++    const bool own_copy = own != in;                                     // in place: the shard is already there
++
++    // 1. push this block's partition into every peer's slot (peers staggered by rank) and into the own output
++    for (long long i = lo + tid; i < hi; i += nt) {
++        const uint4 v = load_pack(in, i, nbytes, in_aligned);
++        for (int k = 1; k < world; ++k) {
++            const int p = (rank + k) % world;
++            uint4* dst = reinterpret_cast<uint4*>(regions.base[p] + data_offset(slot, rank, p, world, slot_bytes));
++            st_global_v4(dst + i, v);                                    // a plain peer-to-peer write
++        }
++        if (own_copy) store_pack(own, i, nbytes, own_aligned, v);
++    }
++    // 2. the block's stores before its flags: a system fence in every thread, the block meets, then the flags
++    fence_acq_rel_sys();
++    __syncthreads();
++    if (tid < world && tid != rank) st_release_sys_u64(flag_at(regions.base[tid], slot, rank, b), seq);
++
++    // 3. wait for every peer's matching block (one thread a peer)
++    if (tid < world && tid != rank) {
++        const unsigned long long* flag = flag_at(regions.base[rank], slot, tid, b);
++        if (ld_relaxed_sys_u64(flag) != seq) {
++            const unsigned long long start = globaltimer();
++            unsigned polls = 0;
++            while (ld_relaxed_sys_u64(flag) != seq) {
++                if ((++polls & 255u) != 0u) continue;
++                if (ld_relaxed_gpu_u32(poison) != 0u) break;                  // another wait gave up first
++                const unsigned long long waited = globaltimer() - start;
++                if ((long long)waited > timeout_ns) {
++                    st_relaxed_sys_s64(err + 1, tid);
++                    st_relaxed_sys_s64(err + 2, b);
++                    st_relaxed_sys_s64(err + 3, (long long)waited);
++                    fence_acq_rel_sys();
++                    st_relaxed_sys_s64(err + 0, (long long)seq);
++                    st_release_gpu_u32(poison, 1u);
++                    break;
++                }
++            }
++        }
++        fence_acq_rel_sys();                                             // acquire: the shard before its flag
++    }
++    __syncthreads();
++
++    // 4. copy every peer's partition out of the slots, in rank order
++    if (ld_relaxed_gpu_u32(poison) == 0u) {
++        const char* mine = regions.base[rank];
++        for (int s = 0; s < world; ++s) {
++            if (s == rank) continue;
++            const uint4* src = reinterpret_cast<const uint4*>(mine + data_offset(slot, s, rank, world, slot_bytes));
++            unsigned char* dst = out + (long long)s * nbytes;
++            const bool dst_aligned = (reinterpret_cast<uintptr_t>(dst) & (PACK_BYTES - 1)) == 0;
++            for (long long i = lo + tid; i < hi; i += nt) store_pack(dst, i, nbytes, dst_aligned, ld_relaxed_sys_v4(src + i));
++        }
++    }
++
++    // 5. the last block advances the epoch (atomicInc wraps the arrival count to 0 for the next launch)
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned prior = atomicInc(arrive, gridDim.x - 1u);
++        if (prior == gridDim.x - 1u && ld_relaxed_gpu_u32(poison) == 0u) st_relaxed_gpu_u64(epoch, seq);
++    }
++}
++
++}  // namespace
++
++void ipc_gather_cuda(const at::Tensor& in, at::Tensor& out, long long nbytes, long long chunk, int grid, int threads,
++                     const Regions& regions, long long slot_bytes, unsigned long long* epoch, unsigned* arrive,
++                     unsigned* poison, long long* err, long long timeout_ns, int world, int rank) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    ipc_gather_kernel<<<(unsigned)grid, (unsigned)threads, 0, stream>>>(
++        reinterpret_cast<const unsigned char*>(in.data_ptr()), reinterpret_cast<unsigned char*>(out.data_ptr()),
++        nbytes, chunk, regions, slot_bytes, epoch, arrive, poison, err, timeout_ns, world, rank);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/cuda/ipc.h tensorfold/cuda/ipc.h
+new file mode 100644
+index 0000000..48a2008
+--- /dev/null
++++ tensorfold/cuda/ipc.h
+@@ -0,0 +1,21 @@
++// Shared by ipc.cpp (the region, IPC handles, launches) and ipc.cu (the one-shot all-gather kernel).
++#pragma once
++
++#include <ATen/ATen.h>
++
++constexpr int IPC_ABI = 1;                      // ipc.py checks it; bump with any change to the layout below
++constexpr int MAX_WORLD = 8;                    // ranks at most
++constexpr int MAX_BLOCKS = 128;                 // blocks a launch at most (one flag a block, source and slot)
++constexpr int MAX_THREADS = 1024;
++constexpr int PACK_BYTES = 16;                  // the kernel moves 16-byte packs
++constexpr long long FLAG_BYTES = 2LL * MAX_WORLD * MAX_BLOCKS * 8;     // u64 flag[2][MAX_WORLD][MAX_BLOCKS]
++constexpr long long DATA_OFFSET = FLAG_BYTES;   // then data[2][world - 1][slot_bytes]
++
++// every rank's region as mapped in this process (this rank's own entry: the local region)
++struct Regions {
++    char* base[MAX_WORLD];
++};
++
++void ipc_gather_cuda(const at::Tensor& in, at::Tensor& out, long long nbytes, long long chunk, int grid, int threads,
++                     const Regions& regions, long long slot_bytes, unsigned long long* epoch, unsigned* arrive,
++                     unsigned* poison, long long* err, long long timeout_ns, int world, int rank);
+diff --git tensorfold/cuda/ipc.py tensorfold/cuda/ipc.py
+new file mode 100644
+index 0000000..7318de6
+--- /dev/null
++++ tensorfold/cuda/ipc.py
+@@ -0,0 +1,286 @@
++"""One-shot all-gather over CUDA IPC for the GPUs of one host (PCIe or NVLink peer to peer).
++
++A decode round's all-gathers are small (a verify window's partials: rows x 4,096 fp32, the samplers' candidates, the
++round messages) and NCCL spends most of each in fixed latency. Here each rank writes its shard straight into every
++peer's slot over peer-to-peer stores, then a flag with a system-scope release store; each rank polls its own flags
++with acquire semantics and copies the peers' shards out of its slots in rank order (ipc.cu). Flags are plain stores
++and loads, so GPUs without peer-to-peer atomics qualify. A device epoch picks one of two slots a launch, so CUDA
++graphs replay the exchange; a wait past TF_GLM_IPC_WAIT_S poisons the runtime and the host raises (as the RoCE one-shot
++does, roce.py).
++
++``IpcComm`` sends all-gathers of up to TF_GLM_IPC_MAX_KB a rank this way and the rest (the prefill exchanges) through
++NCCL, decided by the byte count alone (the same on every rank), with NCCL's output layout and the same bytes: an
++all-gather moves bytes and adds nothing, so every reply keeps its bits.
++
++Credits: the protocol is Mia's one-shot RoCE all-gather (MiaAI-Lab, roce.cu / roce.py, itself b12x's "RoCEnante"),
++without its host proxy; the CUDA IPC buffers follow b12x's PCIe one-shot collectives (local-inference-lab/b12x,
++b12x/comm/pcie, Apache License 2.0). No b12x source is copied.
++
++Settings (every rank must see the same values; the setup compares them):
++  TF_GLM_COMM=ipc         turns it on (GlmEngine); without peer-to-peer access between the ranks' GPUs (each rank must
++                          see the others' devices, e.g. CUDA_VISIBLE_DEVICES with its own GPU first) it says so and
++                          every gather stays on NCCL
++  TF_GLM_IPC_MAX_KB       largest gather a rank sent this way (default 512 = 32 rows of 4,096 fp32); each GPU exports
++                          2 x (ranks - 1) slots of this size (BAR1 space when peers map it)
++  TF_GLM_IPC_WAIT_S       seconds a wait for a peer may take before it poisons the runtime (default 300, 1 to 3600).
++                          Generous on purpose: in a multi-stream round the other ranks wait inside the round
++                          message's gather while rank 0 alone admits a request (an image encode, a grammar compile),
++                          and a dead rank is still reported instead of hanging as NCCL would
++  TF_GLM_IPC_BLOCK_KB     shard KiB a block (the grid: one block for each, at most 128; default 8)
++  TF_GLM_IPC_THREADS      threads a block (default 512)
++"""
++
++from __future__ import annotations
++
++import ctypes
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++ABI = 1                                  # ipc.h's IPC_ABI
++SLOT_ALIGN = 256
++MAX_KB = 512
++WAIT_S = 300.0
++BLOCK_KB = 8
++THREADS = 512
++
++
++class IpcUnavailable(RuntimeError):
++    """CUDA IPC cannot run between these ranks (said on every rank alike): the caller keeps NCCL."""
++
++
++def _setting(name: str, default: float, lo: float, hi: float) -> float:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        value = float(raw)
++    except ValueError:
++        value = lo - 1
++    if not lo <= value <= hi:
++        raise ValueError(f"{name}: {lo:g} to {hi:g}, not {raw!r}")
++    return value
++
++
++def settings() -> dict:
++    """The TF_GLM_IPC_* values (bytes, ns and threads), checked."""
++
++    threads = int(_setting("TF_GLM_IPC_THREADS", THREADS, 32, 1024))
++    if threads % 32:
++        raise ValueError(f"TF_GLM_IPC_THREADS: a multiple of 32, not {threads}")
++    return {"max_bytes": int(_setting("TF_GLM_IPC_MAX_KB", MAX_KB, 1, 4096) * 1024),
++            "timeout_ns": int(_setting("TF_GLM_IPC_WAIT_S", WAIT_S, 1, 3600) * 1e9),
++            "block_bytes": int(_setting("TF_GLM_IPC_BLOCK_KB", BLOCK_KB, 1, 4096) * 1024),
++            "threads": threads}
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name=f"tensorfold_ipc_v{ABI}", sources=[str(here / "ipc.cpp"), str(here / "ipc.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def plan(nbytes: int, block_bytes: int, max_blocks: int = 128, pack: int = 16) -> tuple[int, int]:
++    """(blocks, packs a block) of a gather of ``nbytes`` a rank: ipc.cpp's ``plan`` (the CPU tests check the two
++    agree), from the byte count alone so every rank's launch matches."""
++
++    packs = -(-nbytes // pack)
++    grid = max(1, min(-(-nbytes // block_bytes), max_blocks, packs))
++    chunk = -(-packs // grid)
++    return -(-packs // chunk), chunk
++
++
++class IpcGather:
++    """One rank's side of the exchange: its exported region, the peers' mapped regions and the launches."""
++
++    def __init__(self, comm, rank: int, world: int, max_bytes: int | None = None, timeout_ns: int | None = None,
++                 block_bytes: int | None = None, threads: int | None = None) -> None:
++        """``comm``: a communicator with ``all_gather`` (NCCL) for the setup. Raises ``IpcUnavailable`` on every
++        rank when any rank cannot take part (then nothing is left mapped)."""
++
++        given = settings()
++        self.rank, self.world = rank, world
++        self.max_bytes = int(given["max_bytes"] if max_bytes is None else max_bytes)
++        self.timeout_ns = int(given["timeout_ns"] if timeout_ns is None else timeout_ns)
++        self.block_bytes = int(given["block_bytes"] if block_bytes is None else block_bytes)
++        self.threads = int(given["threads"] if threads is None else threads)
++        self.slot_bytes = -(-self.max_bytes // SLOT_ALIGN) * SLOT_ALIGN
++        self.g = None
++        self.err = None
++        why, handle_len = "", 64
++        handle = None
++        try:
++            if not 2 <= world <= 8:
++                raise ValueError(f"2 to 8 ranks, not {world}")
++            ext = _ext()                 # its first build (tens of seconds) here, before the verdict all-gather below
++            layout = list(ext.layout())
++            if layout[0] != ABI:
++                raise RuntimeError(f"extension ABI {layout[0]}, expected {ABI}")
++            handle_len = int(layout[7])
++            self.g = ext.Gather(world, rank, self.slot_bytes, self.timeout_ns, self.block_bytes, self.threads)
++            handle = self.g.handle()
++        except Exception as exc:         # noqa: BLE001  (any rank's failure: every rank keeps NCCL)
++            why = f"{type(exc).__name__}: {exc}"
++        words = -(-handle_len // 4)
++        raw = bytearray(words * 4)
++        if handle is not None:
++            raw[:handle_len] = bytes(handle.numpy().tobytes())
++        geometry = [ABI, self.slot_bytes, self.block_bytes, self.threads, handle_len]
++        head = [1 if why else 0, *geometry]
++        mine = torch.tensor(head + list(torch.frombuffer(raw, dtype=torch.int32).tolist()), dtype=torch.int32)
++        got = torch.empty((world * mine.numel(),), dtype=torch.int32, device="cuda")
++        comm.all_gather(mine.cuda(), got)
++        rows = got.view(world, -1).cpu()
++        failed = [r for r in range(world) if int(rows[r, 0])]
++        if failed or len({tuple(r[1:len(head)].tolist()) for r in rows}) != 1:
++            self.close()
++            reason = (f"rank {', '.join(map(str, failed))} could not set up ({why or 'see that rank'})" if failed
++                      else "the ranks' TF_GLM_IPC_* settings differ")
++            raise IpcUnavailable(f"CUDA IPC all-gather unavailable: {reason}")
++        handles = [torch.frombuffer(bytearray(rows[r, len(head):].numpy().tobytes()[:handle_len]), dtype=torch.uint8)
++                   for r in range(world)]
++        try:
++            self.g.connect(handles)
++        except Exception as exc:         # noqa: BLE001
++            why = f"{type(exc).__name__}: {exc}"
++        verdict = torch.tensor([1 if why else 0], dtype=torch.int32, device="cuda")
++        all_verdicts = torch.empty((world,), dtype=torch.int32, device="cuda")
++        comm.all_gather(verdict, all_verdicts)
++        failed = [r for r, v in enumerate(all_verdicts.tolist()) if v]
++        if failed:
++            self.close()
++            raise IpcUnavailable(f"CUDA IPC all-gather unavailable: rank {', '.join(map(str, failed))} cannot map "
++                                 f"its peers' memory ({why or 'see that rank'}); peer-to-peer access needs every "
++                                 "GPU visible to every rank")
++        self.err = (ctypes.c_int64 * 4).from_address(self.g.error_address())
++
++    def fits_bytes(self, n: int) -> bool:
++        """Whether a gather of ``n`` bytes a rank goes over IPC (the same answer on every rank)."""
++
++        return 0 < n <= self.max_bytes
++
++    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
++        """recv [world * n] <- every rank's send [n] in rank order: contiguous CUDA tensors, n bytes fitting."""
++
++        self.g.run(send, recv)
++        if self.err[0] and not torch.cuda.is_current_stream_capturing():
++            self.check()
++
++    def check(self) -> None:
++        """Raise if a wait timed out on the GPU (it poisoned the runtime: later gathers move nothing)."""
++
++        if self.err is not None and self.err[0]:
++            seq, peer, block, waited = (int(v) for v in self.err)
++            raise RuntimeError(f"CUDA IPC all-gather failed: sequence {seq} waited {waited / 1e9:.1f} s for rank "
++                               f"{peer} (block {block}) and gave up (TF_GLM_IPC_WAIT_S {self.timeout_ns / 1e9:g} s); "
++                               "the runtime is poisoned, restart every rank")
++
++    def close(self) -> None:
++        if self.g is not None:
++            self.err = None
++            self.g.close()
++            self.g = None
++
++
++def _overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
++    a0, b0 = a.data_ptr(), b.data_ptr()
++    return a0 < b0 + b.numel() * b.element_size() and b0 < a0 + a.numel() * a.element_size()
++
++
++class IpcComm:
++    """NCCL with small all-gathers over CUDA IPC: the same call, output layout and bits."""
++
++    SELF_TEST_WAIT_NS = 30_000_000_000           # the self-test's wait limit: a path that drops writes fails soon
++
++    def __init__(self, nccl, rank: int, world: int, max_bytes: int | None = None) -> None:
++        self.nccl, self.rank, self.world = nccl, rank, world
++        self.small = self.large = 0
++        self.settled = False
++        nccl.barrier()
++        self.ipc = IpcGather(nccl, rank, world, max_bytes)
++        try:
++            self._self_test()
++        except Exception:
++            self.ipc.close()
++            raise
++
++    def _self_test(self) -> None:
++        """Gathers of a few sizes (a tail, a decode row, the largest) over IPC and NCCL, under a short wait limit:
++        the same bits on every rank, or ``IpcUnavailable`` on every rank (peer writes that never arrive, or arrive
++        out of the order the protocol needs, would show here)."""
++
++        ipc = self.ipc
++        ipc.g.set_timeout(min(ipc.timeout_ns, self.SELF_TEST_WAIT_NS))
++        gen = torch.Generator(device="cuda")
++        gen.manual_seed(1234 + self.rank)
++        bad, why = 0, ""
++        try:
++            for n in sorted({4, 168, 16 << 10, ipc.max_bytes - ipc.max_bytes % 4 or 4}):
++                send = torch.randint(-2 ** 31, 2 ** 31 - 1, (n // 4,), dtype=torch.int32, device="cuda",
++                                     generator=gen)
++                want = torch.empty((self.world * send.numel(),), dtype=torch.int32, device="cuda")
++                got = torch.full_like(want, -1)
++                self.nccl.all_gather(send, want)
++                for _ in range(3):
++                    ipc.all_gather(send, got)
++                    torch.cuda.synchronize()
++                    ipc.check()
++                    bad += int(not torch.equal(want, got))
++        except RuntimeError as exc:                   # a wait timed out: this rank is poisoned, so stop here
++            bad, why = bad + 1, str(exc)
++        verdict = torch.tensor([bad], dtype=torch.int32, device="cuda")
++        both = torch.empty((self.world,), dtype=torch.int32, device="cuda")
++        self.nccl.all_gather(verdict, both)
++        if int(both.sum()):
++            ranks = ", ".join(str(r) for r, v in enumerate(both.tolist()) if v)
++            raise IpcUnavailable(f"CUDA IPC all-gather unavailable: its self-test against NCCL failed on rank {ranks}"
++                                 + (f" ({why})" if why else " (other bytes than NCCL's)"))
++        ipc.g.set_timeout(ipc.timeout_ns)
++
++    def settle(self) -> None:
++        """Startup is over on this rank (its engine is built). Until then each eager IPC gather first meets the other
++        ranks in an NCCL barrier: ranks build their CUDA extensions on their own and can drift apart by tens of
++        seconds on a first start, past what an IPC wait allows; NCCL waits without that limit. Captured gathers
++        never do."""
++
++        self.settled = True
++
++    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
++        """IPC for a gather whose byte count fits, NCCL otherwise: decided by the byte count alone, which every rank's
++        matching call shares. A buffer that is not contiguous goes through a contiguous copy, and a send that
++        overlaps recv anywhere but at this rank's place in it through a copy of its own (local choices that never
++        change the transport)."""
++
++        n = send.numel() * send.element_size()
++        if not self.ipc.fits_bytes(n):
++            self.large += 1
++            self.nccl.all_gather(send, recv)
++            return
++        if recv.numel() != send.numel() * self.world or send.dtype != recv.dtype:
++            raise ValueError("all_gather: recv must hold world x send of the same dtype")
++        self.small += 1
++        s = send if send.is_contiguous() else send.contiguous()
++        r = recv if recv.is_contiguous() else torch.empty(recv.shape, dtype=recv.dtype, device=recv.device)
++        if _overlap(s, r) and s.data_ptr() != r.data_ptr() + self.rank * n:
++            s = s.clone()
++        if not self.settled and not torch.cuda.is_current_stream_capturing():
++            self.nccl.barrier()
++        self.ipc.all_gather(s, r)
++        if r is not recv:
++            recv.copy_(r)
++
++    def barrier(self) -> None:
++        self.nccl.barrier()
++
++    def check(self) -> None:
++        self.ipc.check()
++
++    def __getattr__(self, name):
++        if name in ("nccl", "ipc"):                  # not set yet (a failed construction): no recursion
++            raise AttributeError(name)
++        return getattr(self.nccl, name)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 0f4c08f..2d78a0b 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -473,7 +473,26 @@ class GlmEngine:
+         self.serial_only = serial_only
+         self.comm = comm if comm is not None else open_comm(rank, world, master, port)
+         self.comm.barrier()
+-        if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
++        transport = os.environ.get("TF_GLM_COMM", "nccl").strip().lower() or "nccl"
++        if transport not in ("nccl", "roce", "ipc"):
++            raise ValueError(f"TF_GLM_COMM: nccl, roce or ipc, not {transport!r}")
++        if comm is None and transport == "ipc":
++            # small all-gathers (a decode round's partials, the samplers, the messages) as one-shot CUDA IPC pushes
++            # between the GPUs of this host; without peer-to-peer access every rank says so and keeps NCCL
++            from tensorfold.cuda.ipc import IpcComm, IpcUnavailable
++
++            try:
++                self.comm = IpcComm(self.comm, rank, world)
++            except IpcUnavailable as exc:
++                if rank == 0:
++                    print(f"[tensorfold] TF_GLM_COMM=ipc: {exc}; every all-gather stays on NCCL", flush=True)
++            else:
++                if rank == 0:
++                    ipc = self.comm.ipc
++                    print(f"[tensorfold] all-gathers up to {ipc.max_bytes >> 10} KiB over CUDA IPC (one-shot "
++                          f"peer-to-peer push, blocks of {ipc.block_bytes >> 10} KiB x {ipc.threads} threads, wait "
++                          f"limit {ipc.timeout_ns / 1e9:g} s), larger ones over NCCL", flush=True)
++        if comm is None and transport == "roce":
+             # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
+             from tensorfold.cuda.roce import RoceComm
+ 

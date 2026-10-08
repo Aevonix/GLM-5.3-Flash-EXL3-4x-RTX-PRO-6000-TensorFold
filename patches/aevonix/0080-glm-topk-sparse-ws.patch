@@ -1,0 +1,319 @@
+diff --git tensorfold/families/glm5_next/cuda/sparse_topk.cu tensorfold/families/glm5_next/cuda/sparse_topk.cu
+index a3fd35f..9599061 100644
+--- tensorfold/families/glm5_next/cuda/sparse_topk.cu
++++ tensorfold/families/glm5_next/cuda/sparse_topk.cu
+@@ -15,7 +15,8 @@
+ //      positions by prefix counts.
+ // When bin b1 holds more than CAP pools (scores bunched, e.g. -inf rows), the low bits are resolved by two more
+ // reads (12 and 8 bits) and the row classified again; rows over 65,536 pools (no room for the bitmaps) take a final
+-// ordered read instead of the bitmaps. Every path gives the same pools: the set is defined by the order keys.
++// ordered read instead of the bitmaps. Every path gives the same pools: the set is defined by the order keys. Rows are
++// read 16 bytes at a time when every row starts on 16 bytes (NP a multiple of 4), else 4 bytes (patch 0290).
+ //
+ // Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
+ // the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab.
+@@ -108,6 +109,24 @@ __device__ __forceinline__ void find_bin(const unsigned* hist, int nbins, unsign
+     above = static_cast<unsigned>(*out_above);
+ }
+ 
++// V consecutive scores from pool i (zeros past NP, flagged): V = 4 takes 16-byte loads (every row 16-byte aligned:
++// NP a multiple of 4 and an aligned base), V = 1 any row.
++template <int V>
++__device__ __forceinline__ void load_v(const float* __restrict__ row, int i, int NP, float (&e)[V]) {
++    if constexpr (V == 4) {
++        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
++        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
++        e[0] = v.x;
++        e[1] = v.y;
++        e[2] = v.z;
++        e[3] = v.w;
++    } else {
++        static_assert(V == 1, "4- or 1-wide loads");
++        e[0] = i < NP ? row[i] : 0.f;
++    }
++}
++
++template <int V>
+ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restrict__ scores, int64_t* __restrict__ out,
+                                                            int NP) {
+     extern __shared__ __align__(16) unsigned char smem_raw[];
+@@ -117,7 +136,8 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+     int64_t* dst = out + static_cast<size_t>(blockIdx.x) * TK;
+     const int W = (NP + 31) / 32;
+     const bool bitmap = W <= MAXW;
+-    const int span = ((NP + THREADS * 4 - 1) / (THREADS * 4)) * (THREADS * 4);   // every lane runs every step
++    constexpr int STEP = THREADS * V;                // pools a step of the CTA
++    const int span = ((NP + STEP - 1) / STEP) * STEP;   // every lane runs every step
+ 
+     // 1. the histogram of the top 12 bits
+     for (int i = tid; i < NB; i += THREADS) sm.hist[i] = 0;
+@@ -126,13 +146,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+     if (tid == 0) sm.ccount = 0;
+     __syncthreads();
+ #pragma unroll 4
+-    for (int i = tid * 4; i < span; i += THREADS * 4) {               // (unrolled: several loads in flight)
+-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+-        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);       // NP % 4 == 0 (the caller checks)
+-        hist_add(sm.hist, order_key(v.x) >> 20, i < NP);
+-        hist_add(sm.hist, order_key(v.y) >> 20, i < NP);
+-        hist_add(sm.hist, order_key(v.z) >> 20, i < NP);
+-        hist_add(sm.hist, order_key(v.w) >> 20, i < NP);
++    for (int i = tid * V; i < span; i += STEP) {                      // (unrolled: several loads in flight)
++        float e[V];
++        load_v<V>(row, i, NP, e);
++#pragma unroll
++        for (int c = 0; c < V; ++c) hist_add(sm.hist, order_key(e[c]) >> 20, i + c < NP);
+     }
+     __syncthreads();
+     int b1;
+@@ -142,12 +160,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+ 
+     // 2. classify: above b1 selected; b1's keys kept as candidates
+ #pragma unroll 2
+-    for (int i = tid * 4; i < span; i += THREADS * 4) {
+-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+-        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
+-        const float e[4] = {v.x, v.y, v.z, v.w};
++    for (int i = tid * V; i < span; i += STEP) {
++        float e[V];
++        load_v<V>(row, i, NP, e);
+ #pragma unroll
+-        for (int c = 0; c < 4; ++c) {
++        for (int c = 0; c < V; ++c) {
+             const unsigned key = order_key(e[c]);
+             const int b = static_cast<int>(key >> 20);
+             const bool ok = i + c < NP;
+@@ -201,12 +218,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+     } else {                                         // bin b1 bunched: bits 19..8, then 7..0, from the row again
+         for (int i = tid; i < NB; i += THREADS) sm.hist[i] = 0;
+         __syncthreads();
+-        for (int i = tid * 4; i < span; i += THREADS * 4) {
+-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+-            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
+-            const float e[4] = {v.x, v.y, v.z, v.w};
++        for (int i = tid * V; i < span; i += STEP) {
++            float e[V];
++            load_v<V>(row, i, NP, e);
+ #pragma unroll
+-            for (int c = 0; c < 4; ++c) {
++            for (int c = 0; c < V; ++c) {
+                 const unsigned key = order_key(e[c]);
+                 hist_add(sm.hist, (key >> 8) & 4095u, i + c < NP && static_cast<int>(key >> 20) == b1);
+             }
+@@ -219,12 +235,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+         const unsigned pre = (static_cast<unsigned>(b1) << 12) | static_cast<unsigned>(d1);    // the key's top 24 bits
+         for (int i = tid; i < 256; i += THREADS) sm.hist[i] = 0;
+         __syncthreads();
+-        for (int i = tid * 4; i < span; i += THREADS * 4) {
+-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+-            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
+-            const float e[4] = {v.x, v.y, v.z, v.w};
++        for (int i = tid * V; i < span; i += STEP) {
++            float e[V];
++            load_v<V>(row, i, NP, e);
+ #pragma unroll
+-            for (int c = 0; c < 4; ++c) {
++            for (int c = 0; c < V; ++c) {
+                 const unsigned key = order_key(e[c]);
+                 hist_add(sm.hist, key & 255u, i + c < NP && (key >> 8) == pre);
+             }
+@@ -280,13 +295,12 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+         }
+     } else {                                         // no room for the bitmaps: the row once more, in order
+         unsigned done_sel = 0, done_tie = 0;         // over the previous steps (the same in every thread)
+-        for (int i = tid * 4; i < span; i += THREADS * 4) {
+-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+-            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
+-            const float e[4] = {v.x, v.y, v.z, v.w};
++        for (int i = tid * V; i < span; i += STEP) {
++            float e[V];
++            load_v<V>(row, i, NP, e);
+             unsigned s4 = 0, t4 = 0;
+ #pragma unroll
+-            for (int c = 0; c < 4; ++c) {
++            for (int c = 0; c < V; ++c) {
+                 const unsigned key = order_key(e[c]);
+                 const bool ok = i + c < NP;
+                 s4 |= (ok && key > thr) ? (1u << c) : 0u;
+@@ -298,7 +312,7 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+             unsigned seen = done_tie + tb;
+             unsigned pos = done_sel + sb + min(seen, need);
+ #pragma unroll
+-            for (int c = 0; c < 4; ++c) {
++            for (int c = 0; c < V; ++c) {
+                 const bool s = (s4 >> c) & 1u, t = (t4 >> c) & 1u;
+                 const bool take = s || (t && seen < need);
+                 if (t) ++seen;
+@@ -314,15 +328,25 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
+ 
+ int topk_rows_smem() { return static_cast<int>(sizeof(TkSmem)); }
+ 
+-void topk_rows_cuda(const at::Tensor& scores, at::Tensor& out) {
++template <int V>
++void topk_launch(const at::Tensor& scores, at::Tensor& out) {
+     const int R = static_cast<int>(scores.size(0)), NP = static_cast<int>(scores.size(1));
+     static bool configured = false;
+     if (!configured) {
+-        C10_CUDA_CHECK(cudaFuncSetAttribute(topk_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++        C10_CUDA_CHECK(cudaFuncSetAttribute(topk_rows_kernel<V>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             sizeof(TkSmem)));
+         configured = true;
+     }
+-    topk_rows_kernel<<<R, THREADS, sizeof(TkSmem), at::cuda::getCurrentCUDAStream()>>>(
++    topk_rows_kernel<V><<<R, THREADS, sizeof(TkSmem), at::cuda::getCurrentCUDAStream()>>>(
+         scores.data_ptr<float>(), out.data_ptr<int64_t>(), NP);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++// Any contiguous [R, NP >= 512] fp32 rows: 16-byte loads when every row starts on 16 bytes, else 4-byte loads
++void topk_rows_cuda(const at::Tensor& scores, at::Tensor& out) {
++    const bool v4 = scores.size(1) % 4 == 0 && reinterpret_cast<uintptr_t>(scores.data_ptr()) % 16 == 0;
++    if (v4)
++        topk_launch<4>(scores, out);
++    else
++        topk_launch<1>(scores, out);
++}
+diff --git tensorfold/families/glm5_next/cuda/sparse_ws.cpp tensorfold/families/glm5_next/cuda/sparse_ws.cpp
+index 80a37fb..3bd1475 100644
+--- tensorfold/families/glm5_next/cuda/sparse_ws.cpp
++++ tensorfold/families/glm5_next/cuda/sparse_ws.cpp
+@@ -37,13 +37,12 @@ void sparse_ws(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor&
+     sparse_ws_cuda(qa, cache, tokens, counts, out, rs, fp8, scale);
+ }
+ 
+-// scores [R, NP] fp32 (rows NP apart, NP a multiple of 4 and at least 512, 16-byte aligned) -> out [R, 512] int64:
+-// each row's 512 best pools (order keys, ties to the lower pool), ascending: _select_rows' output (sparse_topk.cu).
++// scores [R, NP] fp32 (contiguous rows, NP at least 512) -> out [R, 512] int64: each row's 512 best pools (order keys,
++// ties to the lower pool), ascending: _select_rows' output (sparse_topk.cu).
+ void topk_rows(const at::Tensor& scores, at::Tensor& out) {
+     TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == at::kFloat && scores.dim() == 2 && scores.is_contiguous(),
+                 "topk_rows: contiguous fp32 scores [R, NP]");
+-    TORCH_CHECK(scores.size(1) >= 512 && scores.size(1) % 4 == 0 &&
+-                reinterpret_cast<uintptr_t>(scores.data_ptr()) % 16 == 0, "topk_rows: rows of 4 x n >= 512, aligned");
++    TORCH_CHECK(scores.size(1) >= 512 && scores.size(1) <= (1LL << 30), "topk_rows: rows of 512 pools or more");
+     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kLong && out.dim() == 2 && out.size(0) == scores.size(0) &&
+                 out.size(1) == 512 && out.is_contiguous(), "topk_rows: out [R, 512] int64");
+     if (scores.size(0) == 0) return;
+diff --git tensorfold/families/glm5_next/cuda/sparse_ws.cu tensorfold/families/glm5_next/cuda/sparse_ws.cu
+index d34a9f0..412d3f0 100644
+--- tensorfold/families/glm5_next/cuda/sparse_ws.cu
++++ tensorfold/families/glm5_next/cuda/sparse_ws.cu
+@@ -9,8 +9,8 @@
+ //     the query scale and the mask past the row's count, and hands the 16 x 32 tile to the PV warps (shared memory);
+ //   - four PV warps each own 128 output columns: the tile's softmax (every PV warp computes the whole tile's, from
+ //     the scores), the rescale of their output columns and the PV product over those columns, and they gather the
+-//     tiles ahead (each its 128-column slice of the 32 key rows; fp8 codes widened to bf16 as _sparse_onepass widens
+-//     them) into one of two tile buffers.
++//     tiles ahead (each its 128-column slice of the 32 key rows; fp8 codes widened to the bf16 values _sparse_onepass
++//     widens them to, by integer ops and one exact multiply: e4m3x4_bf16) into one of two tile buffers.
+ // So the scores of tile p + 1 are computed while the PV warps run tile p, nothing is computed twice, and the query is
+ // loaded from memory once a row. mbarriers order the two roles (tile full, scores full, scores consumed).
+ //
+@@ -158,14 +158,21 @@ __device__ __forceinline__ float shfl_xor(float v, int m) {
+     return d;
+ }
+ 
+-// Two e4m3 codes (the low byte first) -> bf16x2, by _sparse_onepass' own instructions (exact: e4m3 fits f16 and bf16)
+-__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t pair) {
+-    uint32_t d;
+-    const uint16_t h = static_cast<uint16_t>(pair);
+-    asm("{\n .reg .b32 a;\n .reg .f16 a0, a1;\n .reg .b16 b0, b1;\n cvt.rn.f16x2.e4m3x2 a, %1;\n mov.b32 {a0, a1}, a;\n"
+-        " cvt.bf16.f16 b0, a0;\n cvt.bf16.f16 b1, a1;\n mov.b32 %0, {b0, b1};\n}"
+-        : "=r"(d) : "h"(h));
+-    return d;
++// Four e4m3 codes (byte k of w) -> two bf16x2 words ((c0, c1), (c2, c3)), with the bits _sparse_onepass' conversion
++// gives (cvt.rn.f16x2.e4m3x2 then cvt.bf16.f16: both exact) for every code a cache holds (patch 0291).
++// The reference's conversion instructions run on the GPU's conversion pipe (F2FP / F2F, about 16 results a clock an
++// SM), which a tile's 16,384 codes hold for ~1,000+ cycles; here integer ops place each code's bits in a bf16 whose
++// value is the code's times 2^-120 (sign to bit 15, exponent field e, mantissa bits m << 4: an e4m3 subnormal lands on
++// a bf16 subnormal), and one packed bf16 multiply by 2^120 scales it back: a power of two, no rounding, the code's
++// exact value. NaN codes (0x7F, 0xFF) differ, and a cache never holds them: kv8 writes codes within +-256 (0x78).
++__device__ __forceinline__ void e4m3x4_bf16(uint32_t w, uint32_t& lo, uint32_t& hi) {
++    const uint32_t L = (w << 4) & 0xF0F0F0F0u;                         // byte k: c_k's e0 m2 m1 m0 0 0 0 0
++    const uint32_t H = ((w >> 4) & 0x07070707u) | (w & 0x80808080u);   // byte k: c_k's s 0 0 0 0 e3 e2 e1
++    const uint32_t p0 = __byte_perm(L, H, 0x5140);                     // (c0, c1) as bf16x2 bits, x 2^-120
++    const uint32_t p1 = __byte_perm(L, H, 0x7362);                     // (c2, c3)
++    // x 2^120 (bf16 0x7B80); the -0 addend keeps a product's zero sign
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(lo) : "r"(p0), "r"(0x7B807B80u), "r"(0x80008000u));
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(hi) : "r"(p1), "r"(0x7B807B80u), "r"(0x80008000u));
+ }
+ 
+ __device__ __forceinline__ uint4 ldg16(const void* p) {
+@@ -293,14 +300,10 @@ __device__ __forceinline__ void slice_store(const Slice<FP8>& s, Smem& sm, uint3
+         if (FP8) {
+             const int row = (lane >> 3) + 4 * i, c = lane & 7;          // 16 codes -> two 16-byte bf16 chunks
+             uint4 lo, hi;
+-            lo.x = e4m3x2_bf16x2(s.v[i].x);
+-            lo.y = e4m3x2_bf16x2(s.v[i].x >> 16);
+-            lo.z = e4m3x2_bf16x2(s.v[i].y);
+-            lo.w = e4m3x2_bf16x2(s.v[i].y >> 16);
+-            hi.x = e4m3x2_bf16x2(s.v[i].z);
+-            hi.y = e4m3x2_bf16x2(s.v[i].z >> 16);
+-            hi.z = e4m3x2_bf16x2(s.v[i].w);
+-            hi.w = e4m3x2_bf16x2(s.v[i].w >> 16);
++            e4m3x4_bf16(s.v[i].x, lo.x, lo.y);
++            e4m3x4_bf16(s.v[i].y, lo.z, lo.w);
++            e4m3x4_bf16(s.v[i].z, hi.x, hi.y);
++            e4m3x4_bf16(s.v[i].w, hi.z, hi.w);
+             sts16(chunk_addr(tb, row, 16 * j + 2 * c), lo);
+             sts16(chunk_addr(tb, row, 16 * j + 2 * c + 1), hi);
+         } else {
+diff --git tensorfold/families/glm5_next/cuda/topk_fast.py tensorfold/families/glm5_next/cuda/topk_fast.py
+index f5967c8..161a65c 100644
+--- tensorfold/families/glm5_next/cuda/topk_fast.py
++++ tensorfold/families/glm5_next/cuda/topk_fast.py
+@@ -9,7 +9,9 @@ call of a process compares it with _select_rows byte for byte (rows of normal, t
+ scores, 1,024 to 131,072 pools); a difference turns the setting off for the process and _select_rows runs.
+ TF_GLM_TOPK_FAST_CHECK=1 compares every call (a test setting).
+ 
+-Applies to prompt chunks' rows (``PromptSelect.pools``): contiguous fp32 rows of at least 512 pools, a multiple of 4.
++Applies to prompt chunks' rows (``PromptSelect.pools``): contiguous fp32 rows of at least 512 pools, any length and
++alignment (16-byte loads when every row starts on 16 bytes, else 4-byte ones: patch 0290). ``launch`` runs the
++reference (``top_pools``) for anything else and says so once a kind of shape, so a call never fails on its shape.
+ 
+ Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
+ the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
+@@ -36,12 +38,28 @@ _decided: bool | None = None
+ 
+ 
+ def applies(scores: torch.Tensor) -> bool:
++    """The kernel's shapes: contiguous fp32 [R, NP] rows on the GPU, NP from 512 to 2^30 (any alignment)."""
+     return (scores.is_cuda and scores.dtype == torch.float32 and scores.dim() == 2 and scores.is_contiguous()
+-            and scores.shape[1] >= K and scores.shape[1] % 4 == 0 and scores.data_ptr() % 16 == 0)
++            and K <= scores.shape[1] <= 1 << 30)
++
++
++_FELL_BACK: set = set()
+ 
+ 
+ def launch(scores: torch.Tensor) -> torch.Tensor:
+-    """The rows' 512 best pools, ascending (int64 [R, 512]): _select_rows' output."""
++    """The rows' 512 best pools, ascending (int64 [R, 512]): _select_rows' output. A shape the kernel does not take
++    runs the reference (``sparse.top_pools``) with one line a kind of shape; it never raises on a shape."""
++    if not applies(scores):
++        why = (str(scores.device.type), str(scores.dtype), scores.dim(), bool(scores.is_contiguous()),
++               scores.shape[-1] >= K if scores.dim() else False)
++        if why not in _FELL_BACK:
++            _FELL_BACK.add(why)
++            print(f"[tensorfold] fast top-512 pools: scores {tuple(scores.shape)} {scores.dtype} "
++                  f"{'contiguous' if scores.is_contiguous() else 'strided'}: not the kernel's shape, the reference "
++                  "runs", flush=True)
++        from . import sparse
++
++        return sparse.top_pools(scores, K)
+     from .attn_fast import _ws
+ 
+     out = torch.empty((scores.shape[0], K), dtype=torch.int64, device=scores.device)
+@@ -61,8 +79,10 @@ def reference(scores: torch.Tensor) -> torch.Tensor:
+ def self_check(device) -> bool:
+     """The kernel against _select_rows on rows of every kind and length, byte for byte."""
+     gen = torch.Generator(device=device).manual_seed(199)
+-    for NP in (1024, 4096, 25600, 32768, 65536, 70656, 131072):
+-        R = 64 if NP <= 32768 else 16
++    # the engine's pool counts (multiples of 1,024; the capacity when a prompt reaches it: any count), rows of 16-byte
++    # and 4-byte alignment, 1 to 64 rows
++    for NP in (512, 1024, 4096, 4226, 25600, 25601, 32768, 65536, 65537, 70656, 131072, 131075):
++        R = (64 if NP <= 32768 else 16) - (NP % 4)
+         rows = []
+         base = torch.randn((R, NP), device=device, generator=gen)
+         rows.append(base)                                                       # distinct scores

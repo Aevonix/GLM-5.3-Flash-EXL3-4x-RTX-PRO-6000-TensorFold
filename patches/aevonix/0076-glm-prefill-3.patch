@@ -1,0 +1,3182 @@
+diff --git tensorfold/cuda/kernels/qmm.py tensorfold/cuda/kernels/qmm.py
+index 1750521..1209269 100644
+--- tensorfold/cuda/kernels/qmm.py
++++ tensorfold/cuda/kernels/qmm.py
+@@ -247,6 +247,12 @@ def prefill_matmul(x: torch.Tensor, q: Q4, *, f32: bool = False, tile: int = 0,
+         x = x.clone(memory_format=torch.contiguous_format)
+     if out is None:
+         out = torch.empty((x.shape[0], q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    if tile >= 32:                       # qmm_prefill2's variants (patch 0195): the same bits, once checked here
++        from . import qmm_prefill2
++
++        if qmm_prefill2.matmul(x, q, f32, out, tile):
++            return out
++        tile = 0
+     _ext().qmm_prefill(x, q.weight, q.scales, q.biases, out, q.n, q.gs, f32, tile)
+     return out
+ 
+diff --git tensorfold/cuda/kernels/qmm_prefill2.cpp tensorfold/cuda/kernels/qmm_prefill2.cpp
+new file mode 100644
+index 0000000..3708c2a
+--- /dev/null
++++ tensorfold/cuda/kernels/qmm_prefill2.cpp
+@@ -0,0 +1,38 @@
++// Bindings of qmm_prefill2.cu: more launch configurations of the 4-bit prompt matmul, qmm_prefill's bits.
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++#include <vector>
++
++void qmm_prefill2_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++                       at::Tensor& out, int N, bool f32, int variant);
++int qmm_prefill2_variants();
++std::vector<int64_t> qmm_prefill2_tiles(int64_t variant, int64_t M, int64_t N, int64_t K, int64_t resident);
++
++// qmm_prefill's checks (groups of 64 only), then variant ``variant`` (0 .. variants() - 1).
++void qmm_prefill2(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++                  at::Tensor& out, int64_t n, int64_t gs, bool f32, int64_t variant) {
++    TORCH_CHECK(gs == 64, "qmm_prefill2: groups of 64");
++    TORCH_CHECK(variant >= 0 && variant < qmm_prefill2_variants(), "qmm_prefill2: no such variant");
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
++                x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M, K) bf16 with contiguous rows");
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
++                "x rows must start on 16-byte boundaries");
++    const int64_t m = x.size(0), k = x.size(1), kg = k / gs, npad = (n + 127) / 128 * 128;
++    TORCH_CHECK(k % gs == 0, "K splits into whole groups");
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt && w.numel() == npad * k / 8,
++                "packed weight does not match n and K");
++    TORCH_CHECK(scales.is_contiguous() && biases.is_contiguous() && scales.scalar_type() == at::kBFloat16 &&
++                biases.scalar_type() == at::kBFloat16 && scales.size(0) == kg && scales.size(1) == npad &&
++                biases.sizes() == scales.sizes(), "scales and biases: (K / gs, n padded to 128) bf16");
++    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == m && out.size(1) == n &&
++                out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
++    c10::cuda::CUDAGuard guard(x.device());
++    qmm_prefill2_cuda(x, w, scales, biases, out, static_cast<int>(n), f32, static_cast<int>(variant));
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("qmm_prefill2", &qmm_prefill2);
++    m.def("variants", &qmm_prefill2_variants);
++    m.def("tiles", &qmm_prefill2_tiles);
++}
+diff --git tensorfold/cuda/kernels/qmm_prefill2.cu tensorfold/cuda/kernels/qmm_prefill2.cu
+new file mode 100644
+index 0000000..134afb3
+--- /dev/null
++++ tensorfold/cuda/kernels/qmm_prefill2.cu
+@@ -0,0 +1,369 @@
++// More launch configurations of the 4-bit prompt matmul (qmm_prefill.cu), every output with qmm_prefill's bits.
++//
++// qmm_prefill computes each output as one chain of m16n8k16 bf16 tensor-core steps over K in order (a 64-input group
++// at a time, its four k16 steps in order), its A fragments by ldmatrix from row-major inputs, its B fragments the
++// weights w = bf16(fma(q, s, b)) decoded from the packed nibbles by pair() and one fma.rn.bf16x2, from a zero
++// accumulator; the epilogue rounds once (bf16) or not at all (fp32). Which CTA, warp or stage computes an output, and
++// how many outputs a CTA holds, never enter that chain. The kernels here keep that per-output code verbatim (the same
++// loads into the same shared-memory layouts, fragments, pair(), fma2() and mma() calls in the same order) and change
++// only what does not touch it:
++//   - the CTA tile and warp tile (16 to 256 rows, 64 to 256 columns; 4 or 8 warps; the 16- and 32-row tiles give a
++//     prompt piece of a few hundred rows enough CTAs: patch 0197),
++//   - the pipeline: stages in flight and 64-input groups a stage (one barrier a stage),
++//   - a tail split: the columns that would make a last, mostly idle wave of CTAs are covered by a smaller tile in the
++//     same launch (the grid's last CTAs), so the GPU's SMs finish together; an output is still computed by exactly one
++//     CTA, with its own chain,
++//   - fp32 outputs stored as pairs (the same values).
++// tests/k5/test_q4p2_cpu.py compares the per-group code with qmm_prefill's as text and checks that every launch covers
++// every output once; the engine compares outputs byte for byte on the GPU before it uses a variant (qmm_prefill2.py).
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <vector>
++
++#include "qmm_frag.cuh"
++
++namespace {
++
++using namespace qmm_frag;
++
++constexpr int GS = 64;                     // inputs a group (the scales' and biases' group)
++constexpr int ROW = GS * 2;                // bytes of one input row's group
++constexpr int CHUNKS = ROW / 16;
++constexpr int TILE_BYTES = 64 * GS / 2;    // one stored 64-column tile's group block of packed weights
++
++template <int BM_, int BN_, int WM_, int WN_>
++struct Tile {
++    static constexpr int BM = BM_, BN = BN_, WM = WM_, WN = WN_;
++    static constexpr int THREADS = WM * WN * 32;
++    static constexpr int MT = BM / WM / 16;         // m16 tiles a warp
++    static constexpr int NT = BN / WN / 8;          // n8 tiles a warp
++    static constexpr int X = BM * ROW;              // a group's inputs,
++    static constexpr int W = BN * GS / 2;           // weights,
++    static constexpr int S = BN * 2;                // scales and biases (bf16)
++    static constexpr int GROUP = X + W + 2 * S;     // a group's bytes in a stage
++    static_assert(BM % (WM * 16) == 0 && BN % (WN * 8) == 0 && BN % 64 == 0, "tile shape");
++};
++
++__device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
++    uint32_t d;
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
++    return d;
++}
++
++// One CTA tile at (m0, n0): qmm_prefill's prefill_kernel body with GPS groups a stage.
++template <class T, int THREADS, int STAGES, int GPS, bool F32>
++__device__ __forceinline__ void run_tile(const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w,
++                                         const __nv_bfloat16* __restrict__ scales,
++                                         const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int M,
++                                         int N, int K, int npad, int ldx, int m0, int n0, bool pairs,
++                                         unsigned char* buf) {
++    static_assert(T::THREADS == THREADS, "a launch's tiles share its warps");
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / T::WN, wn = warp % T::WN;
++    const int KG = K / GS;
++    const int per = (KG + GPS - 1) / GPS;            // stages of GPS groups (the last may hold fewer)
++
++    auto stage = [&](int s) { return buf + s * (GPS * T::GROUP); };
++    // groups st * GPS .. of stage st into buffer s: qmm_prefill's load() for each, one after the other
++    auto load = [&](int s, int st) {
++#pragma unroll
++        for (int u = 0; u < GPS; ++u) {
++            const int g = st * GPS + u;
++            if (g >= KG) break;
++            unsigned char* p = stage(s) + u * T::GROUP;
++            for (int c = tid; c < T::BM * CHUNKS; c += THREADS) {
++                const int r = c / CHUNKS, ch = c % CHUNKS;
++                const int row = min(m0 + r, M - 1);
++                cp16z(p + r * ROW + swz<CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
++                      m0 + r < M);
++            }
++            unsigned char* pw = p + T::X;
++            for (int c = tid; c < T::W / 16; c += THREADS) {
++                const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
++                const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
++                if (n0 + t * 64 < npad)                   // a wide block's last tiles may pass the padded columns
++                    cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
++            }
++            unsigned char* ps = pw + T::W;
++            for (int c = tid; c < 2 * (T::S / 16); c += THREADS) {
++                const int which = c / (T::S / 16), off = c % (T::S / 16);
++                const __nv_bfloat16* src = (which ? biases : scales) + static_cast<size_t>(g) * npad + n0 + off * 8;
++                if (n0 + off * 8 < npad) cp16(ps + which * T::S + off * 16, src);
++            }
++        }
++    };
++
++    float acc[T::MT][T::NT][4];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++#pragma unroll
++    for (int s = 0; s < STAGES - 1; ++s) {
++        if (s < per) load(s, s);
++        commit();
++    }
++    for (int it = 0; it < per; ++it) {
++        wait<STAGES - 2>();
++        __syncthreads();
++        const int next = it + STAGES - 1;
++        if (next < per) load(next % STAGES, next);
++        commit();
++#pragma unroll
++        for (int u = 0; u < GPS; ++u) {
++            if (it * GPS + u >= KG) break;
++            // one group: qmm_prefill's compute, verbatim
++            const unsigned char* p = stage(it % STAGES) + u * T::GROUP;
++            const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
++            const uint16_t* ps = reinterpret_cast<const uint16_t*>(p + T::X + T::W);
++            uint32_t words[T::NT][GS / 32], sv[T::NT], bv[T::NT];
++#pragma unroll
++            for (int j = 0; j < T::NT; ++j) {
++#pragma unroll
++                for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                const int col = wn * (T::BN / T::WN) + j * 8 + (lane >> 2);         // this lane's B-fragment column
++                sv[j] = ps[col] * 0x10001u;                                         // (s, s) and (b, b) as bf16 pairs
++                bv[j] = ps[T::BN + col] * 0x10001u;
++            }
++#pragma unroll
++            for (int kt = 0; kt < GS / 16; ++kt) {
++                uint32_t a[T::MT][4];
++#pragma unroll
++                for (int i = 0; i < T::MT; ++i) {
++                    const int r = wm * (T::BM / T::WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                    const int ch = kt * 2 + (lane >> 4);
++                    ldmatrix4(a[i], p + r * ROW + swz<CHUNKS>(r, ch) * 16);
++                }
++#pragma unroll
++                for (int j = 0; j < T::NT; ++j) {
++                    const uint32_t b0 = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
++                    const uint32_t b1 = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
++#pragma unroll
++                    for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
++                }
++            }
++        }
++    }
++    wait<0>();
++    __syncthreads();
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const int col = n0 + wn * (T::BN / T::WN) + j * 8 + (lane & 3) * 2;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int row = m0 + wm * (T::BM / T::WM) + i * 16 + (lane >> 2) + h * 8;
++                if (row >= M) continue;
++                const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
++                if (F32) {
++                    float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
++                    if (pairs && col + 1 < N) {
++                        *reinterpret_cast<float2*>(dst) = make_float2(v0, v1);        // the same two values
++                    } else {
++                        if (col < N) dst[0] = v0;
++                        if (col + 1 < N) dst[1] = v1;
++                    }
++                } else {
++                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col + 1 < N && (N & 1) == 0)
++                        *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++                    else {
++                        if (col < N) dst[0] = __float2bfloat16_rn(v0);
++                        if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
++                    }
++                }
++            }
++        }
++}
++
++// Block b's (first row, first column) over an M x N region of BM x BN tiles: qmm_frag's tile_of, host and device (the
++// host side lists a launch's tiles for the coverage test).
++__host__ __device__ __forceinline__ int2 tile_at(int b, int M, int N, int BM, int BN, int group) {
++    const int rows_t = (M + BM - 1) / BM, cols_t = (N + BN - 1) / BN, band = group * cols_t;
++    const int first = b / band * group, in_band = b % band;
++    const int height = group < rows_t - first ? group : rows_t - first;
++    return make_int2((first + in_band % height) * BM, in_band / height * BN);
++}
++
++// The launch: CTAs 0 .. nbig - 1 take Big tiles over columns [0, cbig), the rest Small tiles over [cbig, N).
++template <class Big, class Small, int STAGES, int GPS, bool F32>
++__global__ void __launch_bounds__(Big::THREADS) prefill2_kernel(
++        const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
++        const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int M, int N, int K, int npad, int ldx,
++        int nbig, int cbig, int gbig, int gsmall, int pairs) {
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int b = blockIdx.x;
++    if (b < nbig) {
++        const int2 at = tile_at(b, M, cbig, Big::BM, Big::BN, gbig);
++        run_tile<Big, Big::THREADS, STAGES, GPS, F32>(x, w, scales, biases, out, M, N, K, npad, ldx, at.x, at.y,
++                                                      pairs != 0, buf);
++    } else {
++        const int2 at = tile_at(b - nbig, M, N - cbig, Small::BM, Small::BN, gsmall);
++        run_tile<Small, Big::THREADS, STAGES, GPS, F32>(x, w, scales, biases, out, M, N, K, npad, ldx, at.x,
++                                                        cbig + at.y, pairs != 0, buf);
++    }
++}
++
++int l2_group(int rows_t, int BM, int K) {
++    // a group's inputs stay near 12 MB of L2 while its blocks sweep the column tiles (qmm_prefill's rule)
++    return std::max(1, std::min(rows_t, static_cast<int>((12LL << 20) / (static_cast<long long>(BM) * K * 2))));
++}
++
++struct Plan {
++    int nbig, cbig, nsmall, gbig, gsmall;
++};
++
++// The tail split (speed only): Big tiles over the most columns that fill whole waves of resident CTAs, Small tiles
++// over the rest; with split false (or no whole wave, or nothing left over) the whole width at one tile size.
++Plan plan(int bBM, int bBN, int sBM, int sBN, int M, int N, int K, int resident, bool split) {
++    const int rows_b = (M + bBM - 1) / bBM, cols_b = (N + bBN - 1) / bBN;
++    Plan p{rows_b * cols_b, N, 0, l2_group(rows_b, bBM, K), 1};
++    if (!split || resident < 1) return p;
++    const long long total = static_cast<long long>(rows_b) * cols_b;
++    const long long waves = total / resident;
++    const int cols = waves > 0 ? static_cast<int>(std::min<long long>(cols_b, waves * resident / rows_b)) : 0;
++    if (cols >= cols_b) return p;                     // whole waves already
++    const int cbig = cols * bBN;
++    const int rows_s = (M + sBM - 1) / sBM, cols_s = (N - cbig + sBN - 1) / sBN;
++    p.nbig = rows_b * cols;
++    p.cbig = cbig;
++    p.nsmall = rows_s * cols_s;
++    p.gsmall = l2_group(rows_s, sBM, K);
++    return p;
++}
++
++template <class Big, class Small, int STAGES, int GPS, bool F32>
++void launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++            at::Tensor& out, int N, bool split) {
++    constexpr int SMEM = STAGES * GPS * (Big::GROUP > Small::GROUP ? Big::GROUP : Small::GROUP);
++    const int M = x.size(0), K = x.size(1);
++    auto kernel = prefill2_kernel<Big, Small, STAGES, GPS, F32>;
++    static int resident = -1;                          // CTAs an SM holds (this kernel, this device: one per process)
++    if (resident < 0) {
++        int per_sm = 0, sms = 0, dev = 0, optin = 0;
++        cudaGetDevice(&dev);
++        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
++        TORCH_CHECK(SMEM <= optin, "qmm_prefill2: this variant needs ", SMEM, " bytes of shared memory a block, the GPU "
++                    "allows ", optin);
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
++        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
++        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, Big::THREADS, SMEM));
++        resident = std::max(0, per_sm) * sms;
++    }
++    const Plan p = plan(Big::BM, Big::BN, Small::BM, Small::BN, M, N, K, resident, split);
++    const bool pairs = reinterpret_cast<uintptr_t>(out.data_ptr()) % 8 == 0 && (N & 1) == 0;
++    kernel<<<p.nbig + p.nsmall, Big::THREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const uint32_t*>(w.data_ptr()),
++        reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr()),
++        reinterpret_cast<const __nv_bfloat16*>(biases.data_ptr()), out.data_ptr(), M, N, K,
++        static_cast<int>(scales.size(1)), M == 1 ? K : static_cast<int>(x.stride(0)), p.nbig, p.cbig, p.gbig,
++        p.gsmall, pairs ? 1 : 0);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template <class Big, class Small, int STAGES, int GPS>
++void launch_any(const at::Tensor& x, const at::Tensor& w, const at::Tensor& s, const at::Tensor& b, at::Tensor& out,
++                int N, bool f32, bool split) {
++    if (f32) launch<Big, Small, STAGES, GPS, true>(x, w, s, b, out, N, split);
++    else launch<Big, Small, STAGES, GPS, false>(x, w, s, b, out, N, split);
++}
++
++using T128 = Tile<128, 128, 2, 2>;     // qmm_prefill's tiles 5, 6, 9: 64 x 64 a warp, four warps
++using T64 = Tile<64, 64, 2, 2>;        // 32 x 32 a warp
++using T64x128 = Tile<64, 128, 2, 2>;   // 32 x 64 a warp
++using T128x64 = Tile<128, 64, 2, 2>;   // 64 x 32 a warp
++using T64x256 = Tile<64, 256, 1, 4>;   // 64 x 64 a warp, each warp its own 64 columns (no shared weight decode)
++using W128x256 = Tile<128, 256, 2, 4>; // eight warps, 64 x 64 each
++using W64x128 = Tile<64, 128, 2, 4>;   // eight warps, 32 x 32 each
++using W256x128 = Tile<256, 128, 4, 2>; // eight warps, 64 x 64 each
++using W128x64 = Tile<128, 64, 4, 2>;   // eight warps, 32 x 32 each
++// patch 0197: tiles for calls of a few hundred rows (a prompt chunk's 256-row pieces, the index split's 512-row blocks),
++// where 128-row tiles leave most SMs idle (a 1,024-column projection of 256 rows: 8 CTAs of 128 x 256 on 188 SMs)
++using S16x64 = Tile<16, 64, 1, 4>;     // 16 x 16 a warp
++using S16x128 = Tile<16, 128, 1, 4>;   // 16 x 32 a warp
++using S32x64 = Tile<32, 64, 1, 4>;     // 32 x 16 a warp
++using S32x128 = Tile<32, 128, 1, 4>;   // 32 x 32 a warp
++using S32x256 = Tile<32, 256, 1, 4>;   // 32 x 64 a warp, each warp its own 64 columns
++using S64x64 = Tile<64, 64, 1, 4>;     // 64 x 16 a warp (qmm_prefill's tile 3)
++
++} // namespace
++
++// The variants, one list for the launches and the table below (a launch table names variant v as tile 32 + v):
++// id, Big tile, Small tile (the tail's; the Big one when there is no split), tail split, stages, groups a stage.
++#define Q4P2_VARIANTS(X)                                                                                              \
++    X(0, T128, T128, 0, 2, 1)         /* tile 9's launch, fp32 outputs stored as pairs */                            \
++    X(1, T128, T64, 1, 2, 1)          /* + tail split, 64 x 64 tail tiles */                                         \
++    X(2, T128, T128x64, 1, 2, 1)      /* + tail split, 128 x 64 tail tiles */                                        \
++    X(3, T128, T128, 0, 2, 2)         /* two groups a stage (one barrier for 128 inputs) */                          \
++    X(4, T128, T64, 1, 2, 2)                                                                                          \
++    X(5, T128, T128, 0, 3, 1)         /* three stages */                                                             \
++    X(6, T128, T64, 1, 3, 1)                                                                                          \
++    X(7, T64x128, T64, 1, 3, 1)                                                                                       \
++    X(8, T64, T64, 0, 4, 1)                                                                                           \
++    X(9, T128x64, T64, 1, 3, 1)                                                                                       \
++    X(10, T64x256, T64x256, 0, 2, 1)  /* 4 warps side by side: each decodes only its own weights */                  \
++    X(11, T64x256, T64x256, 0, 3, 1)                                                                                  \
++    X(12, W128x256, W64x128, 1, 2, 1) /* eight warps */                                                              \
++    X(13, W128x256, W64x128, 1, 3, 1)                                                                                 \
++    X(14, W256x128, W128x64, 1, 2, 1)                                                                                 \
++    X(15, T64x256, T64, 1, 2, 1)      /* 4 warps side by side + 64 x 64 tail split */                                \
++    X(16, S32x64, S32x64, 0, 4, 1)    /* patch 0197: 16- and 32-row tiles for calls of a few hundred rows */         \
++    X(17, S32x128, S32x128, 0, 4, 1)                                                                                  \
++    X(18, S16x64, S16x64, 0, 4, 1)                                                                                    \
++    X(19, S16x128, S16x128, 0, 4, 1)                                                                                  \
++    X(20, S32x256, S32x256, 0, 3, 1)                                                                                  \
++    X(21, S32x64, S32x64, 0, 6, 1)    /* six stages: a long K on small tiles */                                      \
++    X(22, S64x64, S32x64, 1, 4, 1)    /* 64 x 64 + 32 x 64 tail split */                                             \
++    X(23, T64x128, S32x64, 1, 3, 1)   /* 64 x 128 + 32 x 64 tail split */
++
++struct VariantInfo {
++    int bBM, bBN, sBM, sBN, split, stages, gps, threads;
++};
++#define Q4P2_INFO(id, B, S, split, stages, gps) {B::BM, B::BN, S::BM, S::BN, split, stages, gps, B::THREADS},
++constexpr VariantInfo VARIANTS[] = {Q4P2_VARIANTS(Q4P2_INFO)};
++#undef Q4P2_INFO
++constexpr int NVARIANTS = sizeof(VARIANTS) / sizeof(VARIANTS[0]);
++int qmm_prefill2_variants() { return NVARIANTS; }
++
++// The tiles a launch of ``variant`` covers for an (M, N, K) matmul with ``resident`` CTAs a GPU: [nbig, cbig, nsmall,
++// then (first row, first column, rows, columns) a CTA in launch order] (the coverage test reads it; no GPU needed).
++std::vector<int64_t> qmm_prefill2_tiles(int64_t variant, int64_t M, int64_t N, int64_t K, int64_t resident) {
++    TORCH_CHECK(variant >= 0 && variant < NVARIANTS, "qmm_prefill2: no such variant");
++    const VariantInfo& v = VARIANTS[variant];
++    const Plan p = plan(v.bBM, v.bBN, v.sBM, v.sBN, M, N, K, static_cast<int>(resident), v.split != 0);
++    std::vector<int64_t> out{p.nbig, p.cbig, p.nsmall};
++    for (int b = 0; b < p.nbig + p.nsmall; ++b) {
++        int2 at;
++        int bm, bn;
++        if (b < p.nbig) {
++            at = tile_at(b, M, p.cbig, v.bBM, v.bBN, p.gbig);
++            bm = v.bBM, bn = v.bBN;
++        } else {
++            at = tile_at(b - p.nbig, M, N - p.cbig, v.sBM, v.sBN, p.gsmall);
++            at.y += p.cbig;
++            bm = v.sBM, bn = v.sBN;
++        }
++        out.insert(out.end(), {at.x, at.y, bm, bn});
++    }
++    return out;
++}
++
++void qmm_prefill2_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++                       at::Tensor& out, int N, bool f32, int variant) {
++    switch (variant) {
++#define Q4P2_CASE(id, B, S, split, stages, gps)                                                                       \
++    case id: launch_any<B, S, stages, gps>(x, w, scales, biases, out, N, f32, split != 0); break;
++        Q4P2_VARIANTS(Q4P2_CASE)
++#undef Q4P2_CASE
++        default: TORCH_CHECK(false, "qmm_prefill2: no such variant");
++    }
++}
+diff --git tensorfold/cuda/kernels/qmm_prefill2.py tensorfold/cuda/kernels/qmm_prefill2.py
+new file mode 100644
+index 0000000..3f13218
+--- /dev/null
++++ tensorfold/cuda/kernels/qmm_prefill2.py
+@@ -0,0 +1,141 @@
++"""More launch configurations of the 4-bit prompt matmul (patch 0195, qmm_prefill2.cu), every output with qmm_prefill's
++bits: other CTA and warp tiles, deeper pipelines, two 64-input groups a stage, and a tail split that covers the columns
++of a last, mostly idle wave of CTAs with smaller tiles in the same launch (a prompt lane of 2,048 rows leaves 30-65% of
++the GPU idle in its last wave with 128 x 128 tiles on most of GLM-5.3-Flash's TP4 shapes), and (patch 0197) 16- and
++32-row tiles for calls of a few hundred rows (a prompt chunk's 256-row pieces: a 1,024-column projection runs 8 CTAs of
++128 x 256 on 188 SMs).
++
++Why the bits are qmm_prefill's: every output is one chain of m16n8k16 tensor-core steps over K in order, from the
++same fragments (the same shared-memory layouts, the same pair() / fma.rn.bf16x2 weight decode), rounded once in the
++same epilogue; the per-group code is qmm_prefill's verbatim (tests/k5/test_q4p2_cpu.py compares the text), and the
++accumulator chains are fixed by data dependence whatever the tile, stage or warp. What changes is only which CTA
++computes an output and when its inputs arrive.
++
++How it is chosen: a launch table (TF_GLM_TUNE, kernel q4_prefill) names variant v as tile 32 + v, per weight shape and
++row bucket; tools/glm_autotune.py offers them beside the stock tiles 0-11 and keeps one only if its outputs equal the
++stock tile's bit for bit at every tested row count. On the GPU, the first call of each variant for a weight shape and
++output type also compares it with the stock tile 0 byte for byte (the call's own weights; random inputs over a wide
++range of magnitudes at the call's rows and at 1 and 777 rows); a difference turns that variant off for that shape
++for the process (a line says so) and the stock tile runs. Groups of 64 only (other groups run the stock tiles).
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++BASE = 32            # a launch table's tile id of variant 0
++COUNT = 24           # variants (qmm_prefill2.cu's Q4P2_VARIANTS; checked against the extension at the first build)
++DESCRIBE = {
++    0: "128x128, 2 stages (tile 9's launch), fp32 outputs in pairs",
++    1: "128x128 + 64x64 tail split, 2 stages",
++    2: "128x128 + 128x64 tail split, 2 stages",
++    3: "128x128, 2 stages of 2 groups",
++    4: "128x128 + 64x64 tail split, 2 stages of 2 groups",
++    5: "128x128, 3 stages",
++    6: "128x128 + 64x64 tail split, 3 stages",
++    7: "64x128 + 64x64 tail split, 3 stages",
++    8: "64x64, 4 stages",
++    9: "128x64 + 64x64 tail split, 3 stages",
++    10: "64x256 (4 warps side by side), 2 stages",
++    11: "64x256 (4 warps side by side), 3 stages",
++    12: "128x256 (8 warps) + 64x128 tail split, 2 stages",
++    13: "128x256 (8 warps) + 64x128 tail split, 3 stages",
++    14: "256x128 (8 warps) + 128x64 tail split, 2 stages",
++    15: "64x256 (4 warps side by side) + 64x64 tail split, 2 stages",
++    16: "32x64, 4 stages",
++    17: "32x128, 4 stages",
++    18: "16x64, 4 stages",
++    19: "16x128, 4 stages",
++    20: "32x256 (4 warps side by side), 3 stages",
++    21: "32x64, 6 stages",
++    22: "64x64 + 32x64 tail split, 4 stages",
++    23: "64x128 + 32x64 tail split, 3 stages",
++}
++_checked: dict[tuple, bool] = {}
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    ext = load(name="tensorfold_qmm_prefill2_v2", sources=[str(here / "qmm_prefill2.cpp"),
++                                                          str(here / "qmm_prefill2.cu")],
++               extra_cuda_cflags=["-O3"], verbose=False)
++    if ext.variants() != COUNT:
++        raise RuntimeError(f"qmm_prefill2: the extension has {ext.variants()} variants, this module {COUNT}")
++    return ext
++
++
++def is_variant(tile: int) -> bool:
++    return BASE <= int(tile) < BASE + COUNT
++
++
++def describe(tile: int) -> str:
++    return DESCRIBE.get(int(tile) - BASE, "?")
++
++
++def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
++    return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
++
++
++def _wide(rows: int, k: int, gen, device) -> torch.Tensor:
++    e = torch.randint(-8, 9, (rows, k), device=device, generator=gen).to(torch.float32)
++    return (torch.randn((rows, k), device=device, generator=gen) * torch.exp2(e)).to(torch.bfloat16)
++
++
++def check(variant: int, q, f32: bool, rows: int, device) -> bool:
++    """Variant ``variant`` against the stock tile 0 on ``q`` (the call's weights), byte for byte, at ``rows``, 1 and 777
++    rows of random inputs over a wide range of magnitudes."""
++    from .qmm import _ext as stock
++
++    gen = torch.Generator(device=device).manual_seed(195 + variant)
++    dtype = torch.float32 if f32 else torch.bfloat16
++    for m in sorted({max(1, int(rows)), 1, 777}):
++        x = _wide(m, q.k, gen, device)
++        a = torch.full((m, q.n), 3.0, dtype=dtype, device=device)
++        b = torch.full((m, q.n), 5.0, dtype=dtype, device=device)
++        stock().qmm_prefill(x, q.weight, q.scales, q.biases, a, q.n, q.gs, f32, 0)
++        _ext().qmm_prefill2(x, q.weight, q.scales, q.biases, b, q.n, q.gs, f32, variant)
++        if not _same(a, b):
++            return False
++    return True
++
++
++def matmul(x: torch.Tensor, q, f32: bool, out: torch.Tensor, tile: int) -> bool:
++    """qmm_prefill's output by variant tile - BASE into ``out``; False (nothing written) when the variant does not take
++    this call (groups other than 64, inside a CUDA graph capture before its check) or its check failed on this GPU:
++    the caller then runs the stock tile."""
++    if q.gs != 64 or not is_variant(tile):
++        return False
++    v = int(tile) - BASE
++    key = (v, q.n, q.k, bool(f32))
++    ok = _checked.get(key)
++    if ok is None:
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        try:
++            ok = check(v, q, f32, x.shape[0], x.device)
++            why = "" if ok else ": its outputs differ from the stock tile's on this GPU"
++        except Exception as exc:  # noqa: BLE001 - a variant that cannot run here is off; the stock tile runs
++            ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++        _checked[key] = ok
++        if not ok:
++            print(f"[tensorfold] 4-bit prompt matmul tile {tile} ({describe(tile)}) for {q.n}x{q.k}"
++                  f"{' fp32' if f32 else ''}: off{why}", flush=True)
++    if not ok:
++        return False
++    _ext().qmm_prefill2(x, q.weight, q.scales, q.biases, out, q.n, q.gs, f32, v)
++    return True
++
++
++def tiles(variant: int, M: int, N: int, K: int, resident: int) -> dict:
++    """The CTA tiles a launch covers (no GPU needed once built): {nbig, cbig, nsmall, tiles: [(row, col, rows, cols)]}."""
++    t = _ext().tiles(variant, M, N, K, resident)
++    return {"nbig": t[0], "cbig": t[1], "nsmall": t[2],
++            "tiles": [tuple(t[i:i + 4]) for i in range(3, len(t), 4)]}
+diff --git tensorfold/families/glm5_next/cuda/attn_fast.py tensorfold/families/glm5_next/cuda/attn_fast.py
+new file mode 100644
+index 0000000..ccbf397
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/attn_fast.py
+@@ -0,0 +1,303 @@
++"""TF_GLM_SPARSE_FAST=1 (patch 0194): a prompt chunk's DSA sparse attention (latent.sparse_onepass) by a kernel that
++gives every output latent._sparse_onepass' bits, faster.
++
++Why: sparse attention is the largest DSA stage of a prompt chunk (a row's 16 heads over its 2,051 selected latents:
++about 67 MFLOP a row, 137 GFLOP a 2,048-row lane a layer). _sparse_onepass runs a row on eight warps over 32-key
++tiles; its 16 x 32 score tile is two n8 tiles fewer than eight warps, so warps 4-7 compute warps 0-3's scores again
++(a third of its tensor-core work), and every warp loads the row's whole 16 x 512 query from shared memory for every
++32 keys.
++
++How: the same program per row, eight warps, and the same online softmax, but the scores come 64 keys at a time: one
++16 x 64 product, one n8 tile a warp, nothing computed twice and the query loaded half as often; its two 32-key halves
++go through shared memory into _sparse_onepass' own 16 x 32 layout, and each half then runs _sparse_onepass' tile code
++(fp8 scale, query scale, mask, running maximum, rescale, probabilities, the PV product into the rescaled output, the
++row sum) on its 32 keys, in key order. The key rows for the next 64 keys are gathered into registers while the
++current ones are used (as _sparse_onepass gathers the next tile's).
++
++Exact: every score is one mma chain over the 512-wide latent (32 m16n8k16 steps, operands of k width 2, the same
++order), so it does not depend on which warp computes it or how many columns the product has; everything after the
++scores is _sparse_onepass' code in _sparse_onepass' TTGIR layouts (mma v2, warps [1, 8], 16 x 8; k width 2; its
++shared-memory swizzles), so the softmax's maximum and sum trees and the PV chains are its own (tests/k5/check_ptx.py
++--sparse compares the PTX float work: the score chains and every tile's softmax-and-PV unit). A second half with no
++valid key is skipped (the reference never runs that tile). On the GPU the outputs are compared with
++_sparse_onepass' byte for byte on the first call of a process (random rows over a wide range of magnitudes, token
++lists of every length class); a difference turns the setting off for the process and the reference runs.
++TF_GLM_SPARSE_FAST_CHECK=1 compares every call (a test setting).
++
++TF_GLM_SPARSE_FAST=2 (patch 0199): the same bits by a CUDA kernel with warp roles (``sparse_ws.cu``): four score warps
++hold the row's query in registers and compute each tile's scores (each one 8-key block's chain), four PV warps run the
++tile's softmax and PV product on their 128 output columns and gather the next tiles into a second buffer, so a tile's
++scores are computed while the PV warps run the one before and nothing is computed twice. Every operation of the
++reference's per-tile code is done on the same values in the same order with the same PTX instructions (the file's
++header lists them); the first call compares it with the reference as above.
++
++Applies where _sparse_onepass would run with its fixed tile and launch: TF_GLM_SPARSE_ONEPASS on (the default),
++16-head tiles (a rank's DSA heads at TP4), 32-key tiles, one latent slice, prefetch, eight warps.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++from triton.experimental import gluon
++from triton.experimental.gluon import language as gl
++from triton.experimental.gluon.language.nvidia.ampere import mma_v2
++
++# _sparse_onepass' layouts on sm_120 (Triton 3.7: HBT 16, KTT 32, LW 512, eight warps), read from its TTGIR
++_BLK = gl.constexpr(gl.BlockedLayout([1, 16], [1, 32], [8, 1], [1, 0]))     # key rows (fp8 codes, bf16)
++_BLK1 = gl.constexpr(gl.BlockedLayout([1, 8], [1, 32], [4, 2], [1, 0]))     # the query and the output
++_MMA = gl.constexpr(gl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 8], instr_shape=[16, 8]))
++_DA = gl.constexpr(gl.DotOperandLayout(operand_index=0, parent=_MMA, k_width=2))
++_DB = gl.constexpr(gl.DotOperandLayout(operand_index=1, parent=_MMA, k_width=2))
++_SH = gl.constexpr(gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=8, order=[1, 0]))     # query, key rows
++_SH2 = gl.constexpr(gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=4, order=[1, 0]))    # probabilities
++_SHF = gl.constexpr(gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]))    # scores (fp32)
++WARPS = 8
++KC = 128                            # the score product's k step a launch (speed only: the k chain is the same)
++LAUNCH = (8, 1, True)               # (warps, stages, prefetch) _sparse_onepass must run with for this kernel
++
++
++def _flag(name: str, values=("0", "1")) -> str:
++    value = (os.environ.get(name, "") or "0").strip()
++    if value not in values:
++        raise ValueError(f"{name}: {' or '.join(values)}, not {value!r}")
++    return value
++
++
++MODE = _flag("TF_GLM_SPARSE_FAST", ("0", "1", "2"))      # 1: the Gluon kernel (0194), 2: the CUDA one (0199)
++ENABLED = MODE != "0"
++CHECK = _flag("TF_GLM_SPARSE_FAST_CHECK") == "1"
++_decided: bool | None = None
++_WS = None
++
++
++def _ws():
++    """The warp-role CUDA kernel's extension (TF_GLM_SPARSE_FAST=2, and topk_fast's TF_GLM_TOPK_FAST=1; built at
++    first use)."""
++    global _WS
++    if _WS is None:
++        from pathlib import Path
++
++        from tensorfold.cuda.build import load
++
++        here = Path(__file__).parent
++        _WS = load(name="tensorfold_glm_dsa_ws_v1", sources=[str(here / "sparse_ws.cpp"), str(here / "sparse_ws.cu"),
++                                                            str(here / "sparse_topk.cu")],
++                   extra_cuda_cflags=["-O3"], verbose=False)
++    return _WS
++
++
++@gluon.jit
++def _ids(row, t0, n, KTT: gl.constexpr, layout: gl.constexpr):
++    """Token ids t0 .. t0 + KTT of the row's list (0 past n), int64, in ``layout``."""
++    idx = t0 + gl.arange(0, KTT, layout=layout)
++    return gl.load(row + idx, mask=idx < n, other=0).to(gl.int64)
++
++
++@gluon.jit
++def _rows(LC, tok, t0, n, RS: gl.constexpr, LW: gl.constexpr, KTT: gl.constexpr):
++    """The tokens' latent rows [KTT, LW] (fp8 codes or bf16, RS elements apart); rows past n are zeros."""
++    k = gl.arange(0, LW, layout=gl.SliceLayout(0, _BLK))
++    ok = t0 + gl.arange(0, KTT, layout=gl.SliceLayout(1, _BLK)) < n
++    return gl.load(LC + tok[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0)
++
++
++@gluon.jit
++def _scales(LS, tok, t0, n, LW: gl.constexpr, RS: gl.constexpr, KTT: gl.constexpr, FP8: gl.constexpr):
++    """The tokens' fp8 row scales [KTT] (ones past n; ones for a bf16 cache, unread)."""
++    if FP8:
++        ok = t0 + gl.arange(0, KTT, layout=gl.SliceLayout(0, _MMA)) < n
++        return gl.load(LS + tok * (RS // 4) + LW // 4, mask=ok, other=1.0)
++    return gl.full([KTT], 1.0, gl.float32, gl.SliceLayout(0, _MMA))
++
++
++@gluon.jit
++def _tile(scores, ks, valid, kv, ps, m, l, o, SCALE: gl.constexpr, FP8: gl.constexpr, KTT: gl.constexpr):
++    """latent._tile from its scores on: ``scores`` the 16 x KTT dots (fp32, _MMA), ``kv`` the tile's key rows in
++    shared memory [KTT, LW], ``ps`` the probabilities' shared buffer."""
++    if FP8:
++        scores = scores * ks[None, :]
++    scores = scores * SCALE
++    scores = gl.where(valid[None, :], scores, float("-inf"))
++    tile_m = gl.max(scores, 1)
++    active = tile_m != float("-inf")
++    next_m = gl.where(active, gl.maximum(m, tile_m), m)
++    alpha = gl.where(active, gl.where(m == float("-inf"), 0.0, gl.exp(m - next_m)), 1.0)
++    p = gl.where(valid[None, :] & active[:, None], gl.exp(scores - next_m[:, None]), 0.0)
++    if FP8:
++        pb = (p * ks[None, :]).to(gl.bfloat16)
++    else:
++        pb = p.to(gl.bfloat16)
++    ps.store(pb)
++    o = mma_v2(ps.load(_DA), kv.load(_DB), o * alpha[:, None])
++    l = l * alpha + gl.sum(p, 1)
++    return next_m, l, o
++
++
++@gluon.jit
++def _onepass_fast(QA, LC, LS, TOK, CNT, OUT, W: gl.constexpr, H: gl.constexpr, LW: gl.constexpr,
++                  SCALE: gl.constexpr, HBT: gl.constexpr, KTT: gl.constexpr, RS: gl.constexpr, FP8: gl.constexpr,
++                  KC: gl.constexpr):
++    """Program (row, head group): _sparse_onepass with one latent slice, its scores 2 x KTT keys at a time."""
++    r = gl.program_id(0)
++    hb = gl.program_id(1)
++    n = gl.load(CNT + r)
++    if n > 0:
++        hh = hb * HBT + gl.arange(0, HBT, layout=gl.SliceLayout(1, _BLK1))
++        hok = hh < H
++        k = gl.arange(0, LW, layout=gl.SliceLayout(0, _BLK1))
++        q = gl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(gl.bfloat16)
++        qs = gl.allocate_shared_memory(gl.bfloat16, [HBT, LW], _SH, q)
++        kvs = gl.allocate_shared_memory(gl.bfloat16, [2 * KTT, LW], _SH)
++        scs = gl.allocate_shared_memory(gl.float32, [HBT, 2 * KTT], _SHF)
++        ps = gl.allocate_shared_memory(gl.bfloat16, [HBT, KTT], _SH2)
++        m = gl.full([HBT], float("-inf"), gl.float32, gl.SliceLayout(1, _MMA))
++        l = gl.zeros([HBT], gl.float32, gl.SliceLayout(1, _MMA))
++        o = gl.zeros([HBT, LW], gl.float32, _MMA)
++        row = TOK + r * W
++        KK: gl.constexpr = 2 * KTT
++        # the two 32-key halves' rows (registers), scales and the next ids, as _sparse_onepass keeps a tile's
++        ta = _ids(row, 0, n, KTT, gl.SliceLayout(1, _BLK))
++        tb = _ids(row, KTT, n, KTT, gl.SliceLayout(1, _BLK))
++        kva = _rows(LC, ta, 0, n, RS, LW, KTT)
++        kvb = _rows(LC, tb, KTT, n, RS, LW, KTT)
++        ksa = _scales(LS, _ids(row, 0, n, KTT, gl.SliceLayout(0, _MMA)), 0, n, LW, RS, KTT, FP8)
++        ksb = _scales(LS, _ids(row, KTT, n, KTT, gl.SliceLayout(0, _MMA)), KTT, n, LW, RS, KTT, FP8)
++        ta = _ids(row, KK, n, KTT, gl.SliceLayout(1, _BLK))
++        tb = _ids(row, KK + KTT, n, KTT, gl.SliceLayout(1, _BLK))
++        for t0 in range(0, n, KK):
++            kvs.slice(0, KTT, dim=0).store(kva.to(gl.bfloat16))
++            kvs.slice(KTT, KTT, dim=0).store(kvb.to(gl.bfloat16))
++            # the next 64 keys' rows into registers (their ids are here), and the ids after them
++            kva = _rows(LC, ta, t0 + KK, n, RS, LW, KTT)
++            kvb = _rows(LC, tb, t0 + KK + KTT, n, RS, LW, KTT)
++            ksa_next = _scales(LS, _ids(row, t0 + KK, n, KTT, gl.SliceLayout(0, _MMA)), t0 + KK, n, LW, RS, KTT, FP8)
++            ksb_next = _scales(LS, _ids(row, t0 + KK + KTT, n, KTT, gl.SliceLayout(0, _MMA)), t0 + KK + KTT, n, LW, RS,
++                               KTT, FP8)
++            ta = _ids(row, t0 + 2 * KK, n, KTT, gl.SliceLayout(1, _BLK))
++            tb = _ids(row, t0 + 2 * KK + KTT, n, KTT, gl.SliceLayout(1, _BLK))
++            # the 512-wide product in four 128-wide steps (the same k chain: steps 0 .. 31 in order, each step's
++            # accumulator the last one's), so only a quarter of the query operand is live at a time
++            kt = kvs.permute([1, 0])
++            dots = gl.zeros([HBT, KK], gl.float32, _MMA)
++            for c in gl.static_range(LW // KC):
++                dots = mma_v2(qs.slice(c * KC, KC, dim=1).load(_DA), kt.slice(c * KC, KC, dim=0).load(_DB), dots)
++            scs.store(dots)
++            va = t0 + gl.arange(0, KTT, layout=gl.SliceLayout(0, _MMA)) < n
++            m, l, o = _tile(scs.slice(0, KTT, dim=1).load(_MMA), ksa, va, kvs.slice(0, KTT, dim=0), ps, m, l, o,
++                            SCALE, FP8, KTT)
++            if t0 + KTT < n:
++                vb = t0 + KTT + gl.arange(0, KTT, layout=gl.SliceLayout(0, _MMA)) < n
++                m, l, o = _tile(scs.slice(KTT, KTT, dim=1).load(_MMA), ksb, vb, kvs.slice(KTT, KTT, dim=0), ps, m, l,
++                                o, SCALE, FP8, KTT)
++            ksa = ksa_next
++            ksb = ksb_next
++        out = (o / l[:, None]).to(gl.bfloat16)
++        gl.store(OUT + (r * H + hh[:, None]) * LW + k[None, :], gl.convert_layout(out, _BLK1), mask=hok[:, None])
++
++
++def applies(qa: torch.Tensor, tile, launch) -> bool:
++    """The reference's call is the one this kernel replaces: 16-head programs (a rank's 16 heads: the tile's head
++    count capped as _sparse_onepass caps it), 32-key tiles, one latent slice, the 512-wide latent, its fixed launch."""
++    from . import latent
++
++    hbt, kt, split = tile or latent.ONEPASS_TILE
++    H = qa.shape[1]
++    hbt = max(16, min(hbt, triton.next_power_of_2(H)))
++    return (hbt == 16 and H == 16 and kt == 32 and split == 1 and qa.shape[2] == 512
++            and tuple(launch or latent.ONEPASS_LAUNCH) == LAUNCH)
++
++
++def launch(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor,
++           scale: float, kernel: str | None = None) -> None:
++    """latent.sparse_onepass(qa, cache, tokens, counts, out, scale) for this kernel's shapes (``applies``); ``kernel``
++    "1" (Gluon, 0194) or "2" (warp roles, CUDA, 0199), default the setting's."""
++    from .latent import _cache_parts
++
++    R, H, LW = qa.shape
++    if not (qa.is_contiguous() and out.is_contiguous() and tokens.is_contiguous() and cache.is_contiguous()):
++        raise ValueError("sparse attention: expected contiguous queries, output, token lists and cache")
++    vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    if R == 0:
++        return
++    if (kernel or MODE) == "2":         # patch 0199: the warp-role CUDA kernel (the cache as stored: codes or bf16)
++        _ws().sparse_ws(qa, cache, tokens, counts, out, float(scale))
++        return
++    _onepass_fast[(R, triton.cdiv(H, 16))](qa, vals, scl, tokens, counts, out, W=tokens.shape[1], H=H, LW=LW,
++                                           SCALE=scale, HBT=16, KTT=32, RS=rs, FP8=fp8, KC=KC, num_warps=WARPS)
++
++
++def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
++    return a.shape == b.shape and torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16))
++
++
++def self_check(kind: str, device, kernel: str | None = None) -> bool:
++    """Both kernels on random queries and caches over a wide range of magnitudes, token lists of every length class
++    (0, 1, 31, 32, 33, 63, 64, 65, 2,048, 2,051 tokens, random and repeated ids), compared byte for byte."""
++    from . import kv8, latent
++
++    gen = torch.Generator(device=device).manual_seed(194)
++
++    def wide(shape, spread):
++        e = torch.randint(-spread, spread + 1, shape, device=device, generator=gen).float()
++        return torch.randn(shape, device=device, generator=gen) * torch.exp2(e)
++
++    cap = 6000
++    cache = kv8.zeros(cap, 512, kind, device)
++    rows = wide((cap, 512), 3)
++    cache.copy_(kv8.quantize_rows(rows) if kind == "fp8" else rows.to(torch.bfloat16))
++    lens = [0, 1, 31, 32, 33, 63, 64, 65, 96, 127, 2048, 2051, 2051, 2049, 500, 1000]
++    R = len(lens)
++    W = 2051
++    tokens = torch.full((R, W), -1, dtype=torch.int32, device=device)
++    for i, n in enumerate(lens):
++        if n:
++            ids = torch.randint(0, cap, (n,), device=device, generator=gen) if i % 2 else \
++                torch.sort(torch.randperm(cap, device=device, generator=gen)[:n]).values
++            tokens[i, :n] = ids.to(torch.int32)
++    counts = torch.tensor(lens, dtype=torch.int32, device=device)
++    for spread in (2, 6):
++        qa = wide((R, 16, 512), spread).to(torch.bfloat16)
++        a = torch.full((R, 16, 512), 7.0, device=device).to(torch.bfloat16)
++        b = a.clone()
++        latent._sparse_onepass_ref(qa, cache, tokens, counts, a, 256 ** -0.5)
++        launch(qa, cache, tokens, counts, b, 256 ** -0.5, kernel)
++        if not _same(a, b):
++            return False
++    return True
++
++
++def on(qa: torch.Tensor, cache: torch.Tensor, tile, launch_) -> bool:
++    """Whether to run this kernel for this call: the setting, its shapes, and its check passed on this GPU."""
++    global _decided
++    if not ENABLED or not applies(qa, tile, launch_):
++        return False
++    if _decided is None:
++        from . import kv8
++
++        try:
++            ok = self_check(kv8.kind_of(cache), qa.device)
++            why = "" if ok else ": its outputs differ from the reference kernel's on this GPU"
++        except Exception as exc:  # noqa: BLE001 - a kernel that cannot run here is off; the reference runs
++            ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++        _decided = ok
++        kind = "warp roles, CUDA" if MODE == "2" else "Gluon"
++        print(f"[tensorfold] fast DSA sparse attention ({kind}): {'on (checked bit for bit)' if ok else 'off' + why}",
++              flush=True)
++    return _decided
++
++
++def run(qa, cache, tokens, counts, out, scale) -> None:
++    """launch(), and with TF_GLM_SPARSE_FAST_CHECK=1 the reference on a copy, compared (stops on a difference)."""
++    if CHECK:
++        from . import latent
++
++        ref = out.clone()
++        latent._sparse_onepass_ref(qa, cache, tokens, counts, ref, scale)
++    launch(qa, cache, tokens, counts, out, scale)
++    if CHECK and not _same(ref, out):
++        raise RuntimeError("TF_GLM_SPARSE_FAST_CHECK: the fast sparse attention differs from the reference's")
+diff --git tensorfold/families/glm5_next/cuda/dsa_fuse.py tensorfold/families/glm5_next/cuda/dsa_fuse.py
+new file mode 100644
+index 0000000..aabafa9
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/dsa_fuse.py
+@@ -0,0 +1,396 @@
++"""TF_GLM_DSA_FUSE (patch 0193): DSA's small per-row stages in fewer launches, every output's bits kept, in prompt
++chunks and in decode windows (single-stream and segmented):
++
++  writes  the latent write, the indexer's key and gate write and the pool keys in one launch (3 to 1)
++  norms   the query and latent RMSNorms of the DSA front in one launch (2 to 1)
++
++Exact by construction: each part is the unfused kernel's source with its shapes, warps and arguments, so it
++compiles to the same operations in the same order (tests/k5/check_ptx.py --dsa compares the PTX float work part by
++part). writes runs one warp a program, as _index_write and _pool_keys do; the latent row, written by four warps
++before, has no sum (its fp8 scale is a maximum), so its bytes do not depend on the warps. A pool whose four tokens
++fall in this window computes their keys and gates as _index_write stores them (the same LayerNorm, rounded to bf16)
++instead of reading them back from the ring, so no program reads what another program of the launch writes; tokens
++of earlier windows are read from the ring as before (the ring holds the window's rows and the three before them, so
++this launch's writes never cover them). norms runs each norm as its own program row of one grid with the norm's own
++block and warps; each part takes its own row pointer, so the loads specialize as the unfused calls' do.
++
++Each fusion is used after its outputs equalled the unfused kernels' byte for byte on this GPU (first call outside a
++CUDA graph capture; random rows over a wide range of magnitudes, positions that start and end windows inside pools,
++fp8 and bf16 caches); a difference turns it off for the process (a line says so) and the unfused kernels run.
++
++Setting: TF_GLM_DSA_FUSE 0 / off (default), 1 / on / all, or a comma list of writes, norms.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++from . import kv8
++
++NAMES = ("writes", "norms")
++_wanted: frozenset | None = None
++_decided: dict[str, bool] = {}
++
++
++def wanted() -> frozenset:
++    global _wanted
++    if _wanted is None:
++        v = (os.environ.get("TF_GLM_DSA_FUSE", "") or "0").strip().lower()
++        if v in ("0", "off", "none"):
++            _wanted = frozenset()
++        elif v in ("1", "on", "all"):
++            _wanted = frozenset(NAMES)
++        else:
++            names = {n.strip() for n in v.split(",") if n.strip()}
++            bad = names - set(NAMES)
++            if bad:
++                raise ValueError(f"TF_GLM_DSA_FUSE: 0, 1 or names among {', '.join(NAMES)}; not {', '.join(sorted(bad))}")
++            _wanted = frozenset(names)
++    return _wanted
++
++
++def code() -> int:
++    return sum(1 << i for i, n in enumerate(NAMES) if n in wanted())
++
++
++def reset(value: str | None = None) -> None:
++    global _wanted
++    _decided.clear()
++    _wanted = None
++    if value is not None:
++        os.environ["TF_GLM_DSA_FUSE"] = value
++
++
++def on(name: str, check) -> bool:
++    """Run fusion ``name`` now: asked for and its check passed on this GPU (run on its first call outside a capture)."""
++    if name not in wanted():
++        return False
++    got = _decided.get(name)
++    if got is not None:
++        return got
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        ok = bool(check())
++        why = "" if ok else ": its outputs differ from the unfused kernels' on this GPU"
++    except Exception as exc:  # noqa: BLE001 - a fusion that cannot run here is off; the unfused kernels run
++        ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++    _decided[name] = ok
++    print(f"[tensorfold] DSA fusion {name}: {'on (checked bit for bit)' if ok else 'off' + why}", flush=True)
++    return ok
++
++
++# -- writes: latent + index key / gate + pool keys -------------------------------------------------------------------
++@triton.jit
++def _key_row(KR, k_stride, LNW, LNB, r, eps, D: tl.constexpr):
++    """_index_write's LayerNorm of key row r (fp32, before its bf16 store)."""
++    d = tl.arange(0, D)
++    x = tl.load(KR + r * k_stride + d).to(tl.float32)
++    mean = tl.sum(x, axis=0) / D
++    xc = x - mean
++    var = tl.sum(xc * xc, axis=0) / D
++    return xc / tl.sqrt(var + eps) * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
++
++
++@triton.jit
++def _token(t, P, KR, k_stride, GR, LNW, LNB, IK, IG, RING, eps, D: tl.constexpr):
++    """Token t's index key and gate as their bf16 ring rows: computed when t is a row of this window (row t - P, as
++    _index_write stores it), else read from the ring (an earlier window wrote it). bf16 here, widened where
++    _pool_keys widens its loads, so the compiler folds the same conversions into the same adds."""
++    d = tl.arange(0, D)
++    if t >= P:
++        r = t - P
++        k = _key_row(KR, k_stride, LNW, LNB, r, eps, D).to(tl.bfloat16)
++        g = tl.load(GR + r * D + d).to(tl.bfloat16)
++    else:
++        s = t % RING
++        k = tl.load(IK + s * D + d)
++        g = tl.load(IG + s * D + d)
++    return k, g
++
++
++@triton.jit
++def _pool(k0, g0, k1, g1, k2, g2, k3, g3, APE, D: tl.constexpr):
++    """_pool_keys' arithmetic on four tokens' bf16 keys and gates."""
++    d = tl.arange(0, D)
++    l0 = g0.to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
++    l1 = g1.to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
++    l2 = g2.to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
++    l3 = g3.to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
++    m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
++    e0 = tl.exp(l0 - m)
++    e1 = tl.exp(l1 - m)
++    e2 = tl.exp(l2 - m)
++    e3 = tl.exp(l3 - m)
++    s = ((e0 + e1) + e2) + e3
++    t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    return ((t0 + t1) + t2) + t3
++
++
++@triton.jit
++def _dsa_writes(LAT, lat_stride, LC, LS, KR, k_stride, GR, LNW, LNB, IK, IG, APE, PK, PKS, POS, R, RING, eps,
++                LW: tl.constexpr, RSL: tl.constexpr, FP8L: tl.constexpr, D: tl.constexpr, RSP: tl.constexpr,
++                FP8P: tl.constexpr):
++    """Programs 0 .. R - 1: row r's latent (_lat_write) and index key and gate (_index_write); programs R .. R + R // 4
++    + 1: pool i (_pool_keys), its in-window tokens computed here."""
++    g = tl.program_id(0)
++    P = tl.load(POS).to(tl.int64)
++    if g < R:
++        r = g
++        k = tl.arange(0, LW)
++        kv8.store_row(LC, LS, P + r, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RSL, FP8L)
++        d = tl.arange(0, D)
++        y = _key_row(KR, k_stride, LNW, LNB, r, eps, D)
++        slot = (P + r) % RING
++        tl.store(IK + slot * D + d, y.to(tl.bfloat16))
++        tl.store(IG + slot * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
++    else:
++        p = P // 4 + (g - R)
++        if 4 * p + 3 <= P + R - 1:
++            k0, g0 = _token(4 * p + 0, P, KR, k_stride, GR, LNW, LNB, IK, IG, RING, eps, D)
++            k1, g1 = _token(4 * p + 1, P, KR, k_stride, GR, LNW, LNB, IK, IG, RING, eps, D)
++            k2, g2 = _token(4 * p + 2, P, KR, k_stride, GR, LNW, LNB, IK, IG, RING, eps, D)
++            k3, g3 = _token(4 * p + 3, P, KR, k_stride, GR, LNW, LNB, IK, IG, RING, eps, D)
++            kv8.store_row(PK, PKS, p, _pool(k0, g0, k1, g1, k2, g2, k3, g3, APE, D), D, RSP, FP8P)
++
++
++def writes(lat: torch.Tensor, cache: torch.Tensor, k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor,
++           ln_b: torch.Tensor, ape: torch.Tensor, ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor,
++           pos: torch.Tensor) -> None:
++    """latent.latent_write(lat, cache, pos) and sparse.index_update(k_raw, gate, ...) in one launch."""
++    R = lat.shape[0]
++    ring = ik.shape[0]
++    if ik.dtype != torch.bfloat16 or ig.shape != ik.shape or not ik.is_contiguous() or not ig.is_contiguous():
++        raise ValueError("dsa writes: bf16 key and gate rings of one shape, contiguous")
++    if lat.shape[1] != kv8.width(cache) or kv8.width(pk) != 128 or k_raw.shape[0] != R:
++        raise ValueError("dsa writes: rows, latent width or pooled-key width do not match")
++    vals, scl, rsl, fp8l = kv8.parts(cache)
++    pkv, pks, rsp, fp8p = kv8.parts(pk)
++    _dsa_writes[(R + R // 4 + 2,)](lat, lat.stride(0), vals, scl, k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, ape,
++                                   pkv, pks, pos, R, ring, 1e-6, LW=lat.shape[1], RSL=rsl, FP8L=fp8l, D=128, RSP=rsp,
++                                   FP8P=fp8p, num_warps=1)
++
++
++@triton.jit
++def _seg_token(t, q, r, SEG, KR, k_stride, GR, LNW, LNB, IK, IG, IB, RING, eps, D: tl.constexpr):
++    """_token for a segmented window (bf16 rows): token t of row r's stream (row r at position q) is this window's row r - (q - t)
++    when that row is in r's segment, else the stream's ring row IB + t % RING."""
++    d = tl.arange(0, D)
++    rr = r - (q - t)
++    inside = rr >= 0
++    if inside:
++        inside = tl.load(SEG + rr) == tl.load(SEG + r)
++    if inside:
++        k = _key_row(KR, k_stride, LNW, LNB, rr, eps, D).to(tl.bfloat16)
++        g = tl.load(GR + rr * D + d).to(tl.bfloat16)
++    else:
++        s = IB + t % RING
++        k = tl.load(IK + s * D + d)
++        g = tl.load(IG + s * D + d)
++    return k, g
++
++
++@triton.jit
++def _seg_dsa_writes(LAT, lat_stride, LC, LS, KR, k_stride, GR, LNW, LNB, IK, IG, APE, PK, PKS, POS, BASE, IBASE, SEG,
++                    RING, eps, LW: tl.constexpr, RSL: tl.constexpr, FP8L: tl.constexpr, D: tl.constexpr,
++                    RSP: tl.constexpr, FP8P: tl.constexpr):
++    """Program r: _seg_lat_write, _seg_index_write and _seg_pool_keys of row r."""
++    r = tl.program_id(0)
++    q = tl.load(POS + r).to(tl.int64)
++    B = tl.load(BASE + r).to(tl.int64)
++    IB = tl.load(IBASE + r).to(tl.int64)
++    k = tl.arange(0, LW)
++    kv8.store_row(LC, LS, B + q, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RSL, FP8L)
++    d = tl.arange(0, D)
++    y = _key_row(KR, k_stride, LNW, LNB, r, eps, D)
++    row = IB + q % RING
++    tl.store(IK + row * D + d, y.to(tl.bfloat16))
++    tl.store(IG + row * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
++    if q % 4 == 3:
++        t = (q // 4) * 4
++        k0, g0 = _seg_token(t + 0, q, r, SEG, KR, k_stride, GR, LNW, LNB, IK, IG, IB, RING, eps, D)
++        k1, g1 = _seg_token(t + 1, q, r, SEG, KR, k_stride, GR, LNW, LNB, IK, IG, IB, RING, eps, D)
++        k2, g2 = _seg_token(t + 2, q, r, SEG, KR, k_stride, GR, LNW, LNB, IK, IG, IB, RING, eps, D)
++        k3, g3 = _seg_token(t + 3, q, r, SEG, KR, k_stride, GR, LNW, LNB, IK, IG, IB, RING, eps, D)
++        kv8.store_row(PK, PKS, B // 4 + q // 4, _pool(k0, g0, k1, g1, k2, g2, k3, g3, APE, D), D, RSP, FP8P)
++
++
++def seg_writes(lat: torch.Tensor, cache: torch.Tensor, k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor,
++               ln_b: torch.Tensor, ape: torch.Tensor, ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor,
++               rows) -> None:
++    """latent.seg_latent_write and sparse.seg_index_update (``rows``: segments.SegRows) in one launch."""
++    R = lat.shape[0]
++    if lat.shape[1] != kv8.width(cache) or kv8.width(pk) != 128 or k_raw.shape[0] != R:
++        raise ValueError("dsa writes: rows, latent width or pooled-key width do not match")
++    if cache.stride(-1) != 1 or cache.stride(0) != cache.shape[1]:
++        raise ValueError("dsa writes: a cache of contiguous rows")
++    vals, scl, rsl, fp8l = kv8.parts(cache)
++    pkv, pks, rsp, fp8p = kv8.parts(pk)
++    _seg_dsa_writes[(R,)](lat, lat.stride(0), vals, scl, k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, ape, pkv, pks,
++                          rows.pos, rows.base, rows.ibase, rows.seg, rows.ring_rows, 1e-6, LW=lat.shape[1], RSL=rsl,
++                          FP8L=fp8l, D=128, RSP=rsp, FP8P=fp8p, num_warps=1)
++
++
++# -- norms: the DSA front's query and latent RMSNorms ----------------------------------------------------------------
++@triton.jit
++def _rms_part(X, x_stride, W, OUT, o_stride, XS, eps, r, D: tl.constexpr, BLOCK: tl.constexpr, SUMS: tl.constexpr):
++    """glue._rmsnorm's body for row r."""
++    d = tl.arange(0, BLOCK)
++    ok = d < D
++    x = tl.load(X + r * x_stride + d, mask=ok, other=0.0).to(tl.float32)
++    rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
++    w = tl.load(W + d, mask=ok, other=0.0).to(tl.float32)
++    y = (w * (x * rinv).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    tl.store(OUT + r * o_stride + d, y, mask=ok)
++    if SUMS:
++        g = tl.sum(tl.reshape(tl.where(ok, y.to(tl.float32), 0.0), (BLOCK // 64, 64)), axis=1)
++        gi = tl.arange(0, BLOCK // 64)
++        tl.store(XS + r * (D // 64) + gi, g, mask=gi < D // 64)
++
++
++@triton.jit
++def _norm_pair(XA, xa_stride, WA, OA, oa_stride, XSA, XB, xb_stride, WB, OB, ob_stride, XSB, eps,
++               DA: tl.constexpr, BA: tl.constexpr, DB: tl.constexpr, BB: tl.constexpr, SUMS: tl.constexpr):
++    """Program (r, 0): the first norm of row r; (r, 1): the second; each glue._rmsnorm's body with its own block."""
++    r = tl.program_id(0)
++    if tl.program_id(1) == 0:
++        _rms_part(XA, xa_stride, WA, OA, oa_stride, XSA, eps, r, DA, BA, SUMS)
++    else:
++        _rms_part(XB, xb_stride, WB, OB, ob_stride, XSB, eps, r, DB, BB, SUMS)
++
++
++def norm_pair_ok(xa: torch.Tensor, xb: torch.Tensor) -> bool:
++    """Both norms take the same warps as glue.rmsnorm would (4: blocks up to 2,048) and write group sums."""
++    return (xa.shape[0] == xb.shape[0] and triton.next_power_of_2(xa.shape[1]) <= 2048
++            and triton.next_power_of_2(xb.shape[1]) <= 2048)
++
++
++def norm_pair(xa, wa, oa, xsa, xb, wb, ob, xsb, eps: float) -> None:
++    """glue.rmsnorm(xa, wa, eps, oa, xsa) and glue.rmsnorm(xb, wb, eps, ob, xsb) in one launch (``norm_pair_ok``)."""
++    rows = xa.shape[0]
++    if oa.stride(-1) != 1 or ob.stride(-1) != 1:
++        raise ValueError("norm pair: rows of the outputs must be contiguous")
++    _norm_pair[(rows, 2)](xa, xa.stride(0), wa, oa, oa.stride(0), xsa, xb, xb.stride(0), wb, ob, ob.stride(0), xsb,
++                          eps, DA=xa.shape[1], BA=triton.next_power_of_2(xa.shape[1]), DB=xb.shape[1],
++                          BB=triton.next_power_of_2(xb.shape[1]), SUMS=True, num_warps=4)
++
++
++# -- checks ---------------------------------------------------------------------------------------------------------
++def _same(*pairs) -> bool:
++    for a, b in pairs:
++        if a.shape != b.shape or a.dtype != b.dtype:
++            return False
++        if not torch.equal(a.contiguous().view(-1).view(torch.uint8), b.contiguous().view(-1).view(torch.uint8)):
++            return False
++    return True
++
++
++def _wide(shape, gen, device, spread: int) -> torch.Tensor:
++    e = torch.randint(-spread, spread + 1, shape, device=device, generator=gen).to(torch.float32)
++    return torch.randn(shape, device=device, generator=gen) * torch.exp2(e)
++
++
++def check_writes(kind: str, device) -> bool:
++    """writes / seg_writes against latent_write + index_update (and their segmented forms) on random rows: windows of
++    1 .. 4,096 rows starting at every position mod 4, rings that wrap, fp8 and bf16 caches."""
++    from . import latent, sparse
++
++    gen = torch.Generator(device=device).manual_seed(193)
++    bf = torch.bfloat16
++    for P, R in ((0, 4096), (8191, 2048), (5, 1), (6, 3), (7, 2), (4097, 64), (130, 512), (12345, 37)):
++        cap = P + R + 64
++        ring = min(cap, -(-(R + 3) // 64) * 64)
++        lat = _wide((R, 512), gen, device, 6).to(bf)
++        kraw = _wide((R, 160), gen, device, 6).to(bf)[:, :128]
++        gate = _wide((R, 128), gen, device, 6)
++        ln_w = _wide((128,), gen, device, 2).to(bf)
++        ln_b = _wide((128,), gen, device, 2).to(bf)
++        ape = _wide((4, 128), gen, device, 2).to(bf)
++        ik0 = _wide((ring, 128), gen, device, 4).to(bf)
++        ig0 = _wide((ring, 128), gen, device, 4).to(bf)
++        lc0 = kv8.zeros(cap, 512, kind, device)
++        pk0 = kv8.zeros(cap // 4 + 2, 128, kind, device)
++        pos = torch.tensor([P], dtype=torch.int32, device=device)
++        outs = []
++        for fused in (False, True):
++            lc, pk, ik, ig = lc0.clone(), pk0.clone(), ik0.clone(), ig0.clone()
++            if fused:
++                writes(lat, lc, kraw, gate, ln_w, ln_b, ape, ik, ig, pk, pos)
++            else:
++                latent.latent_write(lat, lc, pos)
++                sparse.index_update(kraw, gate, ln_w, ln_b, ape, ik, ig, pk, pos)
++            outs.append((lc, pk, ik, ig))
++        if not _same(*zip(*outs)):
++            return False
++    return _check_seg_writes(kind, device, gen)
++
++
++def _check_seg_writes(kind: str, device, gen) -> bool:
++    from . import latent, sparse
++    from .segments import SegRows
++
++    bf = torch.bfloat16
++    ring = 128
++    for segs in (((0, 7, 5), (4096, 2, 1), (8192, 1023, 9)), ((0, 3, 1),), ((2048, 0, 4), (6144, 6, 6)),
++                 ((0, 100, 32), (4096, 201, 31))):
++        rows = SegRows(64, device, max_segs=8, ring=ring)
++        R = rows.set([(b, p, n, i * ring) for i, (b, p, n) in enumerate(segs)])
++        cap = 12288
++        lat = _wide((R, 512), gen, device, 6).to(bf)
++        kraw = _wide((R, 160), gen, device, 6).to(bf)[:, :128]
++        gate = _wide((R, 128), gen, device, 6)
++        ln_w = _wide((128,), gen, device, 2).to(bf)
++        ln_b = _wide((128,), gen, device, 2).to(bf)
++        ape = _wide((4, 128), gen, device, 2).to(bf)
++        ik0 = _wide((8 * ring, 128), gen, device, 4).to(bf)
++        ig0 = _wide((8 * ring, 128), gen, device, 4).to(bf)
++        lc0 = kv8.zeros(cap, 512, kind, device)
++        pk0 = kv8.zeros(cap // 4 + 2, 128, kind, device)
++        outs = []
++        for fused in (False, True):
++            lc, pk, ik, ig = lc0.clone(), pk0.clone(), ik0.clone(), ig0.clone()
++            if fused:
++                seg_writes(lat, lc, kraw, gate, ln_w, ln_b, ape, ik, ig, pk, rows)
++            else:
++                latent.seg_latent_write(lat, lc, rows)
++                sparse.seg_index_update(kraw, gate, ln_w, ln_b, ape, ik, ig, pk, rows)
++            outs.append((lc, pk, ik, ig))
++        if not _same(*zip(*outs)):
++            return False
++    return True
++
++
++def check_norms(qa: int, kb: int, device) -> bool:
++    """norm_pair against two glue.rmsnorm calls on random rows of the DSA front's widths (the call's own)."""
++    from . import glue
++
++    gen = torch.Generator(device=device).manual_seed(194)
++    bf = torch.bfloat16
++    for R in (1, 7, 64, 513):
++        dp = _wide((R, qa + kb), gen, device, 6).to(bf)
++        wa = _wide((qa,), gen, device, 3).to(bf)
++        wb = _wide((kb,), gen, device, 3).to(bf)
++        outs = []
++        for fused in (False, True):
++            oa = torch.empty((R, qa), dtype=bf, device=device)
++            ob = torch.empty((R, kb), dtype=bf, device=device)
++            xa = torch.empty((R, qa // 64), dtype=torch.float32, device=device)
++            xb = torch.empty((R, kb // 64), dtype=torch.float32, device=device)
++            if fused:
++                norm_pair(dp[:, :qa], wa, oa, xa, dp[:, qa:], wb, ob, xb, 1e-5)
++            else:
++                glue.rmsnorm(dp[:, :qa], wa, 1e-5, oa, xa)
++                glue.rmsnorm(dp[:, qa:], wb, 1e-5, ob, xb)
++            outs.append((oa, ob, xa, xb))
++        if not _same(*zip(*outs)):
++            return False
++    return True
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index bb31ec2..e1a1270 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -646,6 +646,9 @@ class GlmEngine:
+         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
+ 
+         mine += index_split_settings().code()
++        from .index_split import gather_code as index_gather_code     # patch 0198: TF_GLM_INDEX_SPLIT_GATHER
++
++        mine.append(index_gather_code())
+         from . import lanes as lanes_mod                # patches 0123, 0128: TF_GLM_PREFILL_LANES*, TF_GLM_KDA_OVERLAP
+ 
+         mine += lanes_mod.code()
+@@ -765,6 +768,8 @@ class GlmEngine:
+                           "(only shorter ones split)", flush=True)
+         if rank == 0 and index_split_settings().on and world > 1:
+             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
++        from . import index_split as index_split_mod        # patch 0198: every rank, the split's own IPC gather
++        index_split_mod.warm(getattr(self.comm, "nccl", self.comm), rank, world, prefill_rows)
+         if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
+             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+         if rank == 0 and moe_glue_mod.on():
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 3525beb..17912c5 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -615,11 +615,36 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+     c = w.cfg
+     a = layer.dsa
+     mm(b, b.normed[lo:hi], a.proj, b.xs[lo:hi], b.dp[lo:hi])
+-    glue.rmsnorm(b.dp[lo:hi, :c.q_lora], a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
+-    glue.rmsnorm(b.dp[lo:hi, c.q_lora:], a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
++    _dsa_norms(c, a, b, lo, hi)
+     mm(b, b.qr[lo:hi], a.q_b, b.xs_qr[lo:hi], b.q[lo:hi].view(hi - lo, a.heads * c.qk_dim))
+ 
+ 
++def _dsa_norms(c, a, b: Buffers, lo: int, hi: int) -> None:
++    """The DSA front's query and latent RMSNorms of rows lo .. hi (one launch under TF_GLM_DSA_FUSE norms, patch
++    0193: the same bits)."""
++
++    qa, qb = b.dp[lo:hi, :c.q_lora], b.dp[lo:hi, c.q_lora:]
++    from . import dsa_fuse
++
++    if dsa_fuse.wanted() and dsa_fuse.norm_pair_ok(qa, qb) and dsa_fuse.on(
++            "norms", lambda: dsa_fuse.check_norms(c.q_lora, c.kv_lora, qa.device)):
++        dsa_fuse.norm_pair(qa, a.q_norm, b.qr[lo:hi], b.xs_qr[lo:hi], qb, a.kv_norm, b.lat[lo:hi], b.xs_lat[lo:hi],
++                           c.eps)
++        return
++    glue.rmsnorm(qa, a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
++    glue.rmsnorm(qb, a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
++
++
++def _writes_fused(lc: torch.Tensor) -> bool:
++    """TF_GLM_DSA_FUSE writes (patch 0193): the latent write, index write and pool keys in one launch, once checked
++    bit for bit on this GPU (for this cache format)."""
++
++    from . import dsa_fuse
++
++    return bool(dsa_fuse.wanted()) and dsa_fuse.on(
++        "writes", lambda: dsa_fuse.check_writes(kv8.kind_of(lc), lc.device))
++
++
+ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+               R: int, nch: int | None, index=None, host_pos: int | None = None,
+               sparse_np: int | None = None, done: tuple[int, int] | None = None) -> torch.Tensor:
+@@ -627,8 +652,9 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+ 
+     c = w.cfg
+     a = layer.dsa
+-    for lo, hi in undone(R, done):
+-        dsa_front(layer, w, b, lo, hi)
++    with prof.timed("dsa: front", events_only=True):
++        for lo, hi in undone(R, done):
++            dsa_front(layer, w, b, lo, hi)
+     HL = a.heads
+     if a.absorb is not None:
+         return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index)
+@@ -693,7 +719,8 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
+ 
+     o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
++    with prof.timed("dsa: out + all-gather", events_only=True):
++        return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+ 
+ 
+ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
+@@ -708,8 +735,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+     HL = a.heads
+     s = b.lat_s
+     rs = slice(lo, lo + R)
+-    with prof.timed("dsa: latent write"):
+-        latent.latent_write(b.lat[rs], lc, pos_dev)
++    fused = index is not None and _writes_fused(lc)      # TF_GLM_DSA_FUSE writes (patch 0193): with the indexer's
++    if not fused:
++        with prof.timed("dsa: latent write"):
++            latent.latent_write(b.lat[rs], lc, pos_dev)
+     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
+     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
+     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+@@ -719,7 +748,14 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+         with prof.timed("dsa: indexer update"):
+             mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
+             glue.router(b.normed[rs], ix.gate, b.igr[rs])
+-            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
++            if fused:
++                from . import dsa_fuse
++
++                dsa_fuse.writes(b.lat[rs], lc, b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig,
++                                pk, pos_dev)
++            else:
++                sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
++                                    pos_dev)
+     with prof.timed("dsa: absorb"):
+         qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
+     l2pf.site(layer, "o")
+@@ -766,13 +802,14 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+     if a.absorb is None:
+         raise ValueError("segmented windows need the latent cache (TF_GLM_LATENT=1)")
+     mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+-    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
+-    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
++    _dsa_norms(c, a, b, 0, R)
+     HL = a.heads
+     mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
+     s = b.lat_s
+-    with prof.timed("dsa: latent write"):
+-        latent.seg_latent_write(b.lat[:R], lc, rows)
++    fused = index is not None and _writes_fused(lc)      # TF_GLM_DSA_FUSE writes (patch 0193): with the indexer's
++    if not fused:
++        with prof.timed("dsa: latent write"):
++            latent.seg_latent_write(b.lat[:R], lc, rows)
+     tokens = counts = None
+     if index is not None:
+         ik, ig, pk = index
+@@ -780,7 +817,14 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+         with prof.timed("dsa: indexer update"):
+             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
+             glue.router(b.normed[:R], ix.gate, b.igr[:R])
+-            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
++            if fused:
++                from . import dsa_fuse
++
++                dsa_fuse.seg_writes(b.lat[:R], lc, b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik,
++                                    ig, pk, rows)
++            else:
++                sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
++                                        rows)
+         if select:
+             with prof.timed("dsa: select tokens"):
+                 mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+diff --git tensorfold/families/glm5_next/cuda/index_split.py tensorfold/families/glm5_next/cuda/index_split.py
+index a309ca7..7f31b4b 100644
+--- tensorfold/families/glm5_next/cuda/index_split.py
++++ tensorfold/families/glm5_next/cuda/index_split.py
+@@ -25,7 +25,19 @@ decides from the same numbers, so they all take the same branch; the startup com
+ 
+ Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap and NCCL
+ exchanges (``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else (no overlap,
+-or copy-engine exchanges, which take no NCCL call) on the current stream."""
++or copy-engine exchanges, which take no NCCL call) on the current stream.
++
++TF_GLM_INDEX_SPLIT_GATHER (patch 0198): how the pools travel. ``nccl`` (the default): the NCCL all-gather. On a host
++whose GPUs sit on PCIe, beside the row split's copy-engine exchange, that gather (NCCL's LL protocol on a few
++channels) moves its 1 MiB a rank at about 1 GB/s: 1.5 to 4.9 ms a call on every rank, also the last to arrive, on the
++stream that waits for it (about 1.4 s a rank of a cold 100K prompt). ``ipc``: a CUDA IPC all-gather of the split's
++own (``tensorfold.cuda.ipc.IpcGather``, set up at startup by ``warm``): each rank's copy engines push its pools into a
++slot of every peer's exported memory, a flag a peer says they landed, and each rank copies the peers' pools out in
++rank order. ``ipc-sm``: the same with SM stores instead of the copy engines (its flag protocol). Either way the
++receive buffer holds what NCCL's all-gather leaves (rank r's pools at r x the send size), copied, never computed:
++the same tokens and counts. A gather larger than the regions set up for (``gather_bytes``) and every gather after a
++failed setup (no peer-to-peer access: every rank says so) go through NCCL; the choice depends on the byte count only,
++the same on every rank."""
+ 
+ from __future__ import annotations
+ 
+@@ -78,6 +90,79 @@ def settings() -> IndexSplit:
+     return SETTINGS
+ 
+ 
++GATHERS = ("nccl", "ipc", "ipc-sm")      # TF_GLM_INDEX_SPLIT_GATHER (patch 0198)
++GATHER_BLOCK = 256 << 10                 # bytes a block of the IPC gather's copy-out (1 MiB a rank: 4 blocks)
++_IPC = None                              # the split's CUDA IPC gather (``warm``), or None: NCCL
++
++
++def gather_mode(env=None) -> str:
++    """TF_GLM_INDEX_SPLIT_GATHER: nccl (the default), ipc (copy engines) or ipc-sm (SM stores)."""
++
++    env = os.environ if env is None else env
++    value = str(env.get("TF_GLM_INDEX_SPLIT_GATHER", "") or "nccl").strip().lower()
++    if value not in GATHERS:
++        raise ValueError(f"TF_GLM_INDEX_SPLIT_GATHER: nccl, ipc or ipc-sm, not {value!r}")
++    return value
++
++
++def gather_code(env=None) -> int:
++    """The gather setting for the ranks' startup comparison."""
++
++    return GATHERS.index(gather_mode(env))
++
++
++def gather_bytes(rows: int, world: int) -> int:
++    """The most bytes one rank sends in a split gather of a piece of up to ``rows`` rows: int32 [slots, B, 512]
++    (``select``'s send buffer: B the piece's block rows, slots the blocks a rank holds)."""
++
++    most = 0
++    for R in range(128, int(rows) + 1):
++        b = min(R, split_block(R, world))
++        blocks = -(-R // b)
++        most = max(most, -(-blocks // int(world)) * b * 512 * 4)
++    return most
++
++
++def warm(comm, rank: int, world: int, rows: int) -> None:
++    """Every rank at startup (a collective step): with the split on and TF_GLM_INDEX_SPLIT_GATHER=ipc / ipc-sm,
++    the split's CUDA IPC gather, with regions for ``gather_bytes(rows, world)`` a rank; ``comm``: the NCCL
++    communicator (its all-gather exchanges the regions' handles). Without peer-to-peer access every rank says so and
++    the split's gathers stay on NCCL."""
++
++    global _IPC
++    mode = gather_mode()
++    if not (settings().on and int(world) > 1 and mode != "nccl") or _IPC is not None:
++        return
++    from tensorfold.cuda.ipc import PROTO, IpcGather, IpcUnavailable
++
++    nbytes = gather_bytes(rows, world)
++    proto = PROTO["ce"] if mode == "ipc" else PROTO["flag"]
++    try:
++        _IPC = IpcGather(comm, int(rank), int(world), max_bytes=nbytes, block_bytes=GATHER_BLOCK,
++                         bands=[(proto, nbytes)])
++    except IpcUnavailable as exc:
++        _IPC = None
++        if int(rank) == 0:
++            print(f"[tensorfold] TF_GLM_INDEX_SPLIT_GATHER={mode}: {exc}; the index split's gathers stay on NCCL",
++                  flush=True)
++        return
++    if int(rank) == 0:
++        how = "copy engines" if mode == "ipc" else "SM stores"
++        print(f"[tensorfold] the index split's pools over CUDA IPC ({how}, up to {nbytes >> 10} KiB a rank)",
++              flush=True)
++
++
++def _all_gather(comm, send: torch.Tensor, recv: torch.Tensor) -> None:
++    """recv <- every rank's send in rank order: the split's IPC gather when it was set up and the bytes fit (the same
++    answer on every rank), NCCL otherwise; the same bytes either way."""
++
++    ipc = _IPC
++    if ipc is not None and ipc.fits_bytes(send.numel() * send.element_size()):
++        ipc.all_gather(send, recv)
++    else:
++        comm.all_gather(send, recv)
++
++
+ def applies(w, b, R: int, host_pos: int | None, all_sparse: bool, sparse_np: int | None) -> bool:
+     """Whether a piece of R rows from ``host_pos`` selects split (the same answer on every rank)."""
+ 
+@@ -159,14 +244,14 @@ def select(w, b, qr: torch.Tensor, xs_qr: torch.Tensor, qb, qi: torch.Tensor, wt
+     comm = getattr(w.comm, "nccl", w.comm)
+     side = _side_stream(b)
+     if side is None:
+-        comm.all_gather(send.reshape(-1), recv.reshape(-1))
++        _all_gather(comm, send.reshape(-1), recv.reshape(-1))
+     else:
+         main = torch.cuda.current_stream()
+         ready = torch.cuda.Event()
+         ready.record(main)
+         with torch.cuda.stream(side):
+             side.wait_event(ready)
+-            comm.all_gather(send.reshape(-1), recv.reshape(-1))
++            _all_gather(comm, send.reshape(-1), recv.reshape(-1))
+             done = torch.cuda.Event()
+             done.record(side)
+         send.record_stream(side)
+diff --git tensorfold/families/glm5_next/cuda/lanes.py tensorfold/families/glm5_next/cuda/lanes.py
+index 880557d..180006a 100644
+--- tensorfold/families/glm5_next/cuda/lanes.py
++++ tensorfold/families/glm5_next/cuda/lanes.py
+@@ -185,7 +185,8 @@ class LaneSplit(HcSplit):
+             self.stream.wait_event(self.ev_fill[0])
+             if ready is not None:
+                 self.stream.wait_event(ready)
+-            self._swap_partial(0)
++            with prof.timed("lane: partials exchange", events_only=True):
++                self._swap_partial(0)
+ 
+     def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
+         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
+@@ -196,7 +197,7 @@ class LaneSplit(HcSplit):
+         b, c = self.b, self.w.cfg
+         lo, hi = self.mine(), self.mine() + self.H
+         outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if hc is not None else [])
+-        with torch.cuda.stream(self.stream):
++        with torch.cuda.stream(self.stream), prof.timed("lane: glue + rows exchange", events_only=True):
+             self._post(0, lo, hi)
+             x = b.x[lo:hi]
+             for slot in taps:
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 16358c9..dae4287 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -711,7 +711,24 @@ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor,
+     """sparse_attention for a prompt chunk's rows: one program a row (and head group) walks every selected token in
+     one online softmax and writes out[r] directly, no fp32 partials; rows with counts 0 are left alone. Other bits
+     than sparse_attention's (one chain instead of merged 512-token chunks), the same for any chunking of the rows.
+-    ``tile`` / ``launch`` override ONEPASS_TILE / ONEPASS_LAUNCH (benchmarks)."""
++    ``tile`` / ``launch`` override ONEPASS_TILE / ONEPASS_LAUNCH (benchmarks). TF_GLM_SPARSE_FAST=1 (patch 0194,
++    ``attn_fast``) or 2 (patch 0199, warp roles in CUDA): the same bits by a faster kernel, once checked on this GPU."""
++    if _SPARSE_FAST:
++        from . import attn_fast
++
++        if attn_fast.on(qa, cache, tile, launch):
++            attn_fast.run(qa, cache, tokens, counts, out, scale)
++            return
++    _sparse_onepass_ref(qa, cache, tokens, counts, out, scale, tile=tile, launch=launch)
++
++
++_SPARSE_FAST = (__import__("os").environ.get("TF_GLM_SPARSE_FAST", "") or "0").strip() in ("1", "2")   # 0194 / 0199
++
++
++def _sparse_onepass_ref(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
++                        out: torch.Tensor, scale: float, *, tile: tuple | None = None,
++                        launch: tuple | None = None) -> None:
++    """sparse_onepass' own kernel launch (the reference of TF_GLM_SPARSE_FAST)."""
+     R, H, LW = qa.shape
+     if not (qa.is_contiguous() and out.is_contiguous() and tokens.is_contiguous() and cache.is_contiguous()):
+         raise ValueError("sparse_onepass: expected contiguous queries, output, token lists and cache")
+diff --git tensorfold/families/glm5_next/cuda/prof.py tensorfold/families/glm5_next/cuda/prof.py
+index 450e279..32ecbe7 100644
+--- tensorfold/families/glm5_next/cuda/prof.py
++++ tensorfold/families/glm5_next/cuda/prof.py
+@@ -1,4 +1,13 @@
+-"""TF_GLM_PROFILE=1: time (with device syncs) and memory of each block kind of every prompt chunk, printed after each prefill; never inside decode or capture."""
++"""TF_GLM_PROFILE: per block kind of every prompt chunk, printed after each prefill; never inside decode or capture.
++
++``1``: each block timed with device syncs, and the memory each block added (the original profile). The syncs serialize
++the streams (the prefill lanes, the row split's exchanges) and expose every launch and every cross-rank wait, so short
++blocks read far longer than they run: read shares of long blocks only.
++``events`` (patch 0191): each block timed by CUDA events recorded on the stream that issues it, read once after the
++prompt; nothing waits, so streams keep overlapping and the prompt runs at speed. A block's time is its span on its
++issuing stream (its own kernels, plus any wait for another stream queued inside it); work it queues on another
++stream (an exchange) is not in it. Nested blocks ("dsa: x" inside "dsa (total)") are timed alike; shares count the
++outer kinds only. No memory figures in this mode (they need syncs)."""
+ 
+ from __future__ import annotations
+ 
+@@ -8,17 +17,56 @@ from contextlib import contextmanager
+ 
+ import torch
+ 
+-ENABLED = os.environ.get("TF_GLM_PROFILE", "0") == "1"
++
++def _mode(value: str | None = None) -> str:
++    value = (os.environ.get("TF_GLM_PROFILE", "0") if value is None else value).strip() or "0"
++    if value not in ("0", "1", "events"):
++        raise ValueError(f"TF_GLM_PROFILE: 0 (off), 1 (synced) or events, not {value!r}")
++    return value
++
++
++MODE = _mode()
++ENABLED = MODE != "0"
++EVENTS = MODE == "events"
+ active = False                     # set only around prefill chunks
+ totals: dict[str, float] = {}
++counts: dict[str, int] = {}
+ peaks: dict[str, int] = {}         # the most memory a block allocated on top of what was live before it
++host: dict[str, float] = {}        # events mode: host seconds spent issuing each block (Python, launches, host waits)
++_marks: list[tuple[str, object, object]] = []     # events mode: (name, start, end) of every block since the report
++_pool: list = []                   # events mode: recorded events, reused once read
++_used = 0
++
++
++def _event():
++    global _used
++    if _used == len(_pool):
++        _pool.append(torch.cuda.Event(enable_timing=True))
++    e = _pool[_used]
++    _used += 1
++    return e
+ 
+ 
+ @contextmanager
+-def timed(name: str):
+-    if not (ENABLED and active):
++def timed(name: str, events_only: bool = False):
++    """Time the block as ``name``. ``events_only``: a block only the events mode times (one on a side stream, e.g. a
++    lane's exchange and glue), so the synced mode's figures stay what they were."""
++    if not (ENABLED and active) or (events_only and not EVENTS):
+         yield
+         return
++    if EVENTS:
++        stream = torch.cuda.current_stream()
++        a = _event()
++        a.record(stream)
++        t = time.perf_counter()
++        try:
++            yield
++        finally:
++            host[name] = host.get(name, 0.0) + time.perf_counter() - t      # the host's time issuing the block
++            b = _event()
++            b.record(torch.cuda.current_stream())     # the block left the stream it entered on
++            _marks.append((name, a, b))
++        return
+     torch.cuda.synchronize()
+     before = torch.cuda.memory_allocated()
+     torch.cuda.reset_peak_memory_stats()
+@@ -26,18 +74,60 @@ def timed(name: str):
+     yield
+     torch.cuda.synchronize()
+     totals[name] = totals.get(name, 0.0) + time.perf_counter() - t
++    counts[name] = counts.get(name, 0) + 1
+     peaks[name] = max(peaks.get(name, 0), torch.cuda.max_memory_allocated() - before)
+ 
+ 
++_wall = [0.0]                      # events mode: first block start to last block end, summed over the chunks reported
++
++
++def _collect() -> None:
++    """Events mode: wait for the recorded events once and add their spans to the totals (and the wall time from the
++    first block's start to the last block's end, every stream: events share one timeline)."""
++
++    global _used
++    if not _marks:
++        return
++    torch.cuda.synchronize()
++    first = _marks[0][1]
++    last = 0.0
++    for name, a, b in _marks:
++        totals[name] = totals.get(name, 0.0) + a.elapsed_time(b) / 1000.0
++        counts[name] = counts.get(name, 0) + 1
++        last = max(last, first.elapsed_time(b) / 1000.0)
++    _wall[0] += last
++    _marks.clear()
++    _used = 0
++
++
+ def report(tokens: int) -> None:
+-    if not ENABLED or not totals:
++    if not ENABLED:
++        return
++    if EVENTS:
++        _collect()
++    if not totals:
+         return
+     total = sum(v for k, v in totals.items() if ":" not in k)          # "dsa: x" parts are inside "dsa (total)"
+-    parts = ", ".join(f"{k} {v:.2f}s ({100 * v / total:.0f}%)" for k, v in sorted(totals.items(), key=lambda kv: -kv[1]))
+-    print(f"[tensorfold] prefill profile, {tokens} tokens in {total:.1f}s timed ({tokens / total:.0f} tok/s): {parts}",
+-          flush=True)
+-    big = ", ".join(f"{k} {v / 2**30:.2f}" for k, v in sorted(peaks.items(), key=lambda kv: -kv[1])[:6])
+-    print(f"[tensorfold] prefill memory (GiB): allocated {torch.cuda.memory_allocated() / 2**30:.1f}, reserved "
+-          f"{torch.cuda.memory_reserved() / 2**30:.1f}; most a block added: {big}", flush=True)
++    if EVENTS:
++        parts = ", ".join(f"{k} {v:.3f}s ({100 * v / total:.0f}%, {counts.get(k, 0)}x {1e3 * v / max(1, counts.get(k, 0)):.3f}ms)"
++                          for k, v in sorted(totals.items(), key=lambda kv: -kv[1]))
++        issued = sum(v for k, v in host.items() if ":" not in k)
++        print(f"[tensorfold] prefill profile (events: GPU time on the issuing stream, streams overlapping), {tokens} "
++              f"tokens, first block to last {_wall[0]:.2f}s, outer blocks {total:.2f}s "
++              f"({100 * total / max(_wall[0], 1e-9):.0f}% of it), host issuing them {issued:.2f}s: {parts}", flush=True)
++        slow = ", ".join(f"{k} {v:.3f}s" for k, v in sorted(host.items(), key=lambda kv: -kv[1])[:8])
++        print(f"[tensorfold] prefill profile host time issuing (most): {slow}", flush=True)
++        _wall[0] = 0.0
++        host.clear()
++    else:
++        parts = ", ".join(f"{k} {v:.2f}s ({100 * v / total:.0f}%)" for k, v in sorted(totals.items(), key=lambda kv: -kv[1]))
++        print(f"[tensorfold] prefill profile, {tokens} tokens in {total:.1f}s timed ({tokens / total:.0f} tok/s): {parts}",
++              flush=True)
++        calls = ", ".join(f"{k} {counts.get(k, 0)}" for k in sorted(totals, key=lambda k: -totals[k]))
++        print(f"[tensorfold] prefill profile calls: {calls}", flush=True)
++        big = ", ".join(f"{k} {v / 2**30:.2f}" for k, v in sorted(peaks.items(), key=lambda kv: -kv[1])[:6])
++        print(f"[tensorfold] prefill memory (GiB): allocated {torch.cuda.memory_allocated() / 2**30:.1f}, reserved "
++              f"{torch.cuda.memory_reserved() / 2**30:.1f}; most a block added: {big}", flush=True)
+     totals.clear()
++    counts.clear()
+     peaks.clear()
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index 1bbc8ac..0474416 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -407,7 +407,8 @@ def dec_tile(n: int, k: int, m: int = 1) -> int | None:
+ 
+ def prefill_tile(n: int, k: int, m: int) -> int:
+     """The shared prefill matmul's tile for a prompt chunk's (n, k) matmul of m rows: 0 (128x128, 3 stages), or a
+-    launch table's ``q4_prefill`` entry (TF_GLM_TUNE); no tile changes a row's bits (qmm_prefill.cu)."""
++    launch table's ``q4_prefill`` entry (TF_GLM_TUNE; 32 + v: qmm_prefill2's variant v, patch 0195); no tile changes
++    a row's bits (qmm_prefill.cu, qmm_prefill2.cu)."""
+ 
+     t = tune.pick("q4_prefill", tune.shape(n, k), m)
+     return 0 if t is None else int(t)
+diff --git tensorfold/families/glm5_next/cuda/select_fast.py tensorfold/families/glm5_next/cuda/select_fast.py
+new file mode 100644
+index 0000000..cd3557b
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/select_fast.py
+@@ -0,0 +1,272 @@
++"""TF_GLM_SELECT_FAST=1 (patch 0192): a prompt chunk's DSA pool scores (the indexer's s_p = sum_h w_h relu(scale *
++qi_h . pool_p) a row and complete pool) by a kernel that gives every score the bits of ``sparse._scores``, faster.
++
++Why: at long contexts the indexer scores are the token selection's main cost (a row scores pos / 4 pools, 32 heads of
++128: 8 KFLOP a pool, at 100K about 50 GFLOP a 512-row block a layer), and ``_scores`` spends most of its time
++outside the tensor cores: a program scores RB rows x 64 pools, so for every 64 pools each row's 32 x 128 index query
++is loaded again from memory and staged through shared memory, and the 64 x 128 key tile is masked, staged and loaded
++again for each row.
++
++How: a program keeps RB rows' index queries in shared memory and walks pool blocks (blocks cs, cs + CS, .. of the
++chunk's NP pools); a block's keys go through shared memory once and, where every pool of the block is visible to every
++row of the program (all but the blocks at the rows' own positions), its tensor-core operand is loaded once for all RB
++rows. The blocks at the rows' positions take ``_scores``' per-row masking.
++
++Exact: written in Gluon with ``_scores``' layouts spelled out, as Triton 3.7 compiles ``_scores`` for sm_120: the
++32 x 64 dot as two-by-one m16n8k16 tiles a warp, warps side by side over the pools, and its operands' k width, which
++orders a fragment's k elements inside each mma step and so sets the bits: 4 with fp8 pooled keys (Triton widens the
++upcast keys' fragments), 2 with bf16 keys (the swizzle follows, 16- or 8-wide). So a row's 64 dots, its fp8 scale
++and query scale, its ReLU, its head weights and its sum over the 32 heads are ``_scores``' operations in ``_scores``'
++order on the same operands: ``tests/k5/check_ptx.py`` compares both kernels' dot operand layouts in their TTGIR and
++their PTX float instructions one for one, for each key format. A key the mask would zero is never read where the mask
++is all-true. Rows, pools and the -inf fill are ``_scores``'. On the GPU the scores are compared with ``_scores``' byte
++for byte on the first call of a process for its key format (random rows over a wide range of magnitudes) and, with
++TF_GLM_SELECT_FAST_CHECK=1, on every call (a test setting); a difference turns the setting off for the process (a line
++says so) and ``_scores`` runs.
++
++Settings: TF_GLM_SELECT_FAST 0 (default: off) or 1; TF_GLM_SELECT_FAST_RB 1, 2 or 4 (rows a program, default 4) and
++TF_GLM_SELECT_FAST_GRID (programs a call aims for, default 4 x the GPU's SMs) change speed only.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++from triton.experimental import gluon
++from triton.experimental.gluon import language as gl
++from triton.experimental.gluon.language.nvidia.ampere import mma_v2
++
++# _scores' layouts on sm_120 (Triton 3.7, num_warps 4, a 32 x 128 query tile, a 64 x 128 key tile): read from its TTGIR.
++# The dot's operands depend on the pooled keys' format: fp8 keys (upcast to bf16 in registers) give k width 4 and a
++# 16-wide swizzle, bf16 keys k width 2 and an 8-wide swizzle; the k width orders a fragment's k elements inside each
++# mma step, so it sets the bits (the swizzle only the addresses). FP8_LAYOUTS / BF16_LAYOUTS: (A, B, shared).
++_BLK = gl.constexpr(gl.BlockedLayout([1, 1], [1, 32], [1, 4], [1, 0]))
++_BLK1 = gl.constexpr(gl.BlockedLayout([1], [32], [4], [0]))
++_MMA = gl.constexpr(gl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]))
++FP8_LAYOUTS = (gl.DotOperandLayout(operand_index=0, parent=_MMA.value, k_width=4),
++               gl.DotOperandLayout(operand_index=1, parent=_MMA.value, k_width=4),
++               gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=4, order=[1, 0]))
++BF16_LAYOUTS = (gl.DotOperandLayout(operand_index=0, parent=_MMA.value, k_width=2),
++                gl.DotOperandLayout(operand_index=1, parent=_MMA.value, k_width=2),
++                gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=8, order=[1, 0]))
++# loads only (a tile's register layout before it goes to shared memory sets no bit): 16-byte vectors
++_KV = gl.constexpr(gl.BlockedLayout([1, 16], [4, 8], [4, 1], [1, 0]))      # a 64 x 128 fp8 key tile
++_QV = gl.constexpr(gl.BlockedLayout([1, 8], [2, 16], [4, 1], [1, 0]))      # a 32 x 128 bf16 query tile
++WARPS = 4
++
++
++def _flag(name: str, default: str, allowed: tuple[str, ...]) -> str:
++    value = (os.environ.get(name, "") or default).strip()
++    if value not in allowed:
++        raise ValueError(f"{name}: {' or '.join(allowed)}, not {value!r}")
++    return value
++
++
++ENABLED = _flag("TF_GLM_SELECT_FAST", "0", ("0", "1")) == "1"
++CHECK = _flag("TF_GLM_SELECT_FAST_CHECK", "0", ("0", "1")) == "1"
++RB = int(_flag("TF_GLM_SELECT_FAST_RB", "4", ("1", "2", "4")))
++GRID = int(os.environ.get("TF_GLM_SELECT_FAST_GRID", "0") or 0)
++
++_decided: bool | None = None
++
++
++def code() -> list[int]:
++    """The settings every rank must share (the startup comparison): on, check."""
++    return [int(ENABLED), int(CHECK)]
++
++
++def describe() -> str:
++    return ("prompt chunks' DSA pool scores by the fast kernel (the same bits, checked on this GPU"
++            + (", every call)" if CHECK else ")"))
++
++
++@gluon.jit
++def _stage_q(QS, QI, i, r, R, H: gl.constexpr, HP: gl.constexpr, D: gl.constexpr):
++    """Row r's index query [HP, D] into shared slot i, zeros past the R rows."""
++    hh = gl.arange(0, HP, layout=gl.SliceLayout(1, _QV))
++    dd = gl.arange(0, D, layout=gl.SliceLayout(0, _QV))
++    q = gl.load(QI + (r * H + hh[:, None]) * D + dd[None, :], mask=(hh < H)[:, None] & (r < R), other=0.0)
++    QS.index(i).store(q.to(gl.bfloat16))
++
++
++@gluon.jit
++def _row_out(OUT, W, w_stride, r, R, NP, dots, ks, hh_m, hok_m, p_m, p_o, npool, scale, wscale, FP8: gl.constexpr):
++    """_scores' epilogue for row r: fp8 scales, query scale, ReLU, head weights, the sum over the heads, -inf past the
++    row's pools, the store (its head weights loaded as _scores loads them)."""
++    if FP8:
++        dots = dots * ks[None, :]
++    w = gl.load(W + r * w_stride + hh_m, mask=hok_m & (r < R), other=0.0).to(gl.float32) * wscale
++    sc = gl.sum(w[:, None] * gl.maximum(dots * scale, 0.0), axis=0)
++    sc = gl.where(p_m < npool, sc, float("-inf"))
++    gl.store(OUT + r * NP + p_o, gl.convert_layout(sc, _BLK1), mask=(p_o < NP) & (r < R))
++
++
++@gluon.jit
++def _scores_fast(QI, W, w_stride, PK, PKS, OUT, POS, R, NP, scale, wscale, H: gl.constexpr, HP: gl.constexpr,
++                 D: gl.constexpr, BP: gl.constexpr, RB: gl.constexpr, RS: gl.constexpr, FP8: gl.constexpr,
++                 CS: gl.constexpr, DA: gl.constexpr, DB: gl.constexpr, SH: gl.constexpr):
++    """Program (RB rows, column split cs): pool blocks cs, cs + CS, .. of the NP scored, each through _scores'
++    arithmetic for every row of the program."""
++    rb = gl.program_id(0)
++    cs = gl.program_id(1)
++    P = gl.load(POS)
++    r0 = rb * RB
++    d_b = gl.arange(0, D, layout=gl.SliceLayout(0, _KV))
++    hh_m = gl.arange(0, HP, layout=gl.SliceLayout(1, _MMA))
++    hok_m = hh_m < H
++    QS = gl.allocate_shared_memory(gl.bfloat16, [RB, HP, D], SH)             # RB buffers of SH
++    for i in gl.static_range(RB):
++        _stage_q(QS, QI, i, r0 + i, R, H, HP, D)
++    ksm = gl.allocate_shared_memory(gl.bfloat16, [BP, D], SH)
++    visible = (P + gl.minimum(r0 + RB, R)) // 4           # pools the program's last row sees
++    first = (P + r0 + 1) // 4                              # pools its first row sees
++    kmax = (P + r0 + RB) // 4                              # _scores' key mask (rb * RB + RB)
++    nblk = (NP + BP - 1) // BP
++    for pb in range(cs, nblk, CS):
++        p_m = pb * BP + gl.arange(0, BP, layout=gl.SliceLayout(0, _MMA))
++        p_b = pb * BP + gl.arange(0, BP, layout=gl.SliceLayout(1, _KV))
++        p_o = pb * BP + gl.arange(0, BP, layout=_BLK1)
++        if pb * BP >= visible:
++            ninf = gl.full([BP], float("-inf"), gl.float32, _BLK1)
++            for i in gl.static_range(RB):
++                gl.store(OUT + (r0 + i) * NP + p_o, ninf, mask=(p_o < NP) & (r0 + i < R))
++        else:
++            k = gl.load(PK + p_b[:, None].to(gl.int64) * RS + d_b[None, :], mask=(p_b < kmax)[:, None],
++                        other=0.0).to(gl.bfloat16)
++            if FP8:
++                ks = gl.load(PKS + p_m.to(gl.int64) * (RS // 4) + D // 4, mask=p_m < kmax, other=1.0)
++            else:
++                ks = gl.full([BP], 1.0, gl.float32, gl.SliceLayout(0, _MMA))
++            z = gl.zeros([HP, BP], gl.float32, _MMA)
++            if pb * BP + BP <= first:                      # every pool of the block seen by every row: no mask
++                ksm.store(k)
++                kb = ksm.permute([1, 0]).load(DB)
++                for i in gl.static_range(RB):
++                    r = r0 + i
++                    dots = mma_v2(QS.index(i).load(DA), kb, z)
++                    _row_out(OUT, W, w_stride, r, R, NP, dots, ks, hh_m, hok_m, p_m, p_o, (P + r + 1) // 4, scale,
++                             wscale, FP8)
++            else:                                          # the rows' own block: _scores' mask, row by row
++                for i in gl.static_range(RB):
++                    r = r0 + i
++                    if r < R:
++                        npool = (P + r + 1) // 4
++                        ksm.store(gl.where((p_b < npool)[:, None], k, 0.0))
++                        dots = mma_v2(QS.index(i).load(DA), ksm.permute([1, 0]).load(DB), z)
++                        _row_out(OUT, W, w_stride, r, R, NP, dots, ks, hh_m, hok_m, p_m, p_o, npool, scale, wscale,
++                                 FP8)
++
++
++def _sms(device) -> int:
++    if device.type != "cuda":
++        return 4                                    # the interpreter (tests)
++    return torch.cuda.get_device_properties(device).multi_processor_count
++
++
++def _grid(n: int, NP: int, rb: int, device) -> tuple[int, int]:
++    """(row blocks, column splits): splits enough for about GRID programs (speed only)."""
++    blocks = -(-n // rb)
++    target = GRID or 4 * _sms(device)
++    cs = max(1, min(-(-NP // 64), -(-target // blocks)))
++    return blocks, cs
++
++
++def launch(sel, a: int, at: torch.Tensor, scores: torch.Tensor, rb: int | None = None, cs: int | None = None) -> None:
++    """The scores of PromptSelect ``sel``'s block at row a (n rows over its NP pools) into ``scores`` [n, NP]."""
++    n, NP = sel.rows(a), sel.NP
++    rb = rb or RB
++    blocks, split = _grid(n, NP, rb, scores.device)
++    split = cs or split
++    da, db, sh = FP8_LAYOUTS if sel.fp8 else BF16_LAYOUTS
++    _scores_fast[(blocks, split)](sel.qi[a:a + n], sel.wts[a:a + n], sel.wts.stride(0), sel.pkv, sel.pks, scores, at,
++                                  n, NP, sel.D ** -0.5, sel.wscale, H=sel.H, HP=max(16, triton.next_power_of_2(sel.H)),
++                                  D=sel.D, BP=64, RB=rb, RS=sel.rs, FP8=sel.fp8, CS=split, DA=da, DB=db, SH=sh,
++                                  num_warps=WARPS)
++
++
++def reference(sel, a: int, at: torch.Tensor, scores: torch.Tensor) -> None:
++    """``sparse._scores``' launch for the same block (what PromptSelect.pools runs without the setting)."""
++    from .sparse import _scores
++
++    n, NP = sel.rows(a), sel.NP
++    _scores[(triton.cdiv(n, sel.rb), triton.cdiv(NP, 64))](
++        sel.qi[a:a + n], sel.wts[a:a + n], sel.wts.stride(0), sel.pkv, sel.pks, scores, at, n, NP, sel.D ** -0.5,
++        sel.wscale, H=sel.H, HP=max(16, triton.next_power_of_2(sel.H)), D=sel.D, BP=64, RB=sel.rb, RS=sel.rs,
++        FP8=sel.fp8, num_warps=4)
++
++
++def _same(x: torch.Tensor, y: torch.Tensor) -> bool:
++    return x.shape == y.shape and torch.equal(x.contiguous().view(torch.int32), y.contiguous().view(torch.int32))
++
++
++def self_check(sel, device) -> bool:
++    """Both kernels on random index queries, head weights and pooled keys of the call's kind (fp8 or bf16 keys), over
++    a wide range of magnitudes, at several positions and row counts, compared byte for byte."""
++    from . import kv8
++    from .sparse import PromptSelect
++
++    gen = torch.Generator(device=device).manual_seed(192)
++
++    def wide(shape, spread):
++        e = torch.randint(-spread, spread + 1, shape, device=device, generator=gen).float()
++        return torch.randn(shape, device=device, generator=gen) * torch.exp2(e)
++
++    kind = "fp8" if sel.fp8 else "bf16"
++    for pos, R in ((2048, 512), (8191, 129), (20480, 512), (40000, 7)):
++        cap = pos + R + 8
++        pk = kv8.zeros(cap // 4 + 2, sel.D, kind, device)
++        keys = wide((cap // 4 + 2, sel.D), 4)
++        if kind == "fp8":
++            pk.copy_(kv8.quantize_rows(keys))
++        else:
++            pk.copy_(keys.to(torch.bfloat16))
++        qi = wide((R, sel.H * sel.D), 6).to(torch.bfloat16)
++        wbuf = wide((R, sel.H + 128), 6).to(torch.bfloat16)
++        wts = wbuf[:, 128:128 + sel.H]
++        pos_dev = torch.tensor([pos], dtype=torch.int32, device=device)
++        other = PromptSelect(qi, wts, pk, pos, R, pk.shape[0] - 2, pos_dev, block=R)
++        n, NP = other.rows(0), other.NP
++        a_ = torch.full((n, NP), 7.0, device=device)
++        b_ = torch.full((n, NP), 3.0, device=device)
++        reference(other, 0, pos_dev, a_)
++        for rb in (1, 2, 4):
++            b_.fill_(3.0)
++            launch(other, 0, pos_dev, b_, rb=rb)
++            if not _same(a_, b_):
++                return False
++    return True
++
++
++def on(sel) -> bool:
++    """Whether to score ``sel``'s blocks with the fast kernel: the setting, and the check passed on this GPU (run on
++    the first call of the process)."""
++
++    global _decided
++    if not ENABLED:
++        return False
++    if _decided is None:
++        try:
++            ok = self_check(sel, sel.qi.device)
++            why = "" if ok else ": its scores differ from the reference kernel's on this GPU"
++        except Exception as exc:  # noqa: BLE001 - a kernel that cannot run here is off; the reference runs
++            ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++        _decided = ok
++        print(f"[tensorfold] fast DSA pool scores: {'on (checked bit for bit)' if ok else 'off' + why}", flush=True)
++    return _decided
++
++
++def scores(sel, a: int, at: torch.Tensor, out: torch.Tensor) -> None:
++    """The block's scores into ``out`` [n, NP] (``on(sel)`` true); TF_GLM_SELECT_FAST_CHECK=1 compares every call
++    with the reference kernel and stops on a difference."""
++    launch(sel, a, at, out)
++    if CHECK:
++        ref = torch.empty_like(out)
++        reference(sel, a, at, ref)
++        if not _same(out, ref):
++            bad = (out.view(torch.int32) != ref.view(torch.int32)).any(dim=1).nonzero().flatten()[:8].tolist()
++            raise RuntimeError(f"TF_GLM_SELECT_FAST_CHECK: the fast pool scores differ from the reference's (rows "
++                               f"{bad} of the block at row {a})")
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index cdcf66b..1fcfd44 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -379,6 +379,38 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+     return tokens, counts
+ 
+ 
++_FAST: bool | None = None
++
++
++def fast_scores(sel) -> bool:
++    """TF_GLM_SELECT_FAST=1 (patch 0192, ``select_fast``): a prompt chunk's pool scores by the fast kernel, once it
++    gave ``_scores``' bits on this GPU (its first call checks)."""
++
++    global _FAST
++    if _FAST is None:
++        import os
++
++        value = (os.environ.get("TF_GLM_SELECT_FAST", "") or "0").strip()
++        if value not in ("0", "1"):
++            raise ValueError(f"TF_GLM_SELECT_FAST: 0 or 1, not {value!r}")
++        _FAST = value == "1"
++    if not _FAST:
++        return False
++    from . import select_fast
++
++    return select_fast.on(sel)
++
++
++def _top_prompt(scores: torch.Tensor) -> torch.Tensor:
++    """A prompt block's top-512 pools (``top_pools``); TF_GLM_TOPK_FAST=1 (patch 0199, ``topk_fast``): the same pools
++    by a kernel that reads the scores twice, once checked on this GPU."""
++    from . import topk_fast
++
++    if topk_fast.ENABLED and topk_fast.on(scores):
++        return topk_fast.top512(scores)
++    return top_pools(scores, TOPK_POOLS)
++
++
+ class PromptSelect:
+     """``_select_prompt``'s constants for one prompt chunk (or one piece of a multi-prompt chunk) and its two steps
+     for the block of rows a .. a + n (n = min(B, R - a), B = min(R, SELECT_ROWS)): ``pools`` scores the block's rows
+@@ -424,11 +456,16 @@ class PromptSelect:
+ 
+         n, NP = self.rows(a), self.NP
+         scores = self.buf[:n * NP].view(n, NP)
++        if fast_scores(self):            # TF_GLM_SELECT_FAST=1 (patch 0192): _scores' bits, faster
++            from . import select_fast
++
++            select_fast.scores(self, a, at, scores)
++            return _top_prompt(scores)
+         _scores[(triton.cdiv(n, self.rb), triton.cdiv(NP, 64))](
+             self.qi[a:a + n], self.wts[a:a + n], self.wts.stride(0), self.pkv, self.pks, scores, at, n, NP,
+             self.D ** -0.5, self.wscale, H=self.H, HP=max(16, triton.next_power_of_2(self.H)), D=self.D, BP=64,
+             RB=self.rb, RS=self.rs, FP8=self.fp8, num_warps=4)
+-        return top_pools(scores, TOPK_POOLS)                                           # ascending pool index
++        return _top_prompt(scores)                                                     # ascending pool index
+ 
+     def write_tokens(self, a: int, pools: torch.Tensor, at: torch.Tensor, tokens: torch.Tensor,
+                      counts: torch.Tensor) -> None:
+diff --git tensorfold/families/glm5_next/cuda/sparse_topk.cu tensorfold/families/glm5_next/cuda/sparse_topk.cu
+new file mode 100644
+index 0000000..a3fd35f
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/sparse_topk.cu
+@@ -0,0 +1,328 @@
++// TF_GLM_TOPK_FAST=1 (patch 0199): a prompt chunk's top-512 pools a row (sparse.top_pools on its _select_rows path)
++// in two reads of the row's scores instead of five, the same pools in the same order.
++//
++// _select_rows finds the 512th best score's order key by a radix select of 8 bits a pass (four passes over the row),
++// then writes, in pool order, the pools above it and the lowest-numbered ties (a fifth pass). Its output is a function
++// of the scores alone: the 512 best order keys, ties to the lower pool, in ascending pool order. This kernel computes
++// the same set with one CTA a row:
++//   1. one read: a histogram of the order keys' top 12 bits (shared memory, warp-aggregated atomics); the bin that
++//      holds the 512th best key (b1), the count above it;
++//   2. a second read: pools in bins above b1 marked selected (a bitmap), the keys and pools of bin b1 kept (shared
++//      memory, up to CAP of them);
++//   3. the threshold key among those candidates (a radix select of their low 20 bits, 10 a step), candidates above it
++//      marked selected, those equal to it marked tied;
++//   4. the bitmap compacted in pool order: every selected pool, then the first (512 - selected) tied ones, at their
++//      positions by prefix counts.
++// When bin b1 holds more than CAP pools (scores bunched, e.g. -inf rows), the low bits are resolved by two more
++// reads (12 and 8 bits) and the row classified again; rows over 65,536 pools (no room for the bitmaps) take a final
++// ordered read instead of the bitmaps. Every path gives the same pools: the set is defined by the order keys.
++//
++// Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++// the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace {
++
++constexpr int TK = 512;                     // pools a row keeps (TOPK_POOLS)
++constexpr int THREADS = 256;
++constexpr int NB = 4096;                    // first-level bins: an order key's top 12 bits
++constexpr int CAP = 1024;                   // candidates of the threshold bin kept in shared memory
++constexpr int MAXW = 2048;                  // bitmap words in shared memory: rows of up to 65,536 pools
++
++struct TkSmem {
++    unsigned hist[NB];
++    unsigned ckey[CAP];
++    int cidx[CAP];
++    unsigned sel[MAXW];                     // bit i of word w: pool 32 w + i selected outright
++    unsigned tie[MAXW];                     // ... its key equals the threshold
++    unsigned scan[THREADS / 32];
++    int b1, above, ccount, thr, need;       // bin, keys above, candidates, the threshold key, ties to take
++};
++
++// _order_key: the bits of s + 0.0 (so -0 counts as +0), the sign bit flipped for positives, every bit for negatives
++__device__ __forceinline__ unsigned order_key(float s) {
++    float z;
++    asm("add.rn.f32 %0, %1, 0f00000000;" : "=f"(z) : "f"(s));
++    const unsigned u = __float_as_uint(z);
++    return u ^ ((static_cast<unsigned>(static_cast<int>(u) >> 31)) | 0x80000000u);
++}
++
++// hist[bin] += 1 for every lane with ok, one shared atomic per distinct bin of the warp
++__device__ __forceinline__ void hist_add(unsigned* hist, unsigned bin, bool ok) {
++    const unsigned key = ok ? bin : 0xFFFFFFFFu;
++    const unsigned peers = __match_any_sync(0xFFFFFFFFu, key);
++    const int lane = threadIdx.x & 31;
++    if (ok && lane == __ffs(peers) - 1) atomicAdd(&hist[bin], static_cast<unsigned>(__popc(peers)));
++}
++
++// Block-wide exclusive prefix sum of v (thread order), and the total
++__device__ __forceinline__ unsigned block_excl(unsigned v, unsigned* scratch, unsigned& total) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    unsigned x = v;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        const unsigned y = __shfl_up_sync(0xFFFFFFFFu, x, d);
++        if (lane >= d) x += y;
++    }
++    if (lane == 31) scratch[warp] = x;
++    __syncthreads();
++    unsigned before = 0, all = 0;
++#pragma unroll
++    for (int w = 0; w < THREADS / 32; ++w) {
++        const unsigned c = scratch[w];
++        before += w < warp ? c : 0u;
++        all += c;
++    }
++    __syncthreads();
++    total = all;
++    return before + x - v;
++}
++
++// The largest bin b of hist[0 .. nbins) with count(bins >= b) >= need; above = count(bins > b). Every thread gets them.
++__device__ __forceinline__ void find_bin(const unsigned* hist, int nbins, unsigned need, unsigned* scratch, int& bin,
++                                         unsigned& above, int* out_bin, int* out_above) {
++    const int per = nbins / THREADS;                 // bins a thread, counted from the top
++    const int hi = nbins - 1 - per * static_cast<int>(threadIdx.x);
++    unsigned local = 0;
++    for (int b = hi; b > hi - per; --b) local += hist[b];
++    unsigned total;
++    const unsigned excl = block_excl(local, scratch, total);   // keys in the bins above this thread's
++    if (excl < need && excl + local >= need) {
++        unsigned acc = excl;
++        for (int b = hi; b > hi - per; --b) {
++            if (acc + hist[b] >= need) {
++                *out_bin = b;
++                *out_above = static_cast<int>(acc);
++                break;
++            }
++            acc += hist[b];
++        }
++    }
++    __syncthreads();
++    bin = *out_bin;
++    above = static_cast<unsigned>(*out_above);
++}
++
++__global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restrict__ scores, int64_t* __restrict__ out,
++                                                           int NP) {
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    TkSmem& sm = *reinterpret_cast<TkSmem*>(smem_raw);
++    const int tid = threadIdx.x;
++    const float* row = scores + static_cast<size_t>(blockIdx.x) * NP;
++    int64_t* dst = out + static_cast<size_t>(blockIdx.x) * TK;
++    const int W = (NP + 31) / 32;
++    const bool bitmap = W <= MAXW;
++    const int span = ((NP + THREADS * 4 - 1) / (THREADS * 4)) * (THREADS * 4);   // every lane runs every step
++
++    // 1. the histogram of the top 12 bits
++    for (int i = tid; i < NB; i += THREADS) sm.hist[i] = 0;
++    if (bitmap)
++        for (int i = tid; i < W; i += THREADS) sm.sel[i] = sm.tie[i] = 0;
++    if (tid == 0) sm.ccount = 0;
++    __syncthreads();
++#pragma unroll 4
++    for (int i = tid * 4; i < span; i += THREADS * 4) {               // (unrolled: several loads in flight)
++        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
++        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);       // NP % 4 == 0 (the caller checks)
++        hist_add(sm.hist, order_key(v.x) >> 20, i < NP);
++        hist_add(sm.hist, order_key(v.y) >> 20, i < NP);
++        hist_add(sm.hist, order_key(v.z) >> 20, i < NP);
++        hist_add(sm.hist, order_key(v.w) >> 20, i < NP);
++    }
++    __syncthreads();
++    int b1;
++    unsigned above1;
++    find_bin(sm.hist, NB, TK, sm.scan, b1, above1, &sm.b1, &sm.above);
++    const unsigned need1 = TK - above1;              // keys of bin b1 to take (at least 1)
++
++    // 2. classify: above b1 selected; b1's keys kept as candidates
++#pragma unroll 2
++    for (int i = tid * 4; i < span; i += THREADS * 4) {
++        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
++        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
++        const float e[4] = {v.x, v.y, v.z, v.w};
++#pragma unroll
++        for (int c = 0; c < 4; ++c) {
++            const unsigned key = order_key(e[c]);
++            const int b = static_cast<int>(key >> 20);
++            const bool ok = i + c < NP;
++            if (ok && b > b1 && bitmap) atomicOr(&sm.sel[(i + c) >> 5], 1u << ((i + c) & 31));
++            const bool cand = ok && b == b1;
++            const unsigned peers = __ballot_sync(0xFFFFFFFFu, cand);
++            int base = 0;
++            if ((tid & 31) == 0 && peers) base = atomicAdd(&sm.ccount, __popc(peers));
++            base = __shfl_sync(0xFFFFFFFFu, base, 0);
++            if (cand) {
++                const int pos = base + __popc(peers & ((1u << (tid & 31)) - 1u));
++                if (pos < CAP) {
++                    sm.ckey[pos] = key;
++                    sm.cidx[pos] = i + c;
++                }
++            }
++        }
++    }
++    __syncthreads();
++    const int C1 = sm.ccount;
++
++    // 3. the threshold key and the ties to take
++    unsigned thr;
++    unsigned need;
++    if (C1 <= CAP) {                                 // among the candidates in shared memory: bits 19..10, then 9..0
++        for (int i = tid; i < 1024; i += THREADS) sm.hist[i] = 0;
++        __syncthreads();
++        for (int c = tid; c < C1; c += THREADS) atomicAdd(&sm.hist[(sm.ckey[c] >> 10) & 1023u], 1u);
++        __syncthreads();
++        int d1;
++        unsigned above2;
++        find_bin(sm.hist, 1024, need1, sm.scan, d1, above2, &sm.b1, &sm.above);
++        const unsigned need2 = need1 - above2;
++        for (int i = tid; i < 1024; i += THREADS) sm.hist[i] = 0;
++        __syncthreads();
++        for (int c = tid; c < C1; c += THREADS)
++            if (((sm.ckey[c] >> 10) & 1023u) == static_cast<unsigned>(d1)) atomicAdd(&sm.hist[sm.ckey[c] & 1023u], 1u);
++        __syncthreads();
++        int d2;
++        unsigned above3;
++        find_bin(sm.hist, 1024, need2, sm.scan, d2, above3, &sm.b1, &sm.above);
++        thr = (static_cast<unsigned>(b1) << 20) | (static_cast<unsigned>(d1) << 10) | static_cast<unsigned>(d2);
++        need = need2 - above3;
++        if (bitmap)
++            for (int c = tid; c < C1; c += THREADS) {
++                const unsigned k = sm.ckey[c];
++                const int idx = sm.cidx[c];
++                if (k > thr) atomicOr(&sm.sel[idx >> 5], 1u << (idx & 31));
++                else if (k == thr) atomicOr(&sm.tie[idx >> 5], 1u << (idx & 31));
++            }
++    } else {                                         // bin b1 bunched: bits 19..8, then 7..0, from the row again
++        for (int i = tid; i < NB; i += THREADS) sm.hist[i] = 0;
++        __syncthreads();
++        for (int i = tid * 4; i < span; i += THREADS * 4) {
++            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
++            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
++            const float e[4] = {v.x, v.y, v.z, v.w};
++#pragma unroll
++            for (int c = 0; c < 4; ++c) {
++                const unsigned key = order_key(e[c]);
++                hist_add(sm.hist, (key >> 8) & 4095u, i + c < NP && static_cast<int>(key >> 20) == b1);
++            }
++        }
++        __syncthreads();
++        int d1;
++        unsigned above2;
++        find_bin(sm.hist, NB, need1, sm.scan, d1, above2, &sm.b1, &sm.above);
++        const unsigned need2 = need1 - above2;
++        const unsigned pre = (static_cast<unsigned>(b1) << 12) | static_cast<unsigned>(d1);    // the key's top 24 bits
++        for (int i = tid; i < 256; i += THREADS) sm.hist[i] = 0;
++        __syncthreads();
++        for (int i = tid * 4; i < span; i += THREADS * 4) {
++            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
++            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
++            const float e[4] = {v.x, v.y, v.z, v.w};
++#pragma unroll
++            for (int c = 0; c < 4; ++c) {
++                const unsigned key = order_key(e[c]);
++                hist_add(sm.hist, key & 255u, i + c < NP && (key >> 8) == pre);
++            }
++        }
++        __syncthreads();
++        int d2;
++        unsigned above3;
++        find_bin(sm.hist, 256, need2, sm.scan, d2, above3, &sm.b1, &sm.above);
++        thr = (pre << 8) | static_cast<unsigned>(d2);
++        need = need2 - above3;
++        if (bitmap)
++            for (int i = tid; i < NP; i += THREADS) {        // the threshold bin's pools: above / equal
++                const unsigned key = order_key(row[i]);
++                if (static_cast<int>(key >> 20) == b1) {
++                    if (key > thr) atomicOr(&sm.sel[i >> 5], 1u << (i & 31));
++                    else if (key == thr) atomicOr(&sm.tie[i >> 5], 1u << (i & 31));
++                }
++            }
++    }
++    __syncthreads();
++
++    // 4. in pool order: the selected pools and the first `need` ties
++    if (bitmap) {
++        const int per = (W + THREADS - 1) / THREADS;
++        const int w0 = min(W, tid * per), w1 = min(W, w0 + per);
++        unsigned ns = 0, nt = 0;
++        for (int w = w0; w < w1; ++w) ns += __popc(sm.sel[w]), nt += __popc(sm.tie[w]);
++        unsigned tot;
++        const unsigned sb = block_excl(ns, sm.scan, tot);
++        const unsigned tb = block_excl(nt, sm.scan, tot);
++        unsigned taken = min(tb, need);                // ties before this thread's words that are taken
++        unsigned seen = tb;
++        unsigned pos = sb + taken;
++        for (int w = w0; w < w1; ++w) {
++            const unsigned t = sm.tie[w];
++            unsigned keep = 0;
++            if (seen < need) {                           // the lowest (need - seen) ties of this word
++                unsigned left = need - seen, bits = t;
++                while (bits && left) {
++                    const unsigned low = bits & (0u - bits);
++                    keep |= low;
++                    bits ^= low;
++                    --left;
++                }
++            }
++            seen += __popc(t);
++            unsigned m = sm.sel[w] | keep;
++            while (m) {
++                const int b = __ffs(m) - 1;
++                dst[pos++] = static_cast<int64_t>(32 * w + b);
++                m &= m - 1;
++            }
++        }
++    } else {                                         // no room for the bitmaps: the row once more, in order
++        unsigned done_sel = 0, done_tie = 0;         // over the previous steps (the same in every thread)
++        for (int i = tid * 4; i < span; i += THREADS * 4) {
++            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
++            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
++            const float e[4] = {v.x, v.y, v.z, v.w};
++            unsigned s4 = 0, t4 = 0;
++#pragma unroll
++            for (int c = 0; c < 4; ++c) {
++                const unsigned key = order_key(e[c]);
++                const bool ok = i + c < NP;
++                s4 |= (ok && key > thr) ? (1u << c) : 0u;
++                t4 |= (ok && key == thr) ? (1u << c) : 0u;
++            }
++            unsigned ts, tt;
++            const unsigned sb = block_excl(__popc(s4), sm.scan, ts);
++            const unsigned tb = block_excl(__popc(t4), sm.scan, tt);
++            unsigned seen = done_tie + tb;
++            unsigned pos = done_sel + sb + min(seen, need);
++#pragma unroll
++            for (int c = 0; c < 4; ++c) {
++                const bool s = (s4 >> c) & 1u, t = (t4 >> c) & 1u;
++                const bool take = s || (t && seen < need);
++                if (t) ++seen;
++                if (take) dst[pos++] = static_cast<int64_t>(i + c);
++            }
++            done_sel += ts;
++            done_tie += tt;
++        }
++    }
++}
++
++}  // namespace
++
++int topk_rows_smem() { return static_cast<int>(sizeof(TkSmem)); }
++
++void topk_rows_cuda(const at::Tensor& scores, at::Tensor& out) {
++    const int R = static_cast<int>(scores.size(0)), NP = static_cast<int>(scores.size(1));
++    static bool configured = false;
++    if (!configured) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(topk_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            sizeof(TkSmem)));
++        configured = true;
++    }
++    topk_rows_kernel<<<R, THREADS, sizeof(TkSmem), at::cuda::getCurrentCUDAStream()>>>(
++        scores.data_ptr<float>(), out.data_ptr<int64_t>(), NP);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/sparse_ws.cpp tensorfold/families/glm5_next/cuda/sparse_ws.cpp
+new file mode 100644
+index 0000000..80a37fb
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/sparse_ws.cpp
+@@ -0,0 +1,59 @@
++// Bindings of sparse_ws.cu (TF_GLM_SPARSE_FAST=2, patch 0199): a prompt chunk's DSA sparse attention with warp roles,
++// latent._sparse_onepass' bits; and of sparse_topk.cu (TF_GLM_TOPK_FAST=1): its top-512 pools, _select_rows' output.
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void sparse_ws_cuda(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++                    at::Tensor& out, int64_t rs_bytes, bool fp8, double scale);
++int sparse_ws_smem();
++void topk_rows_cuda(const at::Tensor& scores, at::Tensor& out);
++int topk_rows_smem();
++
++// qa [R, 16, 512] bf16, cache: an FP8 cache (uint8 rows of 512 codes + 16 bytes: the fp32 scale first) or a bf16 one
++// ([P, 512]), tokens [R, W] int32 (ascending, the first counts[r] valid), counts [R] int32, out [R, 16, 512] bf16
++// (rows with count 0 are left alone). scale: the query scale _sparse_onepass multiplies the scores by.
++void sparse_ws(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++               at::Tensor& out, double scale) {
++    TORCH_CHECK(qa.is_cuda() && qa.scalar_type() == at::kBFloat16 && qa.dim() == 3 && qa.size(1) == 16 &&
++                qa.size(2) == 512 && qa.is_contiguous(), "sparse_ws: qa [R, 16, 512] bf16, contiguous");
++    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16 && out.sizes() == qa.sizes() && out.is_contiguous(),
++                "sparse_ws: out like qa");
++    TORCH_CHECK(tokens.is_cuda() && tokens.scalar_type() == at::kInt && tokens.dim() == 2 &&
++                tokens.size(0) == qa.size(0) && tokens.is_contiguous(), "sparse_ws: tokens [R, W] int32, contiguous");
++    TORCH_CHECK(counts.is_cuda() && counts.scalar_type() == at::kInt && counts.numel() == qa.size(0) &&
++                counts.is_contiguous(), "sparse_ws: counts [R] int32");
++    TORCH_CHECK(cache.is_cuda() && cache.dim() == 2 && cache.is_contiguous(), "sparse_ws: a contiguous cache");
++    const bool fp8 = cache.scalar_type() == at::kByte || cache.scalar_type() == at::kFloat8_e4m3fn;
++    if (fp8) {
++        TORCH_CHECK(cache.size(1) == 512 + 16, "sparse_ws: FP8 cache rows of 512 codes and 16 bytes");
++    } else {
++        TORCH_CHECK(cache.scalar_type() == at::kBFloat16 && cache.size(1) == 512, "sparse_ws: bf16 cache rows of 512");
++    }
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(cache.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(qa.data_ptr()) % 16 == 0
++                && reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "sparse_ws: 16-byte aligned buffers");
++    if (qa.size(0) == 0) return;
++    const int64_t rs = cache.stride(0) * cache.element_size();
++    c10::cuda::CUDAGuard guard(qa.device());
++    sparse_ws_cuda(qa, cache, tokens, counts, out, rs, fp8, scale);
++}
++
++// scores [R, NP] fp32 (rows NP apart, NP a multiple of 4 and at least 512, 16-byte aligned) -> out [R, 512] int64:
++// each row's 512 best pools (order keys, ties to the lower pool), ascending: _select_rows' output (sparse_topk.cu).
++void topk_rows(const at::Tensor& scores, at::Tensor& out) {
++    TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == at::kFloat && scores.dim() == 2 && scores.is_contiguous(),
++                "topk_rows: contiguous fp32 scores [R, NP]");
++    TORCH_CHECK(scores.size(1) >= 512 && scores.size(1) % 4 == 0 &&
++                reinterpret_cast<uintptr_t>(scores.data_ptr()) % 16 == 0, "topk_rows: rows of 4 x n >= 512, aligned");
++    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kLong && out.dim() == 2 && out.size(0) == scores.size(0) &&
++                out.size(1) == 512 && out.is_contiguous(), "topk_rows: out [R, 512] int64");
++    if (scores.size(0) == 0) return;
++    c10::cuda::CUDAGuard guard(scores.device());
++    topk_rows_cuda(scores, out);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("sparse_ws", &sparse_ws);
++    m.def("smem", &sparse_ws_smem);
++    m.def("topk_rows", &topk_rows);
++    m.def("topk_smem", &topk_rows_smem);
++}
+diff --git tensorfold/families/glm5_next/cuda/sparse_ws.cu tensorfold/families/glm5_next/cuda/sparse_ws.cu
+new file mode 100644
+index 0000000..d34a9f0
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/sparse_ws.cu
+@@ -0,0 +1,527 @@
++// TF_GLM_SPARSE_FAST=2 (patch 0199): a prompt chunk's DSA sparse attention (latent._sparse_onepass, 16 heads, 32-key
++// tiles, one latent slice, the 512-wide latent) restructured with warp roles, every output with _sparse_onepass' bits.
++//
++// _sparse_onepass runs a row on eight warps that take turns: all of them gather a tile, compute its 16 x 32 scores
++// (a product only four warps' worth wide: warps 4-7 recompute warps 0-3's scores), its softmax and its PV product,
++// then the next tile. Here a CTA's eight warps split the work of a row:
++//   - four score warps hold the row's query in registers (its A fragments for all 32 k16 steps) and each computes one
++//     8-key block of every tile's scores (an m16n8k16 chain over the 512-wide latent), applies the fp8 row scale,
++//     the query scale and the mask past the row's count, and hands the 16 x 32 tile to the PV warps (shared memory);
++//   - four PV warps each own 128 output columns: the tile's softmax (every PV warp computes the whole tile's, from
++//     the scores), the rescale of their output columns and the PV product over those columns, and they gather the
++//     tiles ahead (each its 128-column slice of the 32 key rows; fp8 codes widened to bf16 as _sparse_onepass widens
++//     them) into one of two tile buffers.
++// So the scores of tile p + 1 are computed while the PV warps run tile p, nothing is computed twice, and the query is
++// loaded from memory once a row. mbarriers order the two roles (tile full, scores full, scores consumed).
++//
++// Bits: every operation of _sparse_onepass' per-tile code is done on the same values in the same order, with the
++// same PTX instructions (read from its sm_120 PTX, Triton 3.7):
++//   - a score is one m16n8k16 bf16 chain over k16 steps 0 .. 31 in order from a zero accumulator, operands in the
++//     natural fragment order (Triton's k width 2), then fp8: x * row scale, then x * scale, then -inf past the count;
++//   - the tile's row maximum: max.f32 of each thread's column pair (2t, 2t + 1), then within the 8-column block
++//     (max(max(a0, a2), max(a1, a3))), then across the four blocks (max(max(B0, B2), max(B1, B3)));
++//   - next maximum, the rescale factor (sub, mul by log2 e, ex2.approx, the -inf and inactive selects), the
++//     probabilities (sub, mul by log2 e, ex2.approx, the inactive and mask selects), fp8: probability * row scale;
++//     bf16 by cvt.rn.bf16x2.f32;
++//   - the output's rescale (mul.f32 in place) and the PV chain per output: the rescaled output as the accumulator,
++//     keys 0-15 then keys 16-31;
++//   - the row sum: the column pair's add, then within the block ((a0 + a2) + (a1 + a3)), then across the blocks
++//     ((B0 + B2) + (B1 + B3)); l = fma(l, alpha, sum);
++//   - the output: div.full.f32 by l, cvt.rn.bf16x2.f32.
++// Float operations are written as inline PTX with explicit .rn (no contraction can merge them); the selects and
++// maxima keep the reference's operand order. Rows past the count are zeros, as the reference's masked loads give.
++//
++// Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++// the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace {
++
++constexpr int H = 16;                       // heads a row (a rank's DSA heads at TP4)
++constexpr int LW = 512;                     // latent width
++constexpr int KT = 32;                      // keys a tile
++constexpr int QK_WARPS = 4;                 // score warps: one 8-key block of a tile each
++constexpr int PV_WARPS = 4;                 // PV warps: 128 output columns each
++constexpr int THREADS = (QK_WARPS + PV_WARPS) * 32;
++constexpr int ROWB = LW * 2;                // bytes of a bf16 tile row
++constexpr int TILEB = KT * ROWB;            // bytes of a bf16 tile (32 KB)
++constexpr int SROW = KT + 8;                // floats a score row in shared memory (conflict-free pairs)
++constexpr int KSLOTS = 4;                   // fp8 row scales: a ring of tiles (PV warps can be a tile apart)
++constexpr uint32_t LOG2E = 0x3FB8AA3Bu;     // the constant Triton multiplies by before ex2.approx
++
++struct __align__(128) Smem {
++    unsigned char tile[2][TILEB];           // two tiles of bf16 key rows; 16-byte chunk c of row r at c ^ (r & 7)
++    float s[2][H * SROW];                   // two tiles of scores
++    float ks[KSLOTS][KT];                   // fp8 row scales of the tiles in flight
++    unsigned long long full[2];             // a tile buffer holds its tile (the PV warps' 128 threads arrive)
++    unsigned long long sfull[2];            // a score buffer holds its tile's scores (the score warps' 128 threads)
++    unsigned long long sempty[2];           // a score buffer was read (the PV warps' 128 threads)
++};
++
++// -- PTX wrappers -------------------------------------------------------------------------------------------------
++__device__ __forceinline__ uint32_t saddr(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
++
++__device__ __forceinline__ void mbar_init(uint32_t bar, int count) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
++}
++
++__device__ __forceinline__ void mbar_arrive(uint32_t bar) {
++    asm volatile("{\n .reg .b64 st;\n mbarrier.arrive.shared::cta.b64 st, [%0];\n}" ::"r"(bar) : "memory");
++}
++
++__device__ __forceinline__ bool mbar_try(uint32_t bar, uint32_t parity) {
++    uint32_t ok;
++    asm volatile("{\n .reg .pred P;\n mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n selp.u32 %0, 1, 0, P;\n}"
++                 : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
++    return ok != 0;
++}
++
++__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
++    while (!mbar_try(bar, parity)) {
++    }
++}
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], uint32_t addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr) : "memory");
++}
++
++__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], uint32_t addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr) : "memory");
++}
++
++__device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++                 "{%0, %1, %2, %3};"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ float fmul(float a, float b) {
++    float d;
++    asm("mul.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
++    return d;
++}
++
++__device__ __forceinline__ float fsub(float a, float b) {
++    float d;
++    asm("sub.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
++    return d;
++}
++
++__device__ __forceinline__ float fadd(float a, float b) {
++    float d;
++    asm("add.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
++    return d;
++}
++
++__device__ __forceinline__ float ffma(float a, float b, float c) {
++    float d;
++    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
++    return d;
++}
++
++__device__ __forceinline__ float fmax_(float a, float b) {        // max.f32, operands in this order
++    float d;
++    asm("max.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
++    return d;
++}
++
++__device__ __forceinline__ float ex2(float a) {
++    float d;
++    asm("ex2.approx.f32 %0, %1;" : "=f"(d) : "f"(a));
++    return d;
++}
++
++__device__ __forceinline__ float fdiv(float a, float b) {
++    float d;
++    asm("div.full.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
++    return d;
++}
++
++__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {     // cvt.rn.bf16x2.f32 d, hi, lo
++    uint32_t d;
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
++    return d;
++}
++
++__device__ __forceinline__ float shfl_xor(float v, int m) {
++    float d;
++    asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(d) : "f"(v), "r"(m));
++    return d;
++}
++
++// Two e4m3 codes (the low byte first) -> bf16x2, by _sparse_onepass' own instructions (exact: e4m3 fits f16 and bf16)
++__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t pair) {
++    uint32_t d;
++    const uint16_t h = static_cast<uint16_t>(pair);
++    asm("{\n .reg .b32 a;\n .reg .f16 a0, a1;\n .reg .b16 b0, b1;\n cvt.rn.f16x2.e4m3x2 a, %1;\n mov.b32 {a0, a1}, a;\n"
++        " cvt.bf16.f16 b0, a0;\n cvt.bf16.f16 b1, a1;\n mov.b32 %0, {b0, b1};\n}"
++        : "=r"(d) : "h"(h));
++    return d;
++}
++
++__device__ __forceinline__ uint4 ldg16(const void* p) {
++    uint4 v;
++    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
++    return v;
++}
++
++__device__ __forceinline__ void sts16(uint32_t addr, uint4 v) {
++    asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(addr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
++                 : "memory");
++}
++
++__device__ __forceinline__ uint32_t chunk_addr(uint32_t tile, int row, int chunk) {     // the swizzled 16 bytes
++    return tile + row * ROWB + ((chunk ^ (row & 7)) << 4);
++}
++
++// -- the score warps --------------------------------------------------------------------------------------------
++template <bool FP8>
++__device__ __forceinline__ void score_warp(Smem& sm, const __nv_bfloat16* __restrict__ q_row, int n, int T, int w,
++                                           int lane, float scale) {
++    const int g = lane >> 2, t = lane & 3;
++    // the row's 16 x 512 query as A fragments of all 32 k16 steps: a0 = q[g][16k + 2t, +1], a1 = q[g + 8][..],
++    // a2 = q[g][16k + 8 + 2t, +1], a3 = q[g + 8][16k + 8 + 2t, +1]
++    const uint32_t* q32 = reinterpret_cast<const uint32_t*>(q_row);
++    uint32_t qf[32][4];
++#pragma unroll
++    for (int k = 0; k < 32; ++k) {
++        qf[k][0] = __ldg(q32 + g * (LW / 2) + k * 8 + t);
++        qf[k][1] = __ldg(q32 + (g + 8) * (LW / 2) + k * 8 + t);
++        qf[k][2] = __ldg(q32 + g * (LW / 2) + k * 8 + 4 + t);
++        qf[k][3] = __ldg(q32 + (g + 8) * (LW / 2) + k * 8 + 4 + t);
++    }
++    const uint32_t tile0 = saddr(&sm.tile[0][0]);
++    const int row = 8 * w + (lane & 7);              // the key row this lane addresses for ldmatrix
++    const int mat = lane >> 3;                       // the 8 x 8 matrix it addresses
++    for (int p = 0; p < T; ++p) {
++        const int b = p & 1;
++        mbar_wait(saddr(&sm.full[b]), (p >> 1) & 1);
++        const uint32_t tb = tile0 + b * TILEB;
++        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll
++        for (int kp = 0; kp < 16; ++kp) {           // k16 steps 2 kp, 2 kp + 1: 16-byte chunks 4 kp .. 4 kp + 3
++            uint32_t bf[4];
++            ldsm_x4(bf, chunk_addr(tb, row, 4 * kp + mat));
++            mma(acc, qf[2 * kp], bf[0], bf[1]);
++            mma(acc, qf[2 * kp + 1], bf[2], bf[3]);
++        }
++        const int key = p * KT + 8 * w + 2 * t;      // acc: (g, key), (g, key + 1), (g + 8, key), (g + 8, key + 1)
++        float v0 = acc[0], v1 = acc[1], v2 = acc[2], v3 = acc[3];
++        if (FP8) {
++            const float k0 = sm.ks[p & (KSLOTS - 1)][8 * w + 2 * t];
++            const float k1 = sm.ks[p & (KSLOTS - 1)][8 * w + 2 * t + 1];
++            v0 = fmul(v0, k0);
++            v1 = fmul(v1, k1);
++            v2 = fmul(v2, k0);
++            v3 = fmul(v3, k1);
++        }
++        v0 = fmul(v0, scale);
++        v1 = fmul(v1, scale);
++        v2 = fmul(v2, scale);
++        v3 = fmul(v3, scale);
++        const float ninf = __int_as_float(0xFF800000);
++        if (!(key < n)) v0 = ninf, v2 = ninf;
++        if (!(key + 1 < n)) v1 = ninf, v3 = ninf;
++        mbar_wait(saddr(&sm.sempty[b]), ((p >> 1) & 1) ^ 1);
++        float* s = sm.s[b];
++        *reinterpret_cast<float2*>(&s[g * SROW + 8 * w + 2 * t]) = make_float2(v0, v1);
++        *reinterpret_cast<float2*>(&s[(g + 8) * SROW + 8 * w + 2 * t]) = make_float2(v2, v3);
++        mbar_arrive(saddr(&sm.sfull[b]));
++    }
++}
++
++// -- the PV warps' gather: their 128-column slice of a tile's 32 key rows ------------------------------------------
++// fp8: 8 chunks of 16 codes a lane (rows (lane >> 3) + 4 i, chunk lane & 7 of the slice's 8) and, lanes 0-7, the scale
++// of row 8 j + lane; bf16: 16 chunks of 8 values a lane (rows (lane >> 4) + 2 i, chunk lane & 15 of 16). Rows past
++// the count are zeros and their scales 1 (the reference's masked loads). The ids of a tile are loaded one step before
++// its rows (slice_ids, then slice_load), so neither waits on the other's latency inside the loop.
++template <bool FP8>
++struct Slice {
++    static constexpr int N = FP8 ? 8 : 16;          // 16-byte loads a lane
++    static constexpr int STEP = FP8 ? 4 : 2;        // rows between a lane's loads
++    uint4 v[N];
++    int id[N];
++    int sid;                                        // fp8, lanes 0-7: the id of row 8 j + lane
++    float sc;                                       // ... and its scale
++};
++
++template <bool FP8>
++__device__ __forceinline__ void slice_ids(Slice<FP8>& s, const int32_t* __restrict__ tok_row, int p, int n, int j,
++                                          int lane) {
++    const int r0 = FP8 ? (lane >> 3) : (lane >> 4);
++#pragma unroll
++    for (int i = 0; i < Slice<FP8>::N; ++i) {
++        const int key = p * KT + r0 + Slice<FP8>::STEP * i;
++        s.id[i] = key < n ? __ldg(tok_row + key) : -1;
++    }
++    if (FP8) {
++        const int key = p * KT + 8 * j + (lane & 7);
++        s.sid = (lane < 8 && key < n) ? __ldg(tok_row + key) : -1;
++    }
++}
++
++template <bool FP8>
++__device__ __forceinline__ void slice_load(Slice<FP8>& s, const unsigned char* __restrict__ cache, int RS, int j,
++                                           int lane) {
++    const int c = FP8 ? (lane & 7) : (lane & 15);
++#pragma unroll
++    for (int i = 0; i < Slice<FP8>::N; ++i) {
++        if (s.id[i] >= 0) {
++            const unsigned char* src = cache + static_cast<size_t>(s.id[i]) * RS + (FP8 ? 128 * j : 256 * j) + 16 * c;
++            s.v[i] = ldg16(src);
++        } else {
++            s.v[i] = make_uint4(0u, 0u, 0u, 0u);
++        }
++    }
++    if (FP8)
++        s.sc = s.sid >= 0 ? __ldg(reinterpret_cast<const float*>(cache + static_cast<size_t>(s.sid) * RS + LW)) : 1.0f;
++}
++
++template <bool FP8>
++__device__ __forceinline__ void slice_store(const Slice<FP8>& s, Smem& sm, uint32_t tb, int p, int j, int lane) {
++#pragma unroll
++    for (int i = 0; i < Slice<FP8>::N; ++i) {
++        if (FP8) {
++            const int row = (lane >> 3) + 4 * i, c = lane & 7;          // 16 codes -> two 16-byte bf16 chunks
++            uint4 lo, hi;
++            lo.x = e4m3x2_bf16x2(s.v[i].x);
++            lo.y = e4m3x2_bf16x2(s.v[i].x >> 16);
++            lo.z = e4m3x2_bf16x2(s.v[i].y);
++            lo.w = e4m3x2_bf16x2(s.v[i].y >> 16);
++            hi.x = e4m3x2_bf16x2(s.v[i].z);
++            hi.y = e4m3x2_bf16x2(s.v[i].z >> 16);
++            hi.z = e4m3x2_bf16x2(s.v[i].w);
++            hi.w = e4m3x2_bf16x2(s.v[i].w >> 16);
++            sts16(chunk_addr(tb, row, 16 * j + 2 * c), lo);
++            sts16(chunk_addr(tb, row, 16 * j + 2 * c + 1), hi);
++        } else {
++            const int row = (lane >> 4) + 2 * i, c = lane & 15;
++            sts16(chunk_addr(tb, row, 16 * j + c), s.v[i]);
++        }
++    }
++    if (FP8 && lane < 8) sm.ks[p & (KSLOTS - 1)][8 * j + lane] = s.sc;
++}
++
++// -- the PV warps ------------------------------------------------------------------------------------------------
++// The block maximum of a quad's column pairs: max(max(a0, a2), max(a1, a3)) in lane t = 0, as the reference has it.
++// The other lanes may hold it with the operands of a max swapped, which can only change the sign of a zero maximum;
++// no value downstream depends on that sign (it enters only s - m and m - m', whose exp is the same for +0 and -0,
++// and the -inf test), so every lane keeps its own.
++__device__ __forceinline__ float quad_max(float a) {
++    const float x = fmax_(a, shfl_xor(a, 2));
++    return fmax_(x, shfl_xor(x, 1));
++}
++
++// The block sum: (a0 + a2) + (a1 + a3) (addition is commutative: every lane of the quad holds the same bits).
++__device__ __forceinline__ float quad_sum(float a) {
++    const float x = fadd(a, shfl_xor(a, 2));
++    return fadd(x, shfl_xor(x, 1));
++}
++
++template <bool FP8>
++__device__ __forceinline__ void pv_warp(Smem& sm, const unsigned char* __restrict__ cache,
++                                        const int32_t* __restrict__ tok_row, __nv_bfloat16* __restrict__ out_row,
++                                        int n, int T, int j, int lane, int RS) {
++    const int g = lane >> 2, t = lane & 3;
++    const float ninf = __int_as_float(0xFF800000);
++    const float log2e = __int_as_float(LOG2E);
++    const uint32_t tile0 = saddr(&sm.tile[0][0]);
++    // prologue: tiles 0 and 1 into their buffers, tile 2's slice in flight
++    Slice<FP8> sl;
++    for (int p = 0; p < 2 && p < T; ++p) {
++        slice_ids<FP8>(sl, tok_row, p, n, j, lane);
++        slice_load<FP8>(sl, cache, RS, j, lane);
++        slice_store<FP8>(sl, sm, tile0 + p * TILEB, p, j, lane);
++        mbar_arrive(saddr(&sm.full[p]));
++    }
++    if (2 < T) {
++        slice_ids<FP8>(sl, tok_row, 2, n, j, lane);
++        slice_load<FP8>(sl, cache, RS, j, lane);
++    }
++    float o[16][4];
++#pragma unroll
++    for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
++    float m0 = ninf, m1 = ninf, l0 = 0.0f, l1 = 0.0f;     // rows g and g + 8
++    const int mat = lane >> 3;
++    for (int p = 0; p < T; ++p) {
++        const int b = p & 1;
++        if (p + 3 < T) slice_ids<FP8>(sl, tok_row, p + 3, n, j, lane);      // tile p + 3's ids (the rows: below)
++        mbar_wait(saddr(&sm.sfull[b]), (p >> 1) & 1);
++        float sv[4][2], su[4][2];                    // scores of rows g and g + 8, columns 8 w + 2 t, + 1
++        const float* s = sm.s[b];
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            const float2 x = *reinterpret_cast<const float2*>(&s[g * SROW + 8 * w + 2 * t]);
++            const float2 y = *reinterpret_cast<const float2*>(&s[(g + 8) * SROW + 8 * w + 2 * t]);
++            sv[w][0] = x.x, sv[w][1] = x.y, su[w][0] = y.x, su[w][1] = y.y;
++        }
++        mbar_arrive(saddr(&sm.sempty[b]));
++        // the tile's row maxima, in the reference's order
++        float bv[4], bu[4];
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            bv[w] = quad_max(fmax_(sv[w][0], sv[w][1]));
++            bu[w] = quad_max(fmax_(su[w][0], su[w][1]));
++        }
++        const float tm0 = fmax_(fmax_(bv[0], bv[2]), fmax_(bv[1], bv[3]));
++        const float tm1 = fmax_(fmax_(bu[0], bu[2]), fmax_(bu[1], bu[3]));
++        const bool act0 = tm0 != ninf, act1 = tm1 != ninf;
++        const float mx0 = fmax_(m0, tm0), mx1 = fmax_(m1, tm1);
++        const float nm0 = act0 ? mx0 : m0, nm1 = act1 ? mx1 : m1;
++        float al0 = ex2(fmul(fsub(m0, nm0), log2e)), al1 = ex2(fmul(fsub(m1, nm1), log2e));
++        al0 = m0 == ninf ? 0.0f : al0;
++        al1 = m1 == ninf ? 0.0f : al1;
++        al0 = act0 ? al0 : 1.0f;
++        al1 = act1 ? al1 : 1.0f;
++        // probabilities
++        float pv[4][2], pu[4][2];
++#pragma unroll
++        for (int w = 0; w < 4; ++w)
++#pragma unroll
++            for (int c = 0; c < 2; ++c) {
++                const bool ok = p * KT + 8 * w + 2 * t + c < n;
++                float x = ex2(fmul(fsub(sv[w][c], nm0), log2e));
++                float y = ex2(fmul(fsub(su[w][c], nm1), log2e));
++                x = act0 ? x : 0.0f;
++                y = act1 ? y : 0.0f;
++                pv[w][c] = ok ? x : 0.0f;
++                pu[w][c] = ok ? y : 0.0f;
++            }
++        // the output's rescale
++#pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            o[i][0] = fmul(o[i][0], al0);
++            o[i][1] = fmul(o[i][1], al0);
++            o[i][2] = fmul(o[i][2], al1);
++            o[i][3] = fmul(o[i][3], al1);
++        }
++        // the PV product's A fragments (fp8: probability * row scale), k16 steps 0 (keys 0-15) and 1 (16-31)
++        uint32_t A[2][4];
++#pragma unroll
++        for (int st = 0; st < 2; ++st) {
++            float x[2][2], y[2][2];
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int w = 2 * st + h;
++                x[h][0] = pv[w][0], x[h][1] = pv[w][1], y[h][0] = pu[w][0], y[h][1] = pu[w][1];
++                if (FP8) {
++                    const float k0 = sm.ks[p & (KSLOTS - 1)][8 * w + 2 * t];
++                    const float k1 = sm.ks[p & (KSLOTS - 1)][8 * w + 2 * t + 1];
++                    x[h][0] = fmul(x[h][0], k0);
++                    x[h][1] = fmul(x[h][1], k1);
++                    y[h][0] = fmul(y[h][0], k0);
++                    y[h][1] = fmul(y[h][1], k1);
++                }
++            }
++            A[st][0] = pack_bf16(x[0][0], x[0][1]);
++            A[st][1] = pack_bf16(y[0][0], y[0][1]);
++            A[st][2] = pack_bf16(x[1][0], x[1][1]);
++            A[st][3] = pack_bf16(y[1][0], y[1][1]);
++        }
++        // the row sums: column pairs, the blocks, then across the blocks; l = fma(l, alpha, sum)
++        float qv[4], qu[4];
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            qv[w] = quad_sum(fadd(pv[w][0], pv[w][1]));
++            qu[w] = quad_sum(fadd(pu[w][0], pu[w][1]));
++        }
++        l0 = ffma(l0, al0, fadd(fadd(qv[0], qv[2]), fadd(qv[1], qv[3])));
++        l1 = ffma(l1, al1, fadd(fadd(qu[0], qu[2]), fadd(qu[1], qu[3])));
++        m0 = nm0;
++        m1 = nm1;
++        // PV over this warp's 128 columns: 8 pairs of n8 blocks, keys 0-15 then 16-31 for each
++        const uint32_t tb = tile0 + b * TILEB;
++#pragma unroll
++        for (int bp = 0; bp < 8; ++bp)
++#pragma unroll
++            for (int st = 0; st < 2; ++st) {
++                uint32_t bf[4];
++                const int krow = 16 * st + 8 * (mat & 1) + (lane & 7);
++                ldsm_x4_t(bf, chunk_addr(tb, krow, 16 * j + 2 * bp + (mat >> 1)));
++                mma(o[2 * bp], A[st], bf[0], bf[1]);
++                mma(o[2 * bp + 1], A[st], bf[2], bf[3]);
++            }
++        __syncwarp();
++        // refill: tile p + 2 into this buffer (this warp's slice: only this warp reads it until the buffer is full),
++        // then tile p + 3's rows into registers (consumed at the next step's refill)
++        if (p + 2 < T) {
++            slice_store<FP8>(sl, sm, tb, p + 2, j, lane);
++            mbar_arrive(saddr(&sm.full[b]));
++        }
++        if (p + 3 < T) slice_load<FP8>(sl, cache, RS, j, lane);
++    }
++    // the output: o / l, bf16
++#pragma unroll
++    for (int i = 0; i < 16; ++i) {
++        const int col = 128 * j + 8 * i + 2 * t;
++        *reinterpret_cast<uint32_t*>(out_row + g * LW + col) = pack_bf16(fdiv(o[i][0], l0), fdiv(o[i][1], l0));
++        *reinterpret_cast<uint32_t*>(out_row + (g + 8) * LW + col) = pack_bf16(fdiv(o[i][2], l1), fdiv(o[i][3], l1));
++    }
++}
++
++template <bool FP8>
++__global__ void __launch_bounds__(THREADS, 1) sparse_ws_kernel(const __nv_bfloat16* __restrict__ qa,
++                                                                const unsigned char* __restrict__ cache,
++                                                                const int32_t* __restrict__ tokens,
++                                                                const int32_t* __restrict__ counts,
++                                                                __nv_bfloat16* __restrict__ out, int W, int RS,
++                                                                float scale) {
++    extern __shared__ __align__(128) unsigned char smem_raw[];
++    Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
++    const int r = blockIdx.x;
++    const int n = counts[r];
++    if (n <= 0) return;                              // rows with no selected token are left alone
++    const int T = (n + KT - 1) / KT;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (threadIdx.x == 0) {
++        for (int b = 0; b < 2; ++b) {
++            mbar_init(saddr(&sm.full[b]), PV_WARPS * 32);
++            mbar_init(saddr(&sm.sfull[b]), QK_WARPS * 32);
++            mbar_init(saddr(&sm.sempty[b]), PV_WARPS * 32);
++        }
++    }
++    __syncthreads();
++    const size_t base = static_cast<size_t>(r) * H * LW;
++    if (warp < QK_WARPS)
++        score_warp<FP8>(sm, qa + base, n, T, warp, lane, scale);
++    else
++        pv_warp<FP8>(sm, cache, tokens + static_cast<size_t>(r) * W, out + base, n, T, warp - QK_WARPS, lane, RS);
++}
++
++template <bool FP8>
++void launch(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++            at::Tensor& out, int rs_bytes, double scale) {
++    auto kernel = sparse_ws_kernel<FP8>;
++    static bool configured = false;
++    if (!configured) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem)));
++        configured = true;
++    }
++    const int R = static_cast<int>(qa.size(0));
++    kernel<<<R, THREADS, sizeof(Smem), at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const unsigned char*>(cache.data_ptr()),
++        tokens.data_ptr<int32_t>(), counts.data_ptr<int32_t>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
++        static_cast<int>(tokens.size(1)), rs_bytes, static_cast<float>(scale));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++int sparse_ws_smem() { return static_cast<int>(sizeof(Smem)); }
++
++void sparse_ws_cuda(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++                    at::Tensor& out, int64_t rs_bytes, bool fp8, double scale) {
++    if (fp8)
++        launch<true>(qa, cache, tokens, counts, out, static_cast<int>(rs_bytes), scale);
++    else
++        launch<false>(qa, cache, tokens, counts, out, static_cast<int>(rs_bytes), scale);
++}
+diff --git tensorfold/families/glm5_next/cuda/topk_fast.py tensorfold/families/glm5_next/cuda/topk_fast.py
+new file mode 100644
+index 0000000..f5967c8
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/topk_fast.py
+@@ -0,0 +1,106 @@
++"""TF_GLM_TOPK_FAST=1 (patch 0199): a prompt chunk's top-512 pools a row (``sparse.top_pools`` on its ``_select_rows``
++path) by a CUDA kernel that reads the row's scores twice instead of five times (``sparse_topk.cu``).
++
++_select_rows' output is a function of the scores alone: each row's 512 best order keys (``_order_key``: -0 counted as
+++0), ties to the lower pool, in ascending pool order. The kernel finds the same set by a 12-bit histogram, the
++threshold bin's keys in shared memory and a bitmap compacted in pool order (the kernel's header has the steps and the
++paths for bunched scores and long rows), so every pool is _select_rows' (int64, the same order). On the GPU the first
++call of a process compares it with _select_rows byte for byte (rows of normal, tied, -inf-heavy and signed-zero
++scores, 1,024 to 131,072 pools); a difference turns the setting off for the process and _select_rows runs.
++TF_GLM_TOPK_FAST_CHECK=1 compares every call (a test setting).
++
++Applies to prompt chunks' rows (``PromptSelect.pools``): contiguous fp32 rows of at least 512 pools, a multiple of 4.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++K = 512
++
++
++def _flag(name: str) -> bool:
++    value = (os.environ.get(name, "") or "0").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"{name}: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++ENABLED = _flag("TF_GLM_TOPK_FAST")
++CHECK = _flag("TF_GLM_TOPK_FAST_CHECK")
++_decided: bool | None = None
++
++
++def applies(scores: torch.Tensor) -> bool:
++    return (scores.is_cuda and scores.dtype == torch.float32 and scores.dim() == 2 and scores.is_contiguous()
++            and scores.shape[1] >= K and scores.shape[1] % 4 == 0 and scores.data_ptr() % 16 == 0)
++
++
++def launch(scores: torch.Tensor) -> torch.Tensor:
++    """The rows' 512 best pools, ascending (int64 [R, 512]): _select_rows' output."""
++    from .attn_fast import _ws
++
++    out = torch.empty((scores.shape[0], K), dtype=torch.int64, device=scores.device)
++    _ws().topk_rows(scores, out)
++    return out
++
++
++def reference(scores: torch.Tensor) -> torch.Tensor:
++    from . import sparse
++
++    out = torch.empty((scores.shape[0], K), dtype=torch.int64, device=scores.device)
++    R, NP = scores.shape
++    sparse._select_rows[(R,)](scores, out, NP, scores, K=K, BLOCK=1024, VIS=False, num_warps=4)
++    return out
++
++
++def self_check(device) -> bool:
++    """The kernel against _select_rows on rows of every kind and length, byte for byte."""
++    gen = torch.Generator(device=device).manual_seed(199)
++    for NP in (1024, 4096, 25600, 32768, 65536, 70656, 131072):
++        R = 64 if NP <= 32768 else 16
++        rows = []
++        base = torch.randn((R, NP), device=device, generator=gen)
++        rows.append(base)                                                       # distinct scores
++        rows.append(torch.round(base * 4) / 4)                                  # many ties
++        heavy = base.clone()
++        heavy[:, NP // 3:] = float("-inf")                                      # past the visible pools
++        rows.append(heavy)
++        zeros = torch.where(base > 0.5, base, torch.zeros_like(base))           # a bunched threshold bin
++        zeros[:, ::7] = -0.0
++        rows.append(zeros)
++        e = torch.randint(-30, 31, (R, NP), device=device, generator=gen).float()
++        rows.append(base * torch.exp2(e))                                       # wide magnitudes
++        for s in rows:
++            s = s.contiguous()
++            if not torch.equal(launch(s), reference(s)):
++                return False
++    return True
++
++
++def on(scores: torch.Tensor) -> bool:
++    """Whether to run the kernel for this call: the setting, the shape, and its check passed on this GPU."""
++    global _decided
++    if not ENABLED or not applies(scores):
++        return False
++    if _decided is None:
++        try:
++            ok = self_check(scores.device)
++            why = "" if ok else ": its pools differ from _select_rows' on this GPU"
++        except Exception as exc:  # noqa: BLE001 - a kernel that cannot run here is off; _select_rows runs
++            ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++        _decided = ok
++        print(f"[tensorfold] fast top-512 pools: {'on (checked byte for byte)' if ok else 'off' + why}", flush=True)
++    return _decided
++
++
++def top512(scores: torch.Tensor) -> torch.Tensor:
++    """launch(), and with TF_GLM_TOPK_FAST_CHECK=1 _select_rows too, compared (stops on a difference)."""
++    out = launch(scores)
++    if CHECK and not torch.equal(out, reference(scores)):
++        raise RuntimeError("TF_GLM_TOPK_FAST_CHECK: the fast top-512 pools differ from _select_rows'")
++    return out
+diff --git tensorfold/families/glm5_next/cuda/tune.py tensorfold/families/glm5_next/cuda/tune.py
+index 3824798..16e2976 100644
+--- tensorfold/families/glm5_next/cuda/tune.py
++++ tensorfold/families/glm5_next/cuda/tune.py
+@@ -87,8 +87,10 @@ CHOICES: dict[str, Callable[[Any], Any]] = {
+     "exl3_prompt": _keys(passm=_ints(64, 128), stages=_ints(2, 3, 4)),
+     # 4-bit dense matmul of decode rows: the lane matmul's tile config (qmm.cu dispatch_cfg 0..15), -1 the stock tile
+     "q4_dec": _int_range(-1, 15),
+-    # 4-bit dense matmul of prompt chunks: the prefill tile (qmm_prefill.cu dispatch 0..11)
+-    "q4_prefill": _int_range(0, 11),
++    # 4-bit dense matmul of prompt chunks: the prefill tile (qmm_prefill.cu dispatch 0..11), or 32 + v: variant v of
++    # qmm_prefill2.cu (patches 0195 / 0197: other tiles, pipelines and a tail split, 16- and 32-row tiles; the same bits,
++    # checked again at first use)
++    "q4_prefill": _ints(*range(0, 12), *range(32, 56)),
+     # BF16 / FP8 dense matmuls of decode rows (qmm._bmm / _fmm): Triton warps and stages, the FP8 column tile
+     "b16_dec": _keys(warps=_ints(2, 4, 8), stages=_int_range(1, 8)),
+     "f8_dec": _keys(warps=_ints(2, 4, 8), stages=_int_range(1, 8), bn=_ints(16, 32, 64, 128)),

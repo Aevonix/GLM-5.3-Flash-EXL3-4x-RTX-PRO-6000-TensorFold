@@ -1,0 +1,500 @@
+0079-glm-warm-turn-incremental.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/cuda/incremental.py tensorfold/cuda/incremental.py
+new file mode 100644
+index 0000000..74e1469
+--- /dev/null
++++ tensorfold/cuda/incremental.py
+@@ -0,0 +1,162 @@
++"""Exact host prefix reuse, enabled only by TF_W1_INCREMENTAL=1.
++
++The accepted tokenizer profile extracts literal added tokens before processing each
++remaining piece independently (Split, ByteLevel, deterministic BPE). A cut at the
++start of one such token therefore separates independent pieces. We check the new
++literal barrier and reject matches crossing the cut, including longer added tokens.
++Unknown profiles, normalization, padding, truncation and token-adding processors
++use the original full encode. See tests/W1 for the real-tokenizer contract tests.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++import hashlib
++import json
++import os
++import re
++from typing import Any
++
++
++def enabled() -> bool:
++    value = os.environ.get("TF_W1_INCREMENTAL", "0")
++    if value not in ("0", "1"):
++        raise ValueError("TF_W1_INCREMENTAL must be 0 or 1")
++    return value == "1"
++
++
++def _extend(state, ids, before: int):
++    state = state.copy()
++    if ids:
++        state.update((("," if before else "") + ",".join(str(int(t)) for t in ids)).encode())
++    return state
++
++
++@dataclass(frozen=True)
++class Boundary:
++    char: int
++    token: int
++    state: Any
++
++
++@dataclass(frozen=True)
++class Rendered:
++    text: str
++    ids: tuple[int, ...]
++    boundaries: tuple[Boundary, ...]
++    state: Any
++    reused: int = 0
++
++    def seed(self, salt: int = 0) -> int:
++        state = self.state.copy()
++        state.update(f"|{salt}".encode())
++        return int.from_bytes(state.digest()[:8], "little") & ((1 << 63) - 1)
++
++
++class PromptIds(list):
++    """A request owns its immutable rendering until its kept snapshots release it."""
++
++    def __init__(self, record: Rendered):
++        super().__init__(record.ids)
++        self.record = record
++
++
++def copy_prompt(prompt):
++    return PromptIds(prompt.record) if isinstance(prompt, PromptIds) else list(prompt)
++
++
++def keep_rendered(snap, prompt) -> None:
++    if isinstance(prompt, PromptIds):
++        # A grid snapshot may end inside a tokenized piece. Only earlier barriers
++        # can be reused, while the immutable request keeps the character mapping.
++        snap.w1_rendered = (prompt.record, len(snap.ids))
++
++
++class IncrementalTokenizer:
++    """Only engine-kept snapshots are eligible; active requests are never an LRU.
++
++    ``kept`` returns a snapshot of the cache list. Eviction can race a reader safely:
++    a local immutable rendering reference has no dependency on GPU cache lifetime.
++    The server owns its tokenizer and does not mutate it after construction.
++    """
++
++    def __init__(self, tokenizer, kept=lambda: ()):
++        self.tok, self.kept = tokenizer, kept
++        cfg = json.loads(tokenizer.to_str())
++        added = cfg.get("added_tokens", [])
++        self.literals = {t["id"]: t["content"] for t in added}
++        pp = cfg.get("post_processor")
++        pre = cfg.get("pre_tokenizer") or {}
++        parts = pre.get("pretokenizers", [])
++        model = cfg.get("model") or {}
++        self.supported = bool(added) and all(
++            t["content"] and not any(t.get(k) for k in ("normalized", "single_word", "lstrip", "rstrip"))
++            for t in added)
++        self.supported &= (cfg.get("normalizer") is None and cfg.get("truncation") is None
++                           and cfg.get("padding") is None and not tokenizer.encode_special_tokens
++                           and model.get("type") == "BPE" and model.get("dropout") in (None, 0)
++                           and pre.get("type") == "Sequence" and len(parts) == 2
++                           and parts[0].get("type") == "Split" and parts[1].get("type") == "ByteLevel"
++                           and not parts[1].get("add_prefix_space")
++                           and (pp is None or (pp.get("type") == "ByteLevel" and not pp.get("trim_offsets"))))
++        self.pattern = re.compile("|".join(re.escape(s) for s in sorted(set(self.literals.values()),
++                                                                     key=lambda s: (-len(s), s))))
++        self.longest = max(map(len, self.literals.values()), default=0)
++
++    def _barrier(self, text: str, char: int) -> bool:
++        if self.pattern.match(text, char) is None:
++            return False
++        # Search every possible start: finditer could hide a crossing match inside
++        # an earlier overlapping match. False rejections merely encode in full.
++        for start in range(max(0, char - self.longest + 1), char):
++            match = self.pattern.match(text, start)
++            if match is not None and match.end() > char:
++                return False
++        return True
++
++    def encode(self, text: str, *, add_special_tokens: bool = False):
++        if not self.supported:
++            return self.tok.encode(text, add_special_tokens=add_special_tokens).ids
++        best = None
++        records = tuple(getattr(s, "w1_rendered", None) for s in tuple(self.kept()))
++        for item in records:
++            if item is None:
++                continue
++            record, limit = item
++            if text == record.text and limit == len(record.ids):
++                return PromptIds(Rendered(text, record.ids, record.boundaries, record.state, len(record.ids)))
++            boundaries = record.boundaries
++            lo, hi = 0, len(boundaries)
++            # Prefix equality is monotone; no Python scan of the long history.
++            while lo < hi:
++                mid = (lo + hi) // 2
++                b = boundaries[mid]
++                if b.token <= limit and text.startswith(record.text[:b.char]):
++                    lo = mid + 1
++                else:
++                    hi = mid
++            for index in range(lo - 1, -1, -1):
++                b = boundaries[index]
++                if best is not None and b.token <= best[1].token:
++                    break
++                if self._barrier(text, b.char):
++                    best = record, b, index
++                    break
++        if best is None:
++            old, char, cut, boundaries, state = (), 0, 0, [], hashlib.sha256()
++        else:
++            record, boundary, index = best
++            char, cut = boundary.char, boundary.token
++            old, boundaries, state = record.ids[:cut], list(record.boundaries[:index]), boundary.state
++        tail = self.tok.encode(text[char:], add_special_tokens=add_special_tokens)
++        ids = tail.ids
++        pos = 0
++        # Offsets are character indices, not UTF-8 bytes. No decoded token text is
++        # used for byte fallback, emoji, CRLF or combining characters.
++        for i, (token, (start, end)) in enumerate(zip(ids, tail.offsets)):
++            literal = self.literals.get(token)
++            if literal is not None and text[char + start:char + end] == literal:
++                state = _extend(state, ids[pos:i], cut + pos)
++                pos = i
++                boundaries.append(Boundary(char + start, cut + i, state))
++        state = _extend(state, ids[pos:], cut + pos)
++        return PromptIds(Rendered(text, (*old, *ids), tuple(boundaries), state, cut))
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 55c5ab3..72f30ba 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -92,6 +92,11 @@ class App:
+         self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
+         self.model_dir = Path(model_dir)
+         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
++        from tensorfold.cuda.incremental import IncrementalTokenizer, enabled
++
++        self.incremental = IncrementalTokenizer(self.tok, lambda: tuple(
++            engine.multi.kept if getattr(engine, "multi", None) is not None else getattr(engine, "cache", ())
++        )) if enabled() else None
+         self.template = ChatTemplate(model_dir)
+         self.default_thinking = default_thinking
+         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
+@@ -290,20 +295,26 @@ class App:
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+             text = render(body["messages"])
+-            prompt = self.tok.encode(text, add_special_tokens=False).ids
++            prompt = self._encode(text, add_special_tokens=False)
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+         else:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+                 raise RequestError("prompt must be a string or a list of token ids")
+-            prompt = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", False)).ids
++            prompt = self._encode(text, add_special_tokens=flag(body, "add_special_tokens", False))
+         if not prompt:
+             raise RequestError("rendered prompt is empty")
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
+                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+ 
++    def _encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
++        incremental = getattr(self, "incremental", None)
++        if incremental is not None:
++            return incremental.encode(text, add_special_tokens=add_special_tokens)
++        return self.tok.encode(text, add_special_tokens=add_special_tokens).ids
++
+     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
+         vocabulary."""
+@@ -332,7 +343,7 @@ class App:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+                 raise RequestError("prompt must be a string (or send messages)")
+-            ids = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", True)).ids
++            ids = self._encode(text, add_special_tokens=flag(body, "add_special_tokens", True))
+         limit = self._context_limit()
+         reply: dict[str, Any] = {"count": len(ids), "tokens": [int(t) for t in ids],
+                                  "max_model_len": limit if limit is not None else self.native_context_window}
+@@ -401,7 +412,11 @@ class App:
+         top_k = fields.get("top_k", self.sampling["top_k"])
+         top_p = fields.get("top_p", self.sampling["top_p"])
+         min_p = fields.get("min_p", self.sampling.get("min_p", 0.0))
+-        return Sampling(int(seed) if seed is not None else seed_for(prompt), temp, int(top_k), float(top_p),
++        from tensorfold.cuda.incremental import PromptIds
++
++        implicit = prompt.record.seed() if seed is None and isinstance(prompt, PromptIds) else None
++        return Sampling(int(seed) if seed is not None else implicit if implicit is not None else seed_for(prompt),
++                        temp, int(top_k), float(top_p),
+                         float(min_p))
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
+@@ -548,6 +563,12 @@ class App:
+         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
+ 
+         def generate(ids: list[int], count: int, feed: Callable[[list[int]], bool]) -> Any:
++            from tensorfold.cuda.incremental import PromptIds, copy_prompt
++
++            # The shared gate hands engines a plain list. Restore metadata only
++            # for an exact replay; a gate-extended prompt has no known rendering.
++            if isinstance(prompt, PromptIds) and ids == prompt:
++                ids = copy_prompt(prompt)
+             if yielding and cached:                 # a run after a cut: foreground requests waiting go first
+                 turns.give()
+                 turns.take(True, cancelled)
+diff --git tensorfold/families/glm5_next/cuda/admit_delta.py tensorfold/families/glm5_next/cuda/admit_delta.py
+new file mode 100644
+index 0000000..ebe0a58
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/admit_delta.py
+@@ -0,0 +1,42 @@
++"""An ADMIT prompt field, with an optional reference to its resume snapshot.
++
++Only the snapshot already required by ADMIT may be named. Placement and evictions
++have finished before packing. The scheduler is the sole cache writer; its ordered
++operation stream creates identical immutable ids/kids on every rank. Later EVICT
++operations cannot overtake an ADMIT, even in the same message. No speculative or
++server-side tokenization cache keys cross the wire. Full prompts remain the
++fallback for cold, serial, image, displaced and non-prefix requests.
++"""
++from __future__ import annotations
++
++
++def pack_prompt(prompt, hit=None) -> list[int]:
++    if hit is not None:
++        cut = len(hit.ids)
++        if cut > 4 and cut <= len(prompt) and hit.ids == prompt[:cut] and hit.kid >= 0:
++            return [-1, hit.kid, cut, len(prompt) - cut, *prompt[cut:]]
++    return [len(prompt), *prompt]
++
++
++def unpack_prompt(payload, start: int, kept_by_id, resume_kid: int):
++    n = payload[start]
++    if n >= 0:
++        end = start + 1 + n
++        if end > len(payload):
++            raise RuntimeError("truncated ADMIT prompt")
++        return payload[start + 1:end], end
++    if n != -1 or start + 4 > len(payload):
++        raise RuntimeError("invalid delta ADMIT header")
++    kid, cut, count = payload[start + 1:start + 4]
++    if kid != resume_kid or kid < 0 or cut < 1 or count < 0 or start + 4 + count > len(payload):
++        raise RuntimeError("invalid delta ADMIT reference")
++    hit = kept_by_id(kid)
++    if len(hit.ids) != cut:
++        raise RuntimeError("delta ADMIT snapshot length differs")
++    # 0147 already retains these arrays. tolist copies native integers in C and
++    # does not parse the shared tensor's full prompt into Python on every rank.
++    arr = getattr(hit, "ids_np", None)
++    prefix = arr.tolist() if arr is not None and len(arr) == cut else list(hit.ids)
++    end = start + 4 + count
++    prefix.extend(payload[start + 4:end])
++    return prefix, end
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 4b7800a..49a6ed5 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -1187,6 +1187,9 @@ class GlmEngine:
+         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+         for snap in kept:
++            from tensorfold.cuda.incremental import keep_rendered
++
++            keep_rendered(snap, prompt)
+             self._remember(snap)
+         if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+@@ -1248,6 +1251,8 @@ class GlmEngine:
+                  priority: int | None = None) -> dict[str, Any]:
+         """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them; ``priority``: under --parallel, the request's class (``tensorfold.cuda.priority``, patch 0141; None: from ``background``)."""
+ 
++        from tensorfold.cuda.incremental import copy_prompt
++
+         if len(prompt) >= self.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
+@@ -1260,7 +1265,7 @@ class GlmEngine:
+         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
+             if vision is not None and self.vision is None:
+                 raise ValueError("image inputs require starting this server with --vision")
+-            stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
++            stats = self.scheduler.submit(copy_prompt(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
+                                           background=background, glm={"code": code, "spec": spec},
+                                           priority=priority)
+@@ -1302,7 +1307,7 @@ class GlmEngine:
+             self._share(pack(constraint))
+         if positions:
+             self._share(positions)
+-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
++        stats = self._run(copy_prompt(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
+                           shared)
+         stats.update(policy=spec, drafts=draft)
+         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
+diff --git tensorfold/families/glm5_next/cuda/kept_reasoning.py tensorfold/families/glm5_next/cuda/kept_reasoning.py
+index 297326c..ee996e9 100644
+--- tensorfold/families/glm5_next/cuda/kept_reasoning.py
++++ tensorfold/families/glm5_next/cuda/kept_reasoning.py
+@@ -85,15 +85,49 @@ def signature(history: list[Any], calls: Any) -> str:
+     return "sig:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+ 
+ 
+-def _keys(history: list[Any], calls: Any) -> list[str]:
++class _HistoryHash:
++    """SHA256 of the original JSON prefix ``[[entry,entry`` without closing it.
++
++    Copying and closing it at each tool step gives exactly ``signature``'s bytes.
++    Reasoning and call ids never enter the shape, including restored reasoning.
++    """
++
++    def __init__(self):
++        self.state = hashlib.sha256(b"[[")
++        self.count = 0
++
++    @staticmethod
++    def _json(value):
++        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
++                          default=str).encode("utf-8", "surrogatepass")
++
++    def append(self, message):
++        if not isinstance(message, dict):
++            return
++        entry = [str(message.get("role") or ""), _text(message.get("content")).strip()]
++        if message.get("role") == "assistant" and message.get("tool_calls"):
++            entry.append(_calls(message.get("tool_calls")))
++        self.state.update((b"," if self.count else b"") + self._json(entry))
++        self.count += 1
++
++    def signature(self, calls):
++        state = self.state.copy()
++        state.update(b"]," + self._json(_calls(calls)) + b"]")
++        return "sig:" + state.hexdigest()
++
++
++def _keys(history: list[Any], calls: Any, sig: str | None = None) -> list[str]:
+     ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
+-    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [signature(history, calls)]
++    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [sig if sig is not None else signature(history, calls)]
+ 
+ 
+ class KeptReasoning:
+     """Recent tool-calling replies' reasoning (LRU, bounded in replies and characters), found by any of its keys."""
+ 
+     def __init__(self, entries: int = 1024, chars: int = 32 << 20) -> None:
++        from tensorfold.cuda.incremental import enabled
++
++        self.incremental = enabled()
+         self.entries, self.chars = int(entries), int(chars)
+         self.items: OrderedDict[int, tuple[str, tuple[str, ...]]] = OrderedDict()
+         self.by_key: dict[str, int] = {}
+@@ -143,12 +177,21 @@ class KeptReasoning:
+         if not isinstance(messages, list) or not self.items:
+             return messages
+         out = None
++        running = _HistoryHash() if self.incremental else None
++        hashed = 0
+         for i, m in enumerate(messages):
+             if not (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+                     and not _text(m.get("reasoning_content")).strip() and not _text(m.get("reasoning")).strip()
+                     and "</think>" not in _text(m.get("content"))):
+                 continue
+-            kept = self._find(_keys(messages[:i], m["tool_calls"]))
++            if running is None:
++                keys = _keys(messages[:i], m["tool_calls"])
++            else:
++                for j in range(hashed, i):
++                    running.append(messages[j])
++                hashed = i
++                keys = _keys([], m["tool_calls"], running.signature(m["tool_calls"]))
++            kept = self._find(keys)
+             if kept is not None:
+                 out = out if out is not None else list(messages)
+                 out[i] = {**m, "reasoning_content": kept}
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 1301e2a..43840e8 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -45,6 +45,8 @@ import torch
+ from tensorfold.cuda import priority as prio
+ from tensorfold.cuda.scheduler import Scheduler, Waiting
+ from tensorfold.cuda.streams import Stream, next_fill
++from tensorfold.cuda.incremental import PromptIds, copy_prompt, enabled as incremental_enabled, keep_rendered
++from .admit_delta import pack_prompt, unpack_prompt
+ 
+ from . import digest as _digest, multi_prefill
+ from . import prof as _prefill_prof
+@@ -651,7 +653,8 @@ class MultiDecoder:
+ 
+         self._check()
+         g = self.g
+-        prompt = [int(t) for t in s.prompt]
++        incremental = incremental_enabled()
++        prompt = copy_prompt(s.prompt) if incremental and isinstance(s.prompt, PromptIds) else [int(t) for t in s.prompt]
+         if not prompt:
+             raise ValueError("a request needs at least one prompt token")
+         if len(prompt) >= g.limit:
+@@ -713,7 +716,7 @@ class MultiDecoder:
+         sid = self.next_sid
+         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
+-                   len(prompt), *prompt]
++                   *pack_prompt(prompt, hit if incremental and feed is None else None)]
+         from tensorfold.engine.grammar import pack
+ 
+         packed = pack(s.constraint)
+@@ -725,17 +728,16 @@ class MultiDecoder:
+             self.broken = exc
+             raise
+ 
+-    @staticmethod
+-    def _parse_admit(p: list[int]) -> dict:
++    def _parse_admit(self, p: list[int]) -> dict:
+         (sid, slot, base, size, kid, copy, count, stop_eos, draft) = p[:9]
+         sampling = unpack_sampling(p[9:19])
+         shared = [v for v in p[19:19 + SHARED_SLOTS] if v]
+         i = 19 + SHARED_SLOTS
+         code = p[i:i + 4]
+         i += 4
+-        n = p[i]
+-        prompt = p[i + 1:i + 1 + n]
+-        i += 1 + n
++        # Decoding the wire format is unconditional, so ranks with different
++        # local switch settings still follow rank 0's authoritative operation.
++        prompt, i = unpack_prompt(p, i, self._kept_by_id, kid)
+         n = p[i]
+         packed = p[i + 1:i + 1 + n]
+         i += 1 + n
+@@ -754,7 +756,7 @@ class MultiDecoder:
+         g, e = self.g, self.e
+         hit = self._kept_by_id(a["kid"]) if a["kid"] >= 0 else None
+         prompt = a["prompt"]
+-        s.prompt = list(prompt)
++        s.prompt = copy_prompt(s.prompt) if isinstance(s.prompt, PromptIds) and s.prompt == prompt else list(prompt)
+         cut = len(hit.ids) if hit is not None else 0
+         if hit is not None and hit.ids != prompt[:cut]:
+             raise RuntimeError(f"the kept prompt {a['kid']} is not a prefix of stream {a['sid']}'s prompt")
+@@ -870,6 +872,7 @@ class MultiDecoder:
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
++        keep_rendered(snap, lane.s.prompt)
+         for c in [c for c in self.kept if c.ids == snap.ids]:
+             self._drop(c)
+         lane.extent.kept.append(snap)
+@@ -1773,7 +1776,7 @@ class GlmScheduler(Scheduler):
+         box: queue.Queue = queue.Queue()
+         if priority is None:
+             priority = prio.BACKGROUND if background else self.prio.default if self.prio.enabled else prio.NORMAL
+-        stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
++        stream = Stream(copy_prompt(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+                         constraint=constraint, background=background, priority=int(priority), arrived=self.clock())
+         stream.glm = dict(glm or {})
+         self.saw(stream.priority)

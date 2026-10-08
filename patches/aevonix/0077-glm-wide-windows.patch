@@ -1,0 +1,2310 @@
+0077-glm-wide-windows.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index f56f09a..970652d 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -278,14 +278,17 @@ def mla_ring_bytes(t: dict, rows: int) -> int:
+ 
+ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int, *, prompt: bool) -> int:
+     """GLM's ``exl3_mm.Scratch`` for a window of ``rows`` rows: fp16 rotated inputs of gate/up (2 x pairs x d) and down
+-    (pairs x ``width``, a rank's expert width); a decode window's fp32 split-K sums (2 x 4 splits x pairs x
+-    max(width, d)) and block counters (16-pair items); a prompt window's (``prompt``: TF_GLM_EXL3_PROMPT) launch order."""
++    (pairs x ``width``, a rank's expert width); a decode window's fp32 split-K sums (gate/up's 2 x 4 splits x pairs x
++    ``width`` or down's pairs x d) with room for the streamed kernel's fine slabs (up to 16 rows of every chain's
++    partials) and block counters (16-pair items); a prompt window's (``prompt``: TF_GLM_EXL3_PROMPT) launch order."""
+ 
+     pairs = rows * slots
+     total = 2 * pairs * d * 2 + pairs * width * 2
+     if prompt:
+         return total + 4 + 4 + (pairs // 16 + 1024) * 4
+-    return total + 2 * 4 * pairs * max(width, d) * 4 + (pairs + pairs // 16 + 1) * max(1, width // 128) * 4 + 4
++    fine = min(rows, 16) * slots * (32 * width + 4 * d)
++    return (total + (pairs * max(2 * 4 * width, d) + fine) * 4 + (pairs + pairs // 16 + 1) * max(1, width // 128) * 4
++            + 4)
+ 
+ 
+ def even_share(world: int):
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index 37a490f..0c1106b 100644
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -196,6 +196,11 @@ class MultiDrafter:
+         self.block_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+         self.buckets = list(range(n, T + 1, n))
++        self.replays = {"blocks graph": 0, "blocks eager": 0, "taps graph": 0, "taps eager": 0}   # the profile's
++        # TF_GLM_MULTI_PROFILE (``multi``): the block passes' GPU ms, read after the candidates' own sync
++        self.timing = False
++        self.pass_ms = 0.0
++        self._pev = None
+ 
+     def _pools(self, layers: int, kv: int, rows: int, hd: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+         """The context rings: a key and a value tensor [kv heads, rows, head_dim] a layer (``dflash2_fast`` stacks
+@@ -381,6 +386,7 @@ class MultiDrafter:
+             g.replay()
+         else:
+             self._taps_compute(T)
++        self.replays["taps graph" if g is not None else "taps eager"] += 1
+         for c, part, p0 in pieces:
+             c.context_end = p0 + part.shape[0]
+ 
+@@ -425,16 +431,26 @@ class MultiDrafter:
+             h[s], h[St + s], h[2 * St + s] = int(pending), c.slot, c.context_end
+         self.b_meta.copy_(h, non_blocking=True)
+         g = self.block_graphs.get(S)
++        timed = self.timing and self.cand_ready is not None
++        if timed:
++            if self._pev is None:
++                self._pev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
++            self._pev[0].record()
+         if g is not None:
+             g.replay()
+         else:
+             self._block_compute(S)
++        self.replays["blocks graph" if g is not None else "blocks eager"] += 1
++        if timed:
++            self._pev[1].record()
+         if self.cand_ready is not None:
+             self.cand_host.copy_(self.cand, non_blocking=True)
+             self.cand_ready.record()
+             self.cand_ready.synchronize()
+         else:
+             self.cand_host.copy_(self.cand)
++        if timed and self._pev[0].query() and self._pev[1].query():   # both recorded above, done by the sync
++            self.pass_ms += self._pev[0].elapsed_time(self._pev[1])
+         d = self.d
+         m, k = self.block - 1, d.top_k
+         g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 9c3949c..e173962 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -594,6 +594,12 @@ class GlmEngine:
+             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
+             # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
+             extra = workspace + (parallel - 1) * (slot_bytes(text, world, rank=rank) + mla_ring_bytes(text, prefill_rows))
++            if parallel > 1:                 # a wide window's rows past the 64 the decode buffers' estimate holds
++                from . import wide as _wide
++                from .tp import split_sizes as _split, UNITS as _UNITS
++
++                extra += _wide.extra_bytes(text, world, MULTI_WINDOW,
++                                           share=lambda family, n: _split(n, world, _UNITS.get(family, 1))[rank])
+             per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
+             if not extra and not per:
+                 return g
+@@ -658,6 +664,9 @@ class GlmEngine:
+         from . import dflash2_fast                                    # TF_GLM_DRAFT_FAST*: drafts' passes, gathers
+ 
+         mine += dflash2_fast.code() if parallel > 1 and drafter is not None else [0, 0, 0]
++        from . import wide as wide_mod                                # TF_GLM_MULTI_GRAPH_STEP: captures and pads
++
++        mine += [wide_mod.code()]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -672,7 +681,7 @@ class GlmEngine:
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
+                                "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
+-                               "TF_GLM_DRAFT_FAST*): "
++                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -693,8 +702,13 @@ class GlmEngine:
+             except ValueError as exc:
+                 return -1, str(exc)
+ 
++        from . import exl3_stream as _exl3_stream
++        from . import segprof as _segprof
++
+         mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
+-                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1)]
++                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
++                quiet(_exl3_stream.code),
++                quiet(_segprof.code)]
+         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
+         tables = [row[0] for row in got]
+         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
+@@ -705,7 +719,8 @@ class GlmEngine:
+         if any(-1 in row for row in settings) or any(row != settings[0] for row in settings):
+             why = "; ".join(w for _, w in mine if w)
+             raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
+-                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1 by rank "
++                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
++                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF* by rank "
+                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
+                                + ": give every rank the same valid values")
+         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 570392d..47cd520 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -266,11 +266,16 @@ class Scratch:
+ 
+     def __init__(self, rows: int, slots: int, dims: int, width: int, device, *, prompt: bool = False) -> None:
+         P = rows * slots
+-        sk = max(GATEUP_CFG[2], DOWN_CFG[2])
+         self.xg = torch.zeros((P, dims), dtype=torch.float16, device=device)
+         self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
+         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
+-        self.z = torch.zeros((1 if prompt else 2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
++        # a decode window's fp32 partials: gate/up's [2][splits][P][width] or down's [splits][P][dims] (the decode
++        # and grouped kernels), or the streamed kernel's fine slabs' (exl3_stream.fine_room); scratch only
++        from . import exl3_stream
++
++        zn = 1 if prompt else max(P * max(2 * GATEUP_CFG[2] * width, DOWN_CFG[2] * dims),
++                                  exl3_stream.fine_room(rows, slots, dims, width))
++        self.z = torch.zeros((zn,), dtype=torch.float32, device=device)
+         # decode windows' fused gate/up epilogue: a finished-block count per (item, 128 columns), reset by the kernel
+         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
+                                 dtype=torch.int32, device=device)
+@@ -280,6 +285,10 @@ class Scratch:
+             exl3_k12.note("K12 prompt expert kernels (exact: the prompt kernels' bits)")
+         # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
+         self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
++        # decode windows' streamed kernel (TF_GLM_EXL3_STREAM, exl3_stream): its work queue, counts and flags
++        from . import exl3_stream
++
++        self.stream = None if prompt else exl3_stream.state(rows, slots, dims, device)
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -332,6 +341,11 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+     if plan.tile != grouped.TILE:
+         raise ValueError("the EXL3 kernel takes items of 16 pairs")
+     items = grouped.max_items(R * slots, plan.experts)
++    from . import exl3_stream                        # TF_GLM_EXL3_STREAM: decode windows streamed slab by slab
++
++    if exl3_stream.wanted(R, ex, s) and exl3_stream.on(ex, s):
++        exl3_stream.launch(x, pick, plan, ex, s, y, R, limit, items)
++        return
+     dec, _, _ = dec_settings()
+     if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI in DEC_WIDTHS:
+         dec_gateup(x, pick, plan, ex, s, R, limit, dec_config("gu", D, NI, R), items)
+diff --git tensorfold/families/glm5_next/cuda/exl3_stream.py tensorfold/families/glm5_next/cuda/exl3_stream.py
+new file mode 100644
+index 0000000..1fea5a6
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3_stream.py
+@@ -0,0 +1,373 @@
++"""Routed EXL3 experts of decode windows streamed slab by slab (TF_GLM_EXL3_STREAM): the decode kernel's bits.
++
++A verify window's routed experts are mostly a read of their trellis: 3 MB an expert on a rank at TP4, 8 experts at one
++row (25 MB a layer) and 100-240 at 16-64 rows (0.3-0.75 GB a layer). The decode kernel (``exl3_mm.dec_*``, exl3.cu
++``dec_kernel``) gives every block an (item, 128 columns, K split) and its warps read 1 KB of each k row: thousands of
++short strided streams; the box's launch-table harness measured it at 36% of the card's bandwidth at one row and 51-62%
++at 2-63 rows. Here (exl3s.cu) ONE persistent launch a layer streams each routed expert's trellis once in long
++contiguous runs: a block takes a slab, whole 4 KB k rows of one expert matrix (coarse: the 64 rows of one K split of
++gate or up, 256 KB back to back, or a 4 KB column slice of every k row of down; fine, for small windows: one 16- or
++8-row chain of those, 4x the slabs so every multiprocessor has work), brings it in through a shared-memory pipeline of
++16-byte cp.async copies several stages deep and decodes it with the decode kernel's arithmetic. The last gate/up slab
++of an item runs the item's gate/up epilogue; the item's down slabs wait for it; the last block out resets the work
++queue, so CUDA graphs replay it.
++
++Settings (read once a process; every rank must give the same values, the engine compares them at start):
++
++- ``TF_GLM_EXL3_STREAM``: ``0`` / ``off`` / unset (default): the decode kernels as before; ``on``: decode windows of
++  ``DEFAULT_ROWS`` rows and more; a number N (1 to 256): windows of N rows and more (``1``: every decode window).
++- ``TF_GLM_EXL3_STREAM_SLICE``: the column slice a block streams of every k row by window rows, ``rows:slice`` pairs
++  (slice ``1k``, ``2k`` or ``4k``: blocks of 4, 8 or 16 warps, four, two or one a multiprocessor); a window takes the
++  last pair whose rows it reaches; default ``DEFAULT_SLICE``.
++- ``TF_GLM_EXL3_STREAM_FINE``: windows of fewer rows than this take the fine slabs (default ``DEFAULT_FINE``: never);
++  where the partials fit the window's scratch.
++- ``TF_GLM_EXL3_STREAM_PIPE``: rows a stage x stages, ``4x3`` (default), ``4x4``, ``2x4`` or ``2x6``.
++- ``TF_GLM_EXL3_STREAM_BLOCKS``: the persistent grid (default 0: as many blocks as fit at once).
++- ``TF_GLM_EXL3_STREAM_PDL``: ``1`` launches it as a programmatic dependent launch (its blocks wait for the previous
++  launch on the device instead of after it); ``0`` (default): a plain launch.
++- ``TF_GLM_L2PF_EXPERT_MB``: with the L2 prefetcher on (TF_GLM_L2PF), right after a decode window's routing its side
++  stream brings up to this many MiB of the routed experts' trellis into L2 (in the order the experts are read: gate
++  and up item by item, then down; an expert once) while the main stream runs the shared expert and the input
++  rotation (default 0: off). Independent of TF_GLM_EXL3_STREAM (the decode kernels read the same bytes). It only reads.
++
++Exactness: every output is the decode kernel's float chain (each warp's mma chain over the decode kernel's K range of
++that warp, from zero; the chains added in the decode kernel's warp order, in registers (coarse) or by the epilogue from
++the chains' partials (fine): the same fp32 adds in the same order; the splits added from zero in split order by the
++same epilogue arithmetic); the inputs and fragments are the same values and mma keeps rows independent. Only data
++movement and which block computes what change, and no choice depends on what else is in the window: a window of any
++rows gives each row the bits it gets alone, and every choice by rows (which kernel, which slabs) changes nothing.
++Windows of 64-256 rows (wide windows) get the grouped kernel's bits, which are the decode kernel's. The first call
++outside a CUDA graph capture checks it on this GPU against the engine's own path, byte for byte, on the call's own
++weights and input form (random inputs, several row counts and routings, both slab sizes); any difference turns it off
++for the process (a line says so) and the decode kernels run, as they do in a capture before the check. The GPU tests
++(tests/K3) cover the other forms (per-pair inputs, two ranks' widths, every row count to 256, graph replays).
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab (the EXL3 decode kernels this reproduces; the trellis
++format after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp)."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++PIPES = {"4x3": (4, 3), "4x4": (4, 4), "2x4": (2, 4), "2x6": (2, 6)}
++DEFAULT_PIPE = "4x3"        # the box's best for 4 KB slices at 3-256 rows (K35's timing table)
++SLICES = {"1k": 4, "2k": 8, "4k": 16}                    # slice -> warps a block
++DEFAULT_SLICE = "1:1k,160:4k"
++DEFAULT_ROWS = 1            # ``on``: every decode window (the README's timing table may set a floor)
++DEFAULT_FINE = 0            # windows below this many rows take the fine slabs (0: none)
++MOST_ROWS = 256             # the widest decode window it takes (wide windows' scratch: 128, 192, 256 rows)
++CHECK_ROWS = (1, 5, 16, 33, 63, 64, 128, 256)
++CHECK_SEEDS = 2
++
++
++@dataclass(frozen=True)
++class Settings:
++    rows: int                # 0: off; else decode windows of at least this many rows take the streamed kernel
++    fine: int                # windows below this many rows take the fine slabs
++    rs: int                  # k rows a pipeline stage
++    stages: int
++    blocks: int              # persistent grid (0: as many as fit)
++    pdl: bool
++    prefetch_mb: int         # TF_GLM_L2PF_EXPERT_MB
++    slices: tuple = ((1, 16),)   # (from rows, warps a block), rows ascending, the first from 1
++
++    def code(self) -> list[int]:
++        return [self.rows, self.fine, self.rs * 16 + self.stages, self.blocks, int(self.pdl), self.prefetch_mb,
++                *[v for r, w in self.slices for v in (r, w)]]
++
++    def warps(self, R: int) -> int:
++        """A block's warps for a window of R rows (the last slice whose rows R reaches)."""
++        out = self.slices[0][1]
++        for r, w in self.slices:
++            if R >= r:
++                out = w
++        return out
++
++
++_settings: Settings | None = None
++
++
++def read(env=None) -> Settings:
++    """The settings from the environment (ValueError on a value that is not valid)."""
++
++    env = os.environ if env is None else env
++
++    def number(name: str, default: int, most: int) -> int:
++        v = (env.get(name, "") or str(default)).strip()
++        if not v.isdigit() or int(v) > most:
++            raise ValueError(f"{name}: 0 to {most}, not {v!r}")
++        return int(v)
++
++    def flag(name: str, default: str) -> bool:
++        v = (env.get(name, "") or default).strip().lower()
++        if v not in ("0", "1", "on", "off"):
++            raise ValueError(f"{name}: 1 or 0, not {v!r}")
++        return v in ("1", "on")
++
++    v = (env.get("TF_GLM_EXL3_STREAM", "") or "0").strip().lower()
++    if v in ("0", "off", "no", "false"):
++        rows = 0
++    elif v in ("on", "yes", "true"):
++        rows = DEFAULT_ROWS
++    elif v.isdigit() and 1 <= int(v) <= MOST_ROWS:
++        rows = int(v)                            # a number is always the fewest rows ("1": every decode window)
++    else:
++        raise ValueError(f"TF_GLM_EXL3_STREAM: off, on or the fewest rows a window takes it (1 to {MOST_ROWS}), "
++                         f"not {v!r}")
++    p = (env.get("TF_GLM_EXL3_STREAM_PIPE", "") or DEFAULT_PIPE).strip().lower()
++    if p not in PIPES:
++        raise ValueError(f"TF_GLM_EXL3_STREAM_PIPE: {', '.join(PIPES)}, not {p!r}")
++    rs, stages = PIPES[p]
++    return Settings(rows, number("TF_GLM_EXL3_STREAM_FINE", DEFAULT_FINE, MOST_ROWS + 1), rs, stages,
++                    number("TF_GLM_EXL3_STREAM_BLOCKS", 0, 1 << 20), flag("TF_GLM_EXL3_STREAM_PDL", "0"),
++                    number("TF_GLM_L2PF_EXPERT_MB", 0, 1024), slices(env.get("TF_GLM_EXL3_STREAM_SLICE", "")))
++
++
++def slices(value: str | None) -> tuple:
++    """TF_GLM_EXL3_STREAM_SLICE: ``rows:slice`` pairs, rows ascending from 1 (``1k`` alone: every window)."""
++
++    v = (value or DEFAULT_SLICE).strip().lower()
++    out = []
++    for part in v.split(","):
++        part = part.strip()
++        r, _, sl = part.rpartition(":") if ":" in part else ("1", "", part)
++        if not r.strip().isdigit() or sl.strip() not in SLICES:
++            raise ValueError(f"TF_GLM_EXL3_STREAM_SLICE: rows:slice pairs (slice 1k, 2k or 4k), not {v!r}")
++        out.append((int(r), SLICES[sl.strip()]))
++    if not out or out[0][0] != 1 or any(b[0] <= a[0] for a, b in zip(out, out[1:])) or out[-1][0] > MOST_ROWS:
++        raise ValueError(f"TF_GLM_EXL3_STREAM_SLICE: rows from 1, ascending, at most {MOST_ROWS}, not {v!r}")
++    return tuple(out)
++
++
++def settings() -> Settings:
++    global _settings
++    if _settings is None:
++        _settings = read()
++    return _settings
++
++
++def code() -> int:
++    """The settings as one int for the engine's start comparison (a CRC of every value; ValueError when not valid)."""
++
++    import zlib
++
++    return zlib.crc32(",".join(map(str, settings().code())).encode()) & 0x3FFFFFFF
++
++
++_decided: bool | None = None
++_why: str | None = None
++
++
++def reset(value: str | None = None, **more: str) -> None:
++    """Forget the settings and the check (tests): the environment is read again, ``value`` / ``PIPE=..`` set first."""
++
++    global _settings, _decided, _why
++    if value is not None:
++        os.environ["TF_GLM_EXL3_STREAM"] = value
++    for k, v in more.items():
++        os.environ["TF_GLM_L2PF_EXPERT_MB" if k == "prefetch_mb" else f"TF_GLM_EXL3_STREAM_{k.upper()}"] = v
++    _settings, _decided, _why = None, None, None
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_exl3s_v3", sources=[str(here / "exl3s.cpp"), str(here / "exl3s.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def capacity(rows: int, slots: int) -> int:
++    """The most items a decode plan of ``rows`` x ``slots`` pairs can hold (``grouped.max_items``, any experts)."""
++
++    pairs = rows * slots
++    return pairs + pairs // 16
++
++
++def state(rows: int, slots: int, dims: int, device) -> torch.Tensor:
++    """The kernel's queue, counts and flags for windows of up to ``rows`` rows (model width ``dims``): zeros, and
++    zeros again after each launch."""
++
++    return torch.zeros((2 + (2 + max(1, dims // 128)) * capacity(rows, slots),), dtype=torch.int32, device=device)
++
++
++def fits(ex) -> bool:
++    """Shapes the kernel takes: 4-bit trellis words, D and the rank's expert width multiples of 512, whole chains a
++    pipeline stage, the decode kernels' K splits (GLM-5.3-Flash at two and four ranks: widths 1024 and 512)."""
++
++    from . import exl3_mm
++
++    st = settings()
++    D, NI = ex.dims, ex.width
++    if exl3_mm.GATEUP_CFG != (8, 4, 4) or exl3_mm.DOWN_CFG != (8, 4, 1):
++        return False
++    if D % 512 or NI % 512 or (D // 16) % 16 or (NI // 16) % 4:
++        return False
++    if ((D // 16) // 16) % st.rs or ((NI // 16) // 4) % st.rs:
++        return False
++    return (ex.gt.dtype == torch.int32 and ex.gt.dim() == 4 and tuple(ex.gt.shape[1:]) == (D // 16, NI // 16, 32)
++            and ex.dt.dim() == 4 and tuple(ex.dt.shape[1:]) == (NI // 16, D // 16, 32))
++
++
++_bypass = False             # the check's reference runs: the engine's path without this kernel
++
++
++def wanted(R: int, ex, s=None) -> bool:
++    """Whether a decode window of R rows asks for the streamed kernel (before its check)."""
++
++    rows = settings().rows
++    if _bypass or rows == 0 or R < rows or R > MOST_ROWS or not fits(ex):
++        return False
++    return s is None or (getattr(s, "stream", None) is not None and R <= s.rows)
++
++
++def fine_room(rows: int, slots: int, dims: int, width: int) -> int:
++    """fp32 partials the fine slabs of windows of up to ``rows`` rows take (``exl3_mm.Scratch`` holds at least
++    these): every chain's gate/up and down partials of the widest window below TF_GLM_EXL3_STREAM_FINE; 0 when the
++    streamed kernel is off or its settings are not valid (the engine's start check reports those)."""
++
++    try:
++        st = settings()
++    except ValueError:
++        return 0
++    if st.rows == 0 or st.fine <= 1:
++        return 0
++    return min(rows, st.fine - 1) * slots * (32 * width + 4 * dims)
++
++
++def fine_slabs(R: int, ex, s) -> bool:
++    """Whether a window of R rows takes the fine slabs: fewer rows than TF_GLM_EXL3_STREAM_FINE and every chain's
++    partials (gate/up and down) fit the scratch's Z."""
++
++    P = R * s.slots
++    return R < settings().fine and 32 * P * ex.width + 4 * P * ex.dims <= s.z.numel()
++
++
++def prefetch_experts(pf, plan, ex, R: int) -> None:
++    """TF_GLM_L2PF_EXPERT_MB: fork the L2 prefetcher's side stream (``pf``: l2pf.ACTIVE, which joins it before the
++    forward returns) right after the routing plan, and bring the plan's routed experts' first MiB into L2 there."""
++
++    from tensorfold.cuda import experts as grouped
++
++    mb = settings().prefetch_mb
++    side = getattr(pf, "side", None)
++    if mb <= 0 or side is None or not fits(ex):
++        return
++    items = grouped.max_items(R * plan.slots, plan.experts)
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        _ext().prefetch(plan.items, plan.counts, ex.gt, ex.ut, ex.dt, items, mb << 20)
++    pf.forked = True
++
++
++def launch(x, pick, plan, ex, s, y, R: int, limit: float, items: int, fine: bool | None = None,
++           warps: int | None = None) -> None:
++    """``exl3_mm.routed``'s decode branch through the streamed kernel: Xd (s.xd) and Y for rows 0..R-1's routed pairs
++    (``fine``: the slab size, by default by rows; ``warps``: a block's warps, by default the slice for R rows)."""
++
++    from . import exl3_mm
++
++    st = settings()
++    ext = exl3_mm._ext()
++    D, NI, slots = ex.dims, ex.width, s.slots
++    xrow = ex.shared_suh is not None
++    if xrow:                                     # one rotated input a row, read by all its pairs' gate and up
++        ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
++        x0 = x1 = s.xg
++    else:
++        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++        x0, x1 = s.xg, s.xu
++    if fine is None:
++        fine = fine_slabs(R, ex, s)
++    _ext().stream(x0, x1, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u, ex.suh_d,
++                  ex.svh_d, s.z, s.xd, y, s.stream, D, NI, R * slots, slots, items, float(limit), xrow, bool(fine),
++                  st.rs, st.stages, st.blocks, st.pdl, int(warps or st.warps(R)))
++
++
++def on(ex, s) -> bool:
++    """Whether to run the streamed kernel now: asked for, and its check passed (run here on the first call outside a
++    capture); inside a capture before the check: False."""
++
++    global _decided, _why
++    if _decided is not None:
++        return _decided
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        bad = check(ex, s)
++    except Exception as exc:  # noqa: BLE001 - a kernel that fails to build or run is not used
++        bad = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}"
++    _decided, _why = bad is None, bad
++    st = settings()
++    if bad is None:
++        sl = ", ".join(f"{k} from {r} rows" for r, w in st.slices for k, v in SLICES.items() if v == w)
++        print(f"[tensorfold] streamed EXL3 experts: on for decode windows of {st.rows} to {MOST_ROWS} rows (slices "
++              f"{sl}; fine slabs below {st.fine} rows, pipeline {st.rs}x{st.stages}, pdl {int(st.pdl)}; "
++              "checked bit for bit against the decode kernels)", flush=True)
++    else:
++        print(f"[tensorfold] streamed EXL3 experts: off ({bad})", flush=True)
++    return _decided
++
++
++def check(ex, s, rows: tuple[int, ...] = CHECK_ROWS, seeds: int = CHECK_SEEDS) -> str | None:
++    """The streamed kernel (both slab sizes where they fit) against the engine's own path (``exl3_mm.routed``
++    without it: the decode kernel, the grouped kernel from 64 rows) on this GPU with ``ex``'s weights, in ``s``'s
++    buffers (which the caller's window overwrites next): Y and Xd of every routed pair compared byte for byte. None,
++    or what differed."""
++
++    global _bypass
++    from tensorfold.cuda import experts as grouped
++
++    from . import exl3_mm
++
++    E, D, slots = ex.count, ex.dims, s.slots
++    K8 = slots - 1
++    dev = ex.gt.device
++    top = min(max(rows), s.rows, MOST_ROWS)
++    plan = grouped.Plan(top, slots, E + 1, dev)
++    pick = torch.full((top, slots), E, dtype=torch.int32, device=dev)
++    ys = [torch.empty((top * slots, D), dtype=torch.float32, device=dev) for _ in range(2)]
++    g = torch.Generator(device=dev)
++    for R in sorted({min(r, top) for r in rows}):
++        for seed in range(seeds):
++            g.manual_seed(1000 * seed + R)
++            x = (torch.randn((R, D), device=dev, generator=g) * (0.5 + 2.0 * seed)).to(torch.bfloat16)
++            pool = E if seed % 2 == 0 else min(E, K8 + 3)     # odd seeds: few experts, items of 16 pairs and more
++            pick.fill_(E)
++            pick[:R, :K8] = torch.rand((R, pool), device=dev, generator=g).argsort(dim=1)[:, :K8].int()
++            grouped.route(pick[:R].contiguous(), plan, plan.tile)
++            items = grouped.max_items(R * slots, plan.experts)
++            routed = torch.arange(R * slots, device=dev) % slots != slots - 1
++            ref = None
++            for mode in ("ref", "coarse", "fine"):
++                if mode == "fine" and 32 * R * slots * ex.width + 4 * R * slots * D > s.z.numel():
++                    continue
++                ys[0 if mode == "ref" else 1].view(torch.uint8).fill_(0x7F)
++                s.xd.view(torch.uint8).fill_(0x7F)
++                if mode == "ref":
++                    _bypass = True
++                    try:
++                        exl3_mm.routed(x, pick, plan, ex, s, ys[0], R, 10.0)
++                    finally:
++                        _bypass = False
++                    ref = (ys[0][:R * slots][routed].clone(), s.xd[:R * slots][routed].clone())
++                    continue
++                launch(x, pick, plan, ex, s, ys[1], R, 10.0, items, fine=mode == "fine")
++                got = (ys[1][:R * slots][routed], s.xd[:R * slots][routed])
++                for name, a, b in (("Y", ref[0], got[0]), ("Xd", ref[1], got[1])):
++                    if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
++                        n = (a.view(torch.int32 if a.dtype == torch.float32 else torch.int16) !=
++                             b.view(torch.int32 if b.dtype == torch.float32 else torch.int16)).sum().item()
++                        return (f"{name} differs from the engine's path at {R} rows ({mode} slabs, seed {seed}): "
++                                f"{n} values")
++    if s.stream is not None and torch.any(s.stream):
++        return "the kernel left its queue state set"
++    torch.cuda.synchronize()
++    return None
+diff --git tensorfold/families/glm5_next/cuda/exl3s.cpp tensorfold/families/glm5_next/cuda/exl3s.cpp
+new file mode 100644
+index 0000000..1e9bcbf
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3s.cpp
+@@ -0,0 +1,101 @@
++// Bindings of exl3s.cu: GLM-5.3-Flash's routed EXL3 experts streamed slab by slab in decode windows (the same bits
++// as exl3.cu's decode kernel).
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void exl3_stream_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& Tg, const at::Tensor& Tu,
++                      const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
++                      const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
++                      const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& Z, at::Tensor& xd, at::Tensor& y,
++                      at::Tensor& state, int64_t D, int64_t NI, int64_t E, int64_t P, int64_t slots,
++                      int64_t max_items, double limit, bool xrow, bool fine, int64_t rs, int64_t stages,
++                      int64_t blocks, bool pdl, int64_t warps);
++
++void exl3_probe_cuda(const at::Tensor& ids, const at::Tensor& Tg, const at::Tensor& Tu, const at::Tensor& Td,
++                     at::Tensor& out, int64_t blocks);
++void exl3_expert_prefetch_cuda(const at::Tensor& items, const at::Tensor& counts, const at::Tensor& Tg,
++                               const at::Tensor& Tu, const at::Tensor& Td, int64_t max_items, int64_t budget);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), "streamed experts: ", name,
++                " must be a contiguous CUDA tensor of the right dtype");
++}
++
++static bool aligned16(const at::Tensor& x) { return (reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0; }
++
++// X0 / X1: gate and up inputs, [rows, D] each (xrow: one rotated row a token, X1 = X0) or [pairs, D]; Tg / Tu / Td:
++// the trellis words [E, D/16, NI/16, 32] and [E, NI/16, D/16, 32]; items / counts / members: the decode plan (items
++// of at most 16 pairs); P: the window's pairs (rows x slots); Z: fp32 partials (coarse 8 P NI, fine 32 P NI + 4 P D);
++// xd fp16 [P, NI]; y fp32 [P, D]; state: int32 zeros, 2 + (2 + D / slice) max_items of them (slice: a block's
++// columns, warps * 32); warps: a block's warps, 4, 8 or 16 (1, 2 or 4 KB slices of every k row).
++void stream(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& Tg, const at::Tensor& Tu,
++            const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
++            const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
++            at::Tensor Z, at::Tensor xd, at::Tensor y, at::Tensor state, int64_t D, int64_t NI, int64_t P,
++            int64_t slots, int64_t max_items, double limit, bool xrow, bool fine, int64_t rs, int64_t stages,
++            int64_t blocks, bool pdl, int64_t warps) {
++    for (auto* t : {&X0, &X1, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "fp16 input");
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&Tg, &Tu, &Td, &items, &counts, &members,
++                                                                        &state})
++        check(*t, at::kInt, "int32 input");
++    check(Z, at::kFloat, "Z");
++    check(xd, at::kHalf, "xd");
++    check(y, at::kFloat, "y");
++    const int64_t E = Tg.size(0);
++    TORCH_CHECK(warps == 4 || warps == 8 || warps == 16, "streamed experts: blocks of 4, 8 or 16 warps, not ", warps);
++    const int64_t slice = warps * 2 * 16;                    // columns a block's slice: 128, 256 or 512
++    TORCH_CHECK(D % slice == 0 && NI % slice == 0, "streamed experts: D and NI multiples of the slice's ", slice,
++                " columns, not ", D, ", ", NI);
++    TORCH_CHECK((D / 16) % 16 == 0 && (NI / 16) % 4 == 0, "streamed experts: whole chains");
++    TORCH_CHECK(rs >= 1 && ((D / 16) / 16) % rs == 0 && ((NI / 16) / 4) % rs == 0,
++                "streamed experts: rows a stage must divide every chain");
++    TORCH_CHECK(Tg.dim() == 4 && Tg.size(1) == D / 16 && Tg.size(2) == NI / 16 && Tg.size(3) == 32 &&
++                    Tu.sizes() == Tg.sizes() && Td.dim() == 4 && Td.size(0) == E && Td.size(1) == NI / 16 &&
++                    Td.size(2) == D / 16 && Td.size(3) == 32,
++                "streamed experts: trellis words [E, D/16, NI/16, 32] and [E, NI/16, D/16, 32]");
++    TORCH_CHECK(svh_g.numel() >= E * NI && svh_u.numel() >= E * NI && suh_d.numel() >= E * NI &&
++                    svh_d.numel() >= E * D, "streamed experts: scales");
++    TORCH_CHECK(P >= 1 && P % slots == 0, "streamed experts: P is the window's rows x slots");
++    TORCH_CHECK(X0.numel() >= (xrow ? P / slots : P) * D && X1.numel() == X0.numel(), "streamed experts: inputs");
++    TORCH_CHECK(!xrow || X0.data_ptr() == X1.data_ptr(), "streamed experts: one rotated row a token takes X1 = X0");
++    TORCH_CHECK(items.numel() >= 3 * max_items && members.numel() >= P && counts.numel() >= 2,
++                "streamed experts: the plan");
++    TORCH_CHECK(Z.numel() >= (fine ? 2 * 4 * 4 * P * NI + 4 * P * D : 2 * 4 * P * NI) && xd.numel() >= P * NI &&
++                    y.numel() >= P * D, "streamed experts: outputs");
++    TORCH_CHECK(state.numel() >= 2 + (2 + D / slice) * max_items, "streamed experts: state");
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&X0, &X1, &Tg, &Tu, &Td, &Z, &xd, &y})
++        TORCH_CHECK(aligned16(*t), "streamed experts: 16-byte aligned tensors");
++    c10::cuda::CUDAGuard guard(X0.device());
++    exl3_stream_cuda(X0, X1, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, Z, xd, y, state, D, NI,
++                     E, P, slots, max_items, limit, xrow, fine, rs, stages, blocks, pdl, warps);
++}
++
++// Tests and timing: every byte of the experts in ids (int32, distinct) read once with plain 16-byte loads.
++void probe(const at::Tensor& ids, const at::Tensor& Tg, const at::Tensor& Tu, const at::Tensor& Td, at::Tensor out,
++           int64_t blocks) {
++    check(ids, at::kInt, "ids");
++    for (auto* t : {&Tg, &Tu, &Td}) check(*t, at::kInt, "trellis words");
++    check(out, at::kInt, "out");
++    TORCH_CHECK(Tu.numel() == Tg.numel() && Td.numel() == Tg.numel() && Tg.size(0) == Td.size(0) &&
++                    (Tg.numel() / Tg.size(0)) % 4 == 0, "probe: three matrices of one size an expert");
++    c10::cuda::CUDAGuard guard(Tg.device());
++    exl3_probe_cuda(ids, Tg, Tu, Td, out, blocks);
++}
++
++// The expert L2 prefetch (TF_GLM_L2PF_EXPERT_MB): the plan's routed experts' trellis into L2, up to budget bytes.
++void prefetch(const at::Tensor& items, const at::Tensor& counts, const at::Tensor& Tg, const at::Tensor& Tu,
++              const at::Tensor& Td, int64_t max_items, int64_t budget) {
++    for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&items, &counts, &Tg, &Tu, &Td})
++        check(*t, at::kInt, "int32 input");
++    TORCH_CHECK(Tu.numel() == Tg.numel() && Td.numel() == Tg.numel() && Tg.size(0) == Td.size(0) &&
++                    ((Tg.numel() / Tg.size(0)) * 4) % 16 == 0 && items.numel() >= 3 * max_items,
++                "expert prefetch: three matrices of one size an expert, 16-byte multiples; the plan");
++    c10::cuda::CUDAGuard guard(Tg.device());
++    exl3_expert_prefetch_cuda(items, counts, Tg, Tu, Td, max_items, budget);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("stream", &stream);
++    m.def("probe", &probe);
++    m.def("prefetch", &prefetch);
++}
+diff --git tensorfold/families/glm5_next/cuda/exl3s.cu tensorfold/families/glm5_next/cuda/exl3s.cu
+new file mode 100644
+index 0000000..ebe474a
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/exl3s.cu
+@@ -0,0 +1,689 @@
++// GLM-5.3-Flash's routed EXL3 experts for decode windows of many rows (TF_GLM_EXL3_STREAM): every routed expert's
++// trellis streamed once a window in long contiguous runs, the same bits as the decode kernel (exl3.cu, dec_kernel).
++//
++// Why: dec_kernel gives each block an (item, 128-column block, K split): its warps read 1 KB pieces of every k row
++// (4 KB apart for gate/up, 32 KB apart for down), so a window's experts reach DRAM as thousands of short strided
++// streams. Here a block takes a SLAB: a column slice (1, 2 or 4 KB: TF_GLM_EXL3_STREAM_SLICE) of a run of k rows of
++// one expert matrix (gate/up: the 64 rows of one K split; down: every k row), loaded with 16-byte cp.async a stage of
++// rows at a time, several stages in flight, into shared memory; the block's warps decode their own tiles from there.
++// Narrow slices run several blocks a multiprocessor, so one block's gaps between slabs overlap the others' streaming.
++//
++// One persistent launch a layer: blocks take work from a device queue in order: first every item's gate/up slabs
++// (2 matrices x 4 K splits x NI / slice column blocks), then every item's down slabs (D / slice blocks). The last
++// gate/up slab of an item to finish runs the item's gate/up epilogue (exl3.cu's gateup_epilogue_kernel arithmetic) and
++// raises the item's ready flag; a down slab waits for its item's flag (every gate/up slab is taken before any down slab
++// and a taken slab belongs to a running block, so the wait always ends). The last block to leave resets the queue and
++// the flags, so CUDA graphs replay the launch.
++//
++// Bits: each output is dec_kernel's (and grouped_kernel's) float chain: a warp's mma chain runs k tiles
++// [split * KT / SK + c * KT / (SK * 4), + KT / (SK * 4)) from zero for chain c = 0..3 (dec_kernel's warp c), the
++// chains are added in order (s = c0; s += c1; s += c2; s += c3: dec_kernel's red[0] + red[1] + ...), gate/up write
++// that per split to Z as dec_kernel (fuse 0) does and the epilogue adds the splits from zero in split order; down
++// takes 0 + s into its fused epilogue (dec_kernel fuse 1). The A fragments hold the same fp16 values (rows past an
++// item's pairs are zeros, as load_pair gives), the B fragments come from the same decode, the same mma instruction
++// multiplies them, and mma keeps rows independent. Only data movement and which block computes what change.
++//
++// Format and decode: exl3.cu (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp); kernels of the GLM-5.3-Flash
++// recipe (MiaAI-Lab, Apache-2.0) on TensorFold (Ash Hart and the TensorFold contributors, Apache-2.0).
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++namespace {
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++
++// ---- exl3.cu's arithmetic, verbatim (the same decode, mma, transforms and roundings) ----------------------------
++
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
++    uint32_t x0 = s0 * 0xCBAC1FEDu;
++    uint32_t x1 = s1 * 0xCBAC1FEDu;
++    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// exl3.cu's decode_tile_p: decode_tile's states with fewer integer instructions (the same states, so the same values)
++__device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    const uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    const uint32_t s = __funnelshift_r(w, p, 20);
++    const uint32_t t = w >> 4;
++    b0[0] = mcg2(__byte_perm(s, 0u, 0x4421), (s >> 4) & 0xffffu);          // (s >> 8) & 0xffff, (s >> 4) & 0xffff
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2(__byte_perm(t, 0u, 0x4421), __byte_perm(w, 0u, 0x4421));   // (w >> 12) & 0xffff, (w >> 8) & 0xffff
++    b1[1] = mcg2(__byte_perm(t, 0u, 0x4410), w & 0xffffu);                  // (w >> 4) & 0xffff, w & 0xffff
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// ---- data movement --------------------------------------------------------------------------------------------------
++
++// Copies: plain and zero-fill 16-byte cp.async and ldmatrix x4, the forms the engine's other kernels already run
++// (qmm_frag.cuh, experts.cuh, kda_chunk.cu, qmm.cu). No L2 cache-hint copies: with a hint (createpolicy +
++// cp.async.L2::cache_hint) ptxas folds this loop's shared base into the hint's descriptor registers, a form only the
++// hinted kernels had, and their first launch on the RTX PRO 6000 (sm_120) stopped with "illegal instruction" (Xid 13
++// Illegal Instruction Parameter). tests/K3/triage_exl3_stream.py runs that form alone, in a process of its own.
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++__device__ __forceinline__ int ld_acquire(const int* p) {
++    int v;
++    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
++    return v;
++}
++__device__ __forceinline__ void st_release(int* p, int v) {
++    asm volatile("st.release.gpu.global.b32 [%0], %1;\n" ::"l"(p), "r"(v) : "memory");
++}
++
++// ---- the launch -----------------------------------------------------------------------------------------------------
++
++constexpr int NTW = 2;                    // n tiles a warp
++constexpr int SK = 4;                     // gate/up K splits (exl3_mm.GATEUP_CFG), down 1 (DOWN_CFG)
++constexpr int CHAINS = 4;                 // chains a split: dec_kernel's warps along K
++
++// A block's geometry (TF_GLM_EXL3_STREAM_SLICE): W warps of NTW n tiles take a column slice of BT = 2 W tiles, BT * 128
++// bytes of every k row: W 16 (4 KB slices, one 512-thread block a multiprocessor), 8 (2 KB, two blocks) or 4 (1 KB,
++// four blocks): with several blocks a multiprocessor, one block's gaps between slabs (the claim, the item's rows, the
++// pipeline's first stage, the partials and counts) overlap the other blocks' streaming. Columns are independent: every
++// output keeps its chain whatever slice holds its column.
++template <int W>
++struct Geo {
++    static constexpr int THREADS = W * 32;
++    static constexpr int BT = W * NTW;            // n tiles a block
++    static constexpr int ROWB = BT * 128;         // bytes of a k row a block reads
++    static constexpr int PR = ROWB / 16;          // 16-byte pieces of it
++    static constexpr int ES = BT * 16 + 8;        // the down epilogue's row stride in floats
++    static constexpr int MINB = 16 / W;           // blocks a multiprocessor the launch bounds ask for (128 registers)
++    static_assert(W == 4 || W == 8 || W == 16, "slices of 1, 2 or 4 KB");
++};
++
++struct Args {
++    const half* X0;                       // gate input: [rows, D] (xrow) or [pairs, D]
++    const half* X1;                       // up input (xrow: X0)
++    const uint32_t* Tg;                   // trellis words [E, D/16, NI/16, 32]
++    const uint32_t* Tu;
++    const uint32_t* Td;                   // [E, NI/16, D/16, 32]
++    const int* items;                     // [max_items, 3]: expert, first member, count
++    const int* counts;                    // [2]: items, distinct experts
++    const int* members;                   // pair ids grouped by expert
++    const half* svh_g;                    // [E, NI]
++    const half* svh_u;
++    const half* suh_d;                    // [E, NI]
++    const half* svh_d;                    // [E, D]
++    float* Z;                             // partials (a window's pairs P): coarse [2][SK][P][NI]; fine
++                                          // [2][SK][4][P][NI] then [4][P][D]
++    half* xd;                             // [pairs, NI]: gate/up output, down input
++    float* y;                             // [pairs, D]
++    int* state;                           // queue head, blocks out, gate/up counts [cap], ready flags [cap], down
++                                          // counts [cap][D / (BT * 16)] (fine): zeros before and after every launch
++    int D, NI, E, P, slots, max_items;
++    float limit;
++    int xrow, fine;
++};
++
++template <int RS, int W>
++struct Stage {
++    static constexpr int APITCH = RS * 32 + 16;              // bytes a row of A (RS k tiles + 16: no bank conflicts)
++    static constexpr int BYTES = RS * Geo<W>::ROWB + 16 * APITCH;
++};
++
++template <int RS, int STAGES, int W>
++constexpr int smem_bytes() {
++    constexpr int pipe = STAGES * Stage<RS, W>::BYTES;
++    constexpr int epi = 16 * Geo<W>::ES * 4;
++    return pipe > epi ? pipe : epi;
++}
++
++// One slab: rows k0 .. k0 + nrows - 1 of an expert matrix (row k at wrow + k * pitch words, the block's ROWB bytes of
++// it), A = the item's member rows (arow[i], null past the item's pairs) at k values 16 k .. 16 k + 15; chains of CL
++// rows added in order into `sum` (this warp's NTW tiles, rows g / g + 8 of the 16-row mma tile). Each thread moves
++// PER 16-byte pieces of every stage's k rows (RS * PR pieces over the block's threads) and threads below ACH one
++// piece of A; a stage lands, every warp decodes its tiles of its RS rows, and the slot is refilled STAGES - 1 ahead.
++template <int RS, int STAGES, int W>
++__device__ __forceinline__ void run_slab(unsigned char* smem, const uint32_t* wrow, size_t pitch, int k0, int nrows,
++                                         int CL, const half* const* arow, const half* adummy,
++                                         float (&sum)[NTW][2][4]) {
++    using G = Geo<W>;
++    using S = Stage<RS, W>;
++    constexpr int PER = RS * G::PR / G::THREADS;             // weight pieces a thread a stage
++    static_assert(RS * G::PR % G::THREADS == 0, "a stage's weight pieces split evenly over the threads");
++    constexpr int ACH = 16 * RS * 2;                         // A: 16 rows x RS k tiles x 2 pieces of 16 bytes
++    static_assert(ACH <= G::THREADS, "a thread a piece of A");
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int nst = nrows / RS;
++    // this thread's weight pieces: piece q = tid + j * THREADS of a stage, row q / PR, bytes 16 (q % PR) of it
++    const char* wsrc = reinterpret_cast<const char*>(wrow + (size_t)k0 * pitch);
++    const size_t wpitch = pitch * 4;                         // bytes from one k row to the next
++    const unsigned sbase = (unsigned)__cvta_generic_to_shared(smem);
++    const int ai = tid / (RS * 2), apart = tid % (RS * 2);
++    const half* aptr = tid < ACH ? arow[ai] : nullptr;
++    const char* asrc = reinterpret_cast<const char*>(aptr ? aptr + (size_t)k0 * 16 + apart * 8 : adummy);
++    const unsigned adst = sbase + RS * G::ROWB + ai * S::APITCH + apart * 16;
++    const int abytes = aptr != nullptr ? 16 : 0;
++    auto load = [&](int slot, int st) {
++        const unsigned off = slot * S::BYTES;
++        const char* src = wsrc + (size_t)(st * RS) * wpitch;
++#pragma unroll
++        for (int j = 0; j < PER; ++j) {
++            const int q = tid + j * G::THREADS;
++            const unsigned d = sbase + off + q * 16;
++            const char* g = src + (size_t)(q / G::PR) * wpitch + (q % G::PR) * 16;
++            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(g));
++        }
++        if (tid < ACH)
++            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(adst + off),
++                         "l"(abytes ? asrc + st * RS * 32 : asrc), "r"(abytes));
++    };
++#pragma unroll
++    for (int st = 0; st < STAGES - 1; ++st) {
++        if (st < nst) load(st, st);
++        cp_async_commit();
++    }
++    const int arow_l = (lane & 7) + ((lane >> 3) & 1) * 8;   // ldmatrix: this lane's A row and k half
++    const unsigned a_lane = RS * G::ROWB + arow_l * S::APITCH + (lane >> 4) * 16;
++    const unsigned w_lane = ((warp * NTW) * 32 + lane) * 4;
++    int st = 0;
++    for (int c = 0; c * CL < nrows; ++c) {                   // chain c: rows c * CL .. c * CL + CL - 1, from zero
++        float acc[NTW][2][4];
++#pragma unroll
++        for (int i = 0; i < NTW; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) acc[i][h][e] = 0.f;
++        for (int left = CL; left > 0; left -= RS, ++st) {    // RS divides CL: chains end on stage ends
++            cp_async_wait<STAGES - 2>();
++            __syncthreads();                                 // stage st landed; stage st - 1 is free again
++            if (st + STAGES - 1 < nst) load((st + STAGES - 1) % STAGES, st + STAGES - 1);
++            cp_async_commit();
++            const unsigned char* base = smem + (st % STAGES) * S::BYTES;
++#pragma unroll
++            for (int rr = 0; rr < RS; ++rr) {
++                uint32_t a[4];
++                ldsm_x4(a, base + a_lane + rr * 32);
++                uint32_t w[NTW];
++#pragma unroll
++                for (int i = 0; i < NTW; ++i)
++                    w[i] = *reinterpret_cast<const uint32_t*>(base + rr * G::ROWB + w_lane + i * 128);
++#pragma unroll
++                for (int i = 0; i < NTW; ++i) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile(w[i], lane, b0, b1);
++                    mma16816(acc[i][0], a, b0);
++                    mma16816(acc[i][1], a, b1);
++                }
++            }
++        }
++        // dec_kernel adds its warps' chains in warp order: s = c0, then s += c1, s += c2, s += c3
++#pragma unroll
++        for (int i = 0; i < NTW; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) sum[i][h][e] = c == 0 ? acc[i][h][e] : sum[i][h][e] + acc[i][h][e];
++    }
++    cp_async_wait<0>();
++    __syncthreads();                                         // every warp is done with the stages
++}
++
++// The gate/up epilogue of an item (its last gate/up slab runs it): gateup_epilogue_kernel's arithmetic on each pair
++// and 128 columns. Each split's sum S is the coarse slab's register sum, or (fine) its four chains added in the same
++// order from the partials; g = 0 + S0 + S1 + S2 + S3 in split order. Partials are read through L2 (other blocks wrote
++// them in this launch).
++template <int W>
++__device__ __forceinline__ void gateup_epilogue(const Args& a, int e, const int* rows_sh, int cnt) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int NI = a.NI, P = a.P;
++    const int nb = NI / 128;
++    for (int task = warp; task < cnt * nb; task += W) {
++        const int p = rows_sh[task / nb];
++        const int n = (task % nb) * 128 + 4 * lane;
++        float gv[4], uv[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float sg = 0.f, su = 0.f;
++            for (int s = 0; s < SK; ++s) {
++                float vg, vu;
++                if (a.fine) {
++                    const float* zg = a.Z + ((size_t)((0 * SK + s) * CHAINS) * P + p) * NI + n + j;
++                    const float* zu = a.Z + ((size_t)((1 * SK + s) * CHAINS) * P + p) * NI + n + j;
++                    const size_t cs = (size_t)P * NI;                // one chain's partials to the next
++                    vg = __ldcg(zg);
++                    vu = __ldcg(zu);
++#pragma unroll
++                    for (int c = 1; c < CHAINS; ++c) {
++                        vg += __ldcg(zg + c * cs);
++                        vu += __ldcg(zu + c * cs);
++                    }
++                } else {
++                    vg = __ldcg(a.Z + ((size_t)(0 * SK + s) * P + p) * NI + n + j);
++                    vu = __ldcg(a.Z + ((size_t)(1 * SK + s) * P + p) * NI + n + j);
++                }
++                sg += vg;
++                su += vu;
++            }
++            gv[j] = sg;
++            uv[j] = su;
++        }
++        fwht128(gv, lane);
++        fwht128(uv, lane);
++        float v[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(a.svh_g[(size_t)e * NI + n + j])), a.limit);
++            float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(a.svh_u[(size_t)e * NI + n + j])), -a.limit),
++                             a.limit);
++            float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++            v[j] = act * __half2float(a.suh_d[(size_t)e * NI + n + j]);
++        }
++        fwht128(v, lane);
++        half* o = a.xd + (size_t)p * NI + n;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++    }
++}
++
++// dec_kernel's fused down epilogue for one 128-column block of one pair: v = 0 + s, rotated, times svh -> Y.
++__device__ __forceinline__ void down_out(const Args& a, int e, int p, int n, const float (&s)[4]) {
++    const int lane = threadIdx.x & 31;
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float z = 0.f;
++        z += s[j];
++        v[j] = z;
++    }
++    fwht128(v, lane);
++    float* o = a.y + (size_t)p * a.D + n;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(a.svh_d[(size_t)e * a.D + n + j]);
++}
++
++template <int RS, int STAGES, bool PDL, int W>
++__global__ void __launch_bounds__(Geo<W>::THREADS, Geo<W>::MINB) stream_kernel(const Args a) {
++    using G = Geo<W>;
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ int rows_sh[16];
++    __shared__ const half* arow_sh[16];
++    __shared__ int work_sh, flag_sh;
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int g = lane >> 2, t = lane & 3;
++    // a programmatic dependent launch (TF_GLM_EXL3_STREAM_PDL; only its own instantiation has the instruction): the
++    // plan and inputs of earlier launches before the first read
++    if constexpr (PDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
++    const int D = a.D, NI = a.NI, P = a.P;
++    const int cbg = NI / (G::BT * 16), cbd = D / (G::BT * 16);   // column blocks of gate/up and of down
++    const int ch = a.fine ? CHAINS : 1;                      // slabs a chain range splits into
++    const int GU = 2 * SK * ch * cbg, DN = cbd * ch;         // slabs an item, each phase
++    const int n_items = min(a.counts[0], a.max_items);
++    const int phase1 = n_items * GU, total = phase1 + n_items * DN;
++    int* head = a.state;
++    int* outc = a.state + 1;
++    int* cnt = a.state + 2;
++    int* ready = cnt + a.max_items;
++    int* cntd = ready + a.max_items;
++    float* Zd = a.Z + (size_t)2 * SK * CHAINS * P * NI;      // fine: the down chains' partials
++
++    if (tid == 0) work_sh = atomicAdd(head, 1);
++    __syncthreads();
++    for (;;) {
++        const int w = work_sh;
++        if (w >= total) break;
++        const bool gu = w < phase1;
++        const int item = gu ? w / GU : (w - phase1) / DN;
++        const int sub = gu ? w % GU : (w - phase1) % DN;
++        const int e = a.items[3 * item], first = a.items[3 * item + 1], cnt_i = a.items[3 * item + 2];
++        if (e < a.E) {
++            // gate/up: sub = ((mat * SK + split) * ch + chain) * cbg + cb; down: sub = cb * ch + chain
++            const int cb = gu ? sub % cbg : sub / ch;
++            const int chain = gu ? (sub / cbg) % ch : sub % ch;
++            const int ms = gu ? sub / (cbg * ch) : 0;          // mat * SK + split
++            const int mat = ms / SK, split = ms % SK;
++            if (!gu && tid == 0)                             // the item's gate/up epilogue has run
++                while (ld_acquire(ready + item) == 0) __nanosleep(128);
++            if (tid < 16) {
++                const int p = tid < cnt_i ? a.members[first + tid] : -1;
++                rows_sh[tid] = p;
++                const half* r = nullptr;
++                if (p >= 0) r = gu ? (a.xrow ? a.X0 + (size_t)(p / a.slots) * D : (mat ? a.X1 : a.X0) + (size_t)p * D)
++                                   : a.xd + (size_t)p * NI;
++                arow_sh[tid] = r;
++            }
++            __syncthreads();
++            float sum[NTW][2][4] = {};
++            if (gu) {
++                const int KT = D >> 4, NT = NI >> 4, rows = KT / SK, CL = rows / CHAINS;
++                const uint32_t* T = mat ? a.Tu : a.Tg;
++                const uint32_t* wrow = T + (((size_t)e * KT) * NT + cb * G::BT) * 32;
++                // coarse: the split's 64 rows, its four chains added in registers; fine: one chain's rows
++                if (a.fine) run_slab<RS, STAGES, W>(smem, wrow, (size_t)NT * 32, split * rows + chain * CL, CL, CL,
++                                                 arow_sh, a.X0, sum);
++                else run_slab<RS, STAGES, W>(smem, wrow, (size_t)NT * 32, split * rows, rows, CL, arow_sh, a.X0, sum);
++                // partials: coarse Z[mat][split][pair][n] as dec_kernel (fuse 0) writes them; fine per chain
++                float* Zs = a.Z + (size_t)(a.fine ? ms * CHAINS + chain : ms) * P * NI;
++#pragma unroll
++                for (int i = 0; i < NTW; ++i)
++#pragma unroll
++                    for (int h = 0; h < 2; ++h) {
++                        const int col = cb * G::BT * 16 + (warp * NTW + i) * 16 + h * 8 + 2 * t;
++                        const int p0 = rows_sh[g], p1 = rows_sh[g + 8];
++                        if (p0 >= 0) *reinterpret_cast<float2*>(Zs + (size_t)p0 * NI + col) =
++                                         make_float2(sum[i][h][0], sum[i][h][1]);
++                        if (p1 >= 0) *reinterpret_cast<float2*>(Zs + (size_t)p1 * NI + col) =
++                                         make_float2(sum[i][h][2], sum[i][h][3]);
++                    }
++                __threadfence();                             // this block's partials before its count
++                __syncthreads();
++                if (tid == 0) flag_sh = atomicAdd(cnt + item, 1) == GU - 1;
++                __syncthreads();
++                if (flag_sh) {                               // the item's last gate/up slab: its epilogue
++                    __threadfence();                         // every slab's partials are visible from here
++                    gateup_epilogue<W>(a, e, rows_sh, cnt_i);
++                    __threadfence();
++                    __syncthreads();
++                    if (tid == 0) {
++                        cnt[item] = 0;                       // the next launch counts from zero
++                        st_release(ready + item, 1);
++                    }
++                }
++            } else {
++                const int KT = NI >> 4, NT = D >> 4, CL = KT / CHAINS;
++                const uint32_t* wrow = a.Td + (((size_t)e * KT) * NT + cb * G::BT) * 32;
++                constexpr int HB = G::BT * 16 / 128;         // 128-column blocks a slab: 1, 2 or 4
++                if (a.fine) {
++                    run_slab<RS, STAGES, W>(smem, wrow, (size_t)NT * 32, chain * CL, CL, CL, arow_sh, a.xd, sum);
++                    float* Zc = Zd + (size_t)chain * P * D;
++#pragma unroll
++                    for (int i = 0; i < NTW; ++i)
++#pragma unroll
++                        for (int h = 0; h < 2; ++h) {
++                            const int col = cb * G::BT * 16 + (warp * NTW + i) * 16 + h * 8 + 2 * t;
++                            const int p0 = rows_sh[g], p1 = rows_sh[g + 8];
++                            if (p0 >= 0) *reinterpret_cast<float2*>(Zc + (size_t)p0 * D + col) =
++                                             make_float2(sum[i][h][0], sum[i][h][1]);
++                            if (p1 >= 0) *reinterpret_cast<float2*>(Zc + (size_t)p1 * D + col) =
++                                             make_float2(sum[i][h][2], sum[i][h][3]);
++                        }
++                    __threadfence();
++                    __syncthreads();
++                    int* c = cntd + (size_t)item * cbd + cb;
++                    if (tid == 0) flag_sh = atomicAdd(c, 1) == CHAINS - 1;
++                    __syncthreads();
++                    if (flag_sh) {                           // the last chain of these 512 columns: s = c0 + c1 + ...
++                        __threadfence();
++                        for (int task = warp; task < cnt_i * HB; task += W) {
++                            const int p = rows_sh[task / HB];
++                            const int n = cb * G::BT * 16 + (task % HB) * 128 + 4 * lane;
++                            float s[4];
++#pragma unroll
++                            for (int j = 0; j < 4; ++j) {
++                                const float* z = Zd + (size_t)p * D + n + j;
++                                float v = __ldcg(z);
++#pragma unroll
++                                for (int k = 1; k < CHAINS; ++k) v += __ldcg(z + (size_t)k * P * D);
++                                s[j] = v;
++                            }
++                            down_out(a, e, p, n, s);
++                        }
++                        if (tid == 0) *c = 0;                // the next launch counts from zero
++                    }
++                } else {
++                    run_slab<RS, STAGES, W>(smem, wrow, (size_t)NT * 32, 0, KT, CL, arow_sh, a.xd, sum);
++                    float* E = reinterpret_cast<float*>(smem);   // the stages are free (run_slab's last barrier)
++#pragma unroll
++                    for (int i = 0; i < NTW; ++i)
++#pragma unroll
++                        for (int h = 0; h < 2; ++h) {
++                            const int col = (warp * NTW + i) * 16 + h * 8 + 2 * t;
++                            *reinterpret_cast<float2*>(E + g * G::ES + col) = make_float2(sum[i][h][0], sum[i][h][1]);
++                            *reinterpret_cast<float2*>(E + (g + 8) * G::ES + col) =
++                                make_float2(sum[i][h][2], sum[i][h][3]);
++                        }
++                    __syncthreads();
++                    for (int task = warp; task < cnt_i * HB; task += W) {
++                        const int i = task / HB, c = (task % HB) * 128 + 4 * lane;
++                        const float4 s4 = *reinterpret_cast<const float4*>(E + i * G::ES + c);
++                        const float s[4] = {s4.x, s4.y, s4.z, s4.w};
++                        down_out(a, e, rows_sh[i], cb * G::BT * 16 + c, s);
++                    }
++                }
++            }
++        }
++        __syncthreads();                                     // rows_sh, arow_sh, flag_sh and E are free again
++        if (tid == 0) work_sh = atomicAdd(head, 1);
++        __syncthreads();
++    }
++    // leaving: the last block out resets the queue, its own count and the flags for the next launch
++    if (tid == 0) flag_sh = atomicAdd(outc, 1) == (int)gridDim.x - 1;
++    __syncthreads();
++    if (flag_sh) {
++        __threadfence();
++        for (int i = tid; i < a.max_items; i += G::THREADS) ready[i] = 0;
++        if (tid == 0) {
++            *head = 0;
++            *outc = 0;
++        }
++    }
++}
++
++
++// ---- a read probe (tests and timing only): every byte of the listed experts' three matrices once, 16-byte loads ----
++// in a grid-stride loop, four in flight a thread; the bandwidth the card gives these bytes read plainly (no decode).
++__global__ void __launch_bounds__(256) probe_kernel(const uint4* __restrict__ Tg, const uint4* __restrict__ Tu,
++                                                    const uint4* __restrict__ Td, const int* __restrict__ ids, int n,
++                                                    long long per, uint32_t* __restrict__ out) {
++    const long long total = (long long)n * 3 * per;          // 16-byte pieces: per a matrix of an expert
++    uint32_t x = 0;
++    const long long stride = (long long)gridDim.x * blockDim.x;
++    long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    for (; c + 3 * stride < total; c += 4 * stride) {
++        uint4 v[4];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            const long long q = c + u * stride;
++            const long long seg = q / per, off = q % per;
++            const int e = ids[seg / 3], m = (int)(seg % 3);
++            const uint4* base = m == 0 ? Tg : m == 1 ? Tu : Td;
++            v[u] = __ldg(base + (size_t)e * per + off);
++        }
++#pragma unroll
++        for (int u = 0; u < 4; ++u) x ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
++    }
++    for (; c < total; c += stride) {
++        const long long seg = c / per, off = c % per;
++        const int e = ids[seg / 3], m = (int)(seg % 3);
++        const uint4* base = m == 0 ? Tg : m == 1 ? Tu : Td;
++        const uint4 v = __ldg(base + (size_t)e * per + off);
++        x ^= v.x ^ v.y ^ v.z ^ v.w;
++    }
++    out[(size_t)blockIdx.x * blockDim.x + threadIdx.x] = x;
++}
++
++// ---- the expert L2 prefetch (TF_GLM_L2PF_EXPERT_MB): right after routing, on the L2 prefetcher's side stream ------
++// The window's routed experts' trellis, in the order the streamed kernel reads it (every item's gate and up, then every
++// item's down; an expert of several items once), brought into L2 with cp.async.bulk.prefetch.L2 in pieces of PIECE
++// bytes, up to `budget` bytes, while the main stream runs the shared expert and the input rotation. It only reads.
++constexpr long long PF_PIECE = 32 << 10;
++
++__global__ void __launch_bounds__(128) expert_prefetch_kernel(const int* __restrict__ items,
++                                                              const int* __restrict__ counts, const char* Tg,
++                                                              const char* Tu, const char* Td, int E, int max_items,
++                                                              long long mat_bytes, long long budget) {
++    const int n_items = min(counts[0], max_items);
++    const long long per = (mat_bytes + PF_PIECE - 1) / PF_PIECE;          // pieces a matrix
++    const long long gu_pieces = (long long)n_items * 2 * per;
++    const long long total = min(gu_pieces + (long long)n_items * per, (budget + PF_PIECE - 1) / PF_PIECE);
++    for (long long q = (long long)blockIdx.x * blockDim.x + threadIdx.x; q < total;
++         q += (long long)gridDim.x * blockDim.x) {
++        const bool gu = q < gu_pieces;
++        const long long r = gu ? q : q - gu_pieces;
++        const long long m = r / per;                                       // gu: item * 2 + mat; down: item
++        const long long off = (r % per) * PF_PIECE;
++        const int item = (int)(gu ? m / 2 : m);
++        const int e = items[3 * item];
++        if (e >= E || (item > 0 && items[3 * (item - 1)] == e)) continue;  // the shared expert; an expert's 2nd item
++        const char* base = gu ? (m % 2 ? Tu : Tg) : Td;
++        const char* a = base + (size_t)e * mat_bytes + off;
++        const unsigned n = (unsigned)min(PF_PIECE, mat_bytes - off);
++        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(n) : "memory");
++    }
++}
++
++template <int RS, int STAGES, bool PDL, int W>
++void launch(const Args& args, int blocks, cudaStream_t stream) {
++    using G = Geo<W>;
++    constexpr int SMEM = smem_bytes<RS, STAGES, W>();
++    auto fn = stream_kernel<RS, STAGES, PDL, W>;
++    static int per_sm = [&] {
++        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
++        int n = 0;
++        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, G::THREADS, SMEM);
++        return n > 0 ? n : 1;
++    }();
++    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    const int cbg = args.NI / (G::BT * 16), cbd = args.D / (G::BT * 16), ch = args.fine ? CHAINS : 1;
++    const long long work = (long long)args.max_items * (2 * SK * cbg + cbd) * ch;
++    long long grid = blocks > 0 ? blocks : (long long)per_sm * sms;
++    grid = std::min<long long>(std::max<long long>(grid, 1), std::max<long long>(work, 1));
++    if constexpr (PDL) {
++        // programmatic dependent launch: this grid's blocks may be scheduled before the previous launch has finished
++        // and wait for it (griddepcontrol.wait) before their first read. The kernel never triggers its dependents
++        // early: a persistent grid's later blocks must be able to start.
++        cudaLaunchConfig_t cfg = {};
++        cfg.gridDim = dim3((unsigned)grid);
++        cfg.blockDim = dim3(G::THREADS);
++        cfg.dynamicSmemBytes = SMEM;
++        cfg.stream = stream;
++        cudaLaunchAttribute attr[1];
++        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++        attr[0].val.programmaticStreamSerializationAllowed = 1;
++        cfg.attrs = attr;
++        cfg.numAttrs = 1;
++        C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, fn, args));
++    } else {
++        fn<<<(unsigned)grid, G::THREADS, SMEM, stream>>>(args);
++    }
++}
++
++}  // namespace
++
++// Routed experts of a decode window, one launch: Xd [pairs, NI] and Y [pairs, D] (fp32) for every routed pair of the
++// plan (P: the window's pairs, rows x slots); Z holds the partials (coarse: each split's; fine: each chain's, gate/up
++// and down); state zeroed once (the kernel leaves it zeroed). fine: slabs of one chain (small windows: 4x the slabs);
++// rs / stages the pipeline (rows a stage, stages); blocks the grid (0: as many as fit at once); pdl a programmatic
++// dependent launch. All data movement and placement only: the same bits.
++void exl3_stream_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& Tg, const at::Tensor& Tu,
++                      const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
++                      const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
++                      const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& Z, at::Tensor& xd, at::Tensor& y,
++                      at::Tensor& state, int64_t D, int64_t NI, int64_t E, int64_t P, int64_t slots,
++                      int64_t max_items, double limit, bool xrow, bool fine, int64_t rs, int64_t stages,
++                      int64_t blocks, bool pdl, int64_t warps) {
++    Args a;
++    a.X0 = reinterpret_cast<const half*>(X0.data_ptr());
++    a.X1 = reinterpret_cast<const half*>(X1.data_ptr());
++    a.Tg = reinterpret_cast<const uint32_t*>(Tg.data_ptr());
++    a.Tu = reinterpret_cast<const uint32_t*>(Tu.data_ptr());
++    a.Td = reinterpret_cast<const uint32_t*>(Td.data_ptr());
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.svh_g = reinterpret_cast<const half*>(svh_g.data_ptr());
++    a.svh_u = reinterpret_cast<const half*>(svh_u.data_ptr());
++    a.suh_d = reinterpret_cast<const half*>(suh_d.data_ptr());
++    a.svh_d = reinterpret_cast<const half*>(svh_d.data_ptr());
++    a.Z = Z.data_ptr<float>();
++    a.xd = reinterpret_cast<half*>(xd.data_ptr());
++    a.y = y.data_ptr<float>();
++    a.state = state.data_ptr<int>();
++    a.D = (int)D;
++    a.NI = (int)NI;
++    a.E = (int)E;
++    a.P = (int)P;
++    a.slots = (int)slots;
++    a.max_items = (int)max_items;
++    a.limit = (float)limit;
++    a.xrow = xrow ? 1 : 0;
++    a.fine = fine ? 1 : 0;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int b = (int)blocks;
++#define GO_W(RS_, ST_, W_)                                                                                         \
++    do {                                                                                                           \
++        if (pdl) launch<RS_, ST_, true, W_>(a, b, stream); else launch<RS_, ST_, false, W_>(a, b, stream);         \
++    } while (0)
++#define GO(RS_, ST_)                                                                                               \
++    do {                                                                                                           \
++        if (warps == 4) GO_W(RS_, ST_, 4); else if (warps == 8) GO_W(RS_, ST_, 8); else GO_W(RS_, ST_, 16);        \
++    } while (0)
++    TORCH_CHECK(warps == 4 || warps == 8 || warps == 16, "streamed experts: blocks of 4, 8 or 16 warps, not ", warps);
++    if (rs == 2 && stages == 6) GO(2, 6);
++    else if (rs == 2 && stages == 4) GO(2, 4);
++    else if (rs == 4 && stages == 3) GO(4, 3);
++    else if (rs == 4 && stages == 4) GO(4, 4);
++    else TORCH_CHECK(false, "streamed experts: pipelines 4x3, 4x4, 2x4 or 2x6 (rows a stage x stages), not ",
++                     rs, "x", stages);
++#undef GO
++#undef GO_W
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// The read probe: ids [n] int32 (distinct experts), Tg / Tu / Td stacked [E, ...] of equal per-expert size; out
++// uint32 [blocks * 256] (blocks: 0 = four a multiprocessor).
++void exl3_probe_cuda(const at::Tensor& ids, const at::Tensor& Tg, const at::Tensor& Tu, const at::Tensor& Td,
++                     at::Tensor& out, int64_t blocks) {
++    const long long per = (long long)(Tg.numel() / Tg.size(0)) * 4 / 16;
++    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    const int grid = blocks > 0 ? (int)blocks : 4 * sms;
++    TORCH_CHECK(out.numel() >= (int64_t)grid * 256, "probe: out holds a word a thread");
++    probe_kernel<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const uint4*>(Tg.data_ptr()), reinterpret_cast<const uint4*>(Tu.data_ptr()),
++        reinterpret_cast<const uint4*>(Td.data_ptr()), ids.data_ptr<int>(), (int)ids.numel(), per,
++        reinterpret_cast<uint32_t*>(out.data_ptr()));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// The expert L2 prefetch: a window's routed experts (plan items / counts), up to budget bytes; 0 bytes: nothing.
++void exl3_expert_prefetch_cuda(const at::Tensor& items, const at::Tensor& counts, const at::Tensor& Tg,
++                               const at::Tensor& Tu, const at::Tensor& Td, int64_t max_items, int64_t budget) {
++    if (budget <= 0) return;
++    const long long mat_bytes = (long long)(Tg.numel() / Tg.size(0)) * 4;
++    const long long pieces = (budget + PF_PIECE - 1) / PF_PIECE;
++    const int grid = (int)std::min<long long>(std::max<long long>((pieces + 127) / 128, 1), 64);
++    expert_prefetch_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
++        items.data_ptr<int>(), counts.data_ptr<int>(), reinterpret_cast<const char*>(Tg.data_ptr()),
++        reinterpret_cast<const char*>(Tu.data_ptr()), reinterpret_cast<const char*>(Td.data_ptr()),
++        (int)Tg.size(0), (int)max_items, mat_bytes, (long long)budget);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 17912c5..311ed64 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -883,6 +883,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         from . import exl3_mm
+ 
+         if l2pf.ACTIVE is not None and done is None:
++            # TF_GLM_L2PF_EXPERT_MB (exl3_stream): the routed experts' first MiB into L2 on the prefetcher's side
++            # stream while the shared expert runs (it only reads)
++            from . import exl3_stream
++
++            exl3_stream.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
+             # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
+             # bits), while the L2 still holds what site "a" prefetched for it
+             shared_front(layer, w, b, 0, R)
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 4f2bdef..45e5295 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -28,6 +28,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import hashlib
+ import json
+ import os
+@@ -51,6 +52,8 @@ from .pool import ALIGN, Pool, align_up
+ from .segments import window_rows
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
++_NULL = contextlib.nullcontext()                    # TF_GLM_SEGPROF off, or not a profiled round's span
++
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+        IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL"}
+@@ -395,6 +398,9 @@ class MultiDecoder:
+                 self.drafts.capture()
+         if verify is None:
+             if verify_kind() == "batched":
++                from . import segprof
++
++                segprof.setup(self.rank)                  # TF_GLM_SEGPROF: before the capture (its profiled graphs)
+                 taps = engine.drafter.tap_layers if engine.drafter is not None else ()
+                 verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
+                 # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
+@@ -410,6 +416,10 @@ class MultiDecoder:
+             self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
+                              True: RoundProfile(self.tune.profile, label="lone stream, one-stream graphs")}
+         self.profile = None                              # the current round's (``profiles``), or None
++        for p in (self.profiles or {}).values():
++            p.counters = self._replay_counts
++        if self.profiles is not None and hasattr(self.drafts, "timing"):
++            self.drafts.timing = True                    # the profile's "propose GPU ms"
+         self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
+         graphs = getattr(e, "graphs", None)
+         self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
+@@ -520,6 +530,25 @@ class MultiDecoder:
+         allv = torch.empty((world * n,), dtype=torch.int32, device=dev)
+         comm.all_gather(vals[:n], allv)
+ 
++    def _replay_counts(self) -> dict:
++        """TF_GLM_MULTI_PROFILE: cumulative CUDA graph replays and eager runs of the batched verify windows, the
++        one-stream engine's steps (lone rounds, prompt heads) and the drafter's block passes and tap updates."""
++
++        out = {}
++        v = getattr(self.verify, "replays", None)
++        if isinstance(v, dict):
++            out["verify graph"], out["verify eager"] = v.get("graph", 0), v.get("eager", 0)
++        solo = getattr(self.e, "replays", None)
++        if isinstance(solo, dict):
++            out["solo graph"] = sum(n for k, n in solo.items() if k != "eager")
++            out["solo eager"] = solo.get("eager", 0)
++        d = getattr(self.drafts, "replays", None)
++        if isinstance(d, dict):
++            out.update(d)
++        if getattr(self.drafts, "timing", False):
++            out["propose GPU ms"] = float(self.drafts.pass_ms)
++        return out
++
+     def _time_rows(self, reps: int = 5) -> list[float]:
+         """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. MAX_WINDOW rows (its graphs, fastest of
+         ``reps``), the larger of both ranks' (so both allocate alike)."""
+@@ -1351,6 +1380,8 @@ class MultiDecoder:
+                 raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
+             if len(segments[0].tokens) <= self.lone_rows:
+                 verify = self.solo_verify
++        # TF_GLM_MULTI_GRAPH_STEP (wide.py): a batched window between two captured widths padded to the next one
++        pads = self._pad(segments, lanes) if verify is self.verify else []
+         if prof is not None:
+             prof.gpu_start()
+         v = forward_streams(verify, segments)
+@@ -1362,7 +1393,11 @@ class MultiDecoder:
+             if l.window is not None:
+                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
+             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
+-        sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
++        from . import segprof
++
++        sp = segprof.ACTIVE if verify is self.verify else None    # TF_GLM_SEGPROF: a profiled round's spans
++        with sp.span("sampler") if sp is not None else _NULL:
++            sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
+         if prof is not None:
+             prof.mark("sample")
+         keeps = []
+@@ -1375,7 +1410,8 @@ class MultiDecoder:
+             keeps.append(keep)
+         if prof is not None:
+             prof.mark("accept")
+-        verify.commit(segments, keeps)
++        with sp.span("commit") if sp is not None else _NULL:
++            verify.commit(segments, keeps)
+         if prof is not None:
+             prof.mark("commit")
+         if self.drafts is not None:
+@@ -1384,23 +1420,25 @@ class MultiDecoder:
+                 self.drafts.commit(items)
+         if prof is not None:
+             prof.mark("taps")
+-        for l, seg, rows, keep, was_copy in zip(lanes, segments, sampled, keeps, copied):
++        for k, (l, seg, rows, keep, was_copy) in enumerate(zip(lanes, segments, sampled, keeps, copied)):
+             s = l.s
+             new = rows[:keep]
+             if l.constraint is not None:
+                 l.constraint.advance(new)
+             if l.copies is not None:
+                 l.copies.extend(new)
+-            ndrafts = len(seg.tokens) - 1
+-            s.counted(len(seg.tokens))                     # Stream.take counts the accepted drafts
++            pad = pads[k] if pads else 0                   # padding rows (wide.py) are not the drafters'
++            ndrafts = len(seg.tokens) - 1 - pad
++            kept = min(keep - 1, ndrafts)
++            s.counted(len(seg.tokens) - pad)               # Stream.take counts the accepted drafts
+             if was_copy:
+                 l.copy_rounds += 1
+                 l.copy_drafted += ndrafts
+-                l.copy_accepted += keep - 1
++                l.copy_accepted += kept
+             room = s.count - len(s.out)
+             s.take(new[:max(0, room)], self._ends(l))
+             if l.policy is not None:
+-                l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
++                l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, kept))),
+                               max(0, s.count - len(s.out)))
+         wants = getattr(self.drafts, "wants_ahead", None)
+         if wants is not None and tune.depth != "joint" and wants():
+@@ -1409,6 +1447,28 @@ class MultiDecoder:
+             prof.mark("emit")
+             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
+                      sum(len(g.tokens) - 1 for g in segments))
++        if sp is not None:
++            sp.collect()                          # the round's events (after the sampler's sync), rank 0 reads them
++
++    def _pad(self, segments: list[Segment], lanes: list[Lane]) -> list[int]:
++        """Both ranks, TF_GLM_MULTI_GRAPH_STEP (``wide``): the batched window padded in place to the next captured
++        width with extra draft rows (a stream's last token repeated; streams without a grammar, within their room);
++        the rows added to each segment, or [] (none needed, every width captured, or the width out of reach: the
++        window then runs as it is)."""
++
++        from . import wide
++
++        v = self.verify
++        if not isinstance(v, BatchedVerify) or not v.widths or len(v.widths) == v.widths[-1]:
++            return []
++        dense = self.w.cfg.dense_limit
++
++        def room(seg) -> int:
++            st = seg.st
++            top = st.capacity if st.index is not None else min(st.capacity, dense)
++            return top - st.pos - len(seg.tokens)
++
++        return wide.pad(segments, [l.constraint is None for l in lanes], room, v.widths)
+ 
+     def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list) -> None:
+         """TF_GLM_MULTI_DEPTH=joint: every asking stream's chain walked to its depth in one block pass, then the
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+index d5d523e..c9733d0 100644
+--- tensorfold/families/glm5_next/cuda/multi_tune.py
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -254,11 +254,17 @@ class RoundProfile:
+         self.every, self.log, self.label = every, log, label
+         self.cuda = torch.cuda.is_available()
+         self.ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)] if self.cuda else None
++        self.armed = 0                    # this round's events recorded: 1 after gpu_start, 2 after gpu_stop
++        # () -> cumulative {path: count} of CUDA graph replays and eager runs (the decoder's verify windows, the
++        # drafter's block passes and tap updates); each report gives the counts since the last one
++        self.counters = None
++        self._c0: dict = {}
+         self._reset()
+         self.t_report = time.perf_counter()
+ 
+     def _reset(self) -> None:
+         self.rounds = 0
++        self.gpu_rounds = 0               # rounds whose verify GPU time was read (every round of a live decoder)
+         self.sums = dict.fromkeys(self.STAGES + ("wall", "gpu"), 0.0)
+         self.rows = self.streams = self.tokens = self.drafted = 0
+         self.fill_s = 0.0
+@@ -267,6 +273,7 @@ class RoundProfile:
+     def begin(self, t0: float | None = None) -> None:
+         self.t0 = time.perf_counter() if t0 is None else t0
+         self.t = self.t0
++        self.armed = 0
+ 
+     def mark(self, stage: str) -> None:
+         now = time.perf_counter()
+@@ -276,10 +283,12 @@ class RoundProfile:
+     def gpu_start(self) -> None:
+         if self.cuda:
+             self.ev[0].record()
++            self.armed = 1
+ 
+     def gpu_stop(self) -> None:
+-        if self.cuda:
++        if self.cuda and self.armed == 1:
+             self.ev[1].record()
++            self.armed = 2
+ 
+     def fill(self, seconds: float) -> None:
+         self.fills += 1
+@@ -287,8 +296,13 @@ class RoundProfile:
+ 
+     def end(self, streams: int, rows: int, tokens: int, drafted: int) -> None:
+         self.sums["wall"] += time.perf_counter() - self.t0
+-        if self.cuda:
++        # the window's GPU time when this round recorded both events and both have completed (a decoder's round
++        # records them around its verify and the sampler has waited for it); any other round adds no GPU time
++        # rather than raising (an event never recorded) or waiting (one not yet reached)
++        if self.cuda and self.armed == 2 and self.ev[0].query() and self.ev[1].query():
+             self.sums["gpu"] += self.ev[0].elapsed_time(self.ev[1]) / 1e3
++            self.gpu_rounds += 1
++        self.armed = 0
+         self.rounds += 1
+         self.streams += streams
+         self.rows += rows
+@@ -297,17 +311,37 @@ class RoundProfile:
+         if self.rounds >= self.every:
+             self.report()
+ 
++    def _replays(self) -> str:
++        """'; replays verify graph N eager M, ...' since the last report (empty without counters)."""
++
++        if self.counters is None:
++            return ""
++        try:
++            now = dict(self.counters())
++        except Exception:  # noqa: BLE001 - the profile never stops a round
++            return ""
++        delta = {k: v - self._c0.get(k, 0) for k, v in now.items()}
++        self._c0 = now
++        n = max(self.rounds, 1)
++        counts = ", ".join(f"{k} {v}" for k, v in delta.items() if not k.endswith(" ms"))
++        times = ", ".join(f"{k[:-3]} {v / n:.2f} ms a round" for k, v in delta.items() if k.endswith(" ms"))
++        return "; replays " + counts + (f"; {times}" if times else "")
++
+     def report(self) -> None:
+         n = max(self.rounds, 1)
+         ms = {k: 1e3 * v / n for k, v in self.sums.items()}
++        ms["gpu"] = 1e3 * self.sums["gpu"] / max(self.gpu_rounds, 1)        # a timed round's
++        untimed = (f" ({self.gpu_rounds} of {self.rounds} rounds timed)"
++                   if self.cuda and self.gpu_rounds < self.rounds else "")
+         staged = sum(ms[k] for k in self.STAGES)
+         span = time.perf_counter() - self.t_report
+         self.log(f"[tensorfold] multi profile{' (' + self.label + ')' if self.label else ''}, {self.rounds} rounds: {self.streams / n:.2f} streams, "
+                  f"{self.rows / n:.1f} rows ({self.drafted / n:.1f} drafted), {self.tokens / n:.2f} tokens a round; "
+                  f"ms a round: wall {ms['wall']:.1f} = " +
+                  " + ".join(f"{k} {ms[k]:.1f}" for k in self.STAGES) +
+-                 f" + other {ms['wall'] - staged:.1f}; verify GPU {ms['gpu']:.1f}; "
++                 f" + other {ms['wall'] - staged:.1f}; verify GPU {ms['gpu']:.1f}{untimed}; "
+                  f"{self.tokens / max(self.sums['wall'], 1e-9):.1f} tok/s in rounds; prompt chunks {self.fills} "
+-                 f"({1e3 * self.fill_s:.0f} ms, {100 * self.fill_s / max(span, 1e-9):.1f}% of {span:.1f} s)")
++                 f"({1e3 * self.fill_s:.0f} ms, {100 * self.fill_s / max(span, 1e-9):.1f}% of {span:.1f} s)"
++                 + self._replays())
+         self._reset()
+         self.t_report = time.perf_counter()
+diff --git tensorfold/families/glm5_next/cuda/segments.py tensorfold/families/glm5_next/cuda/segments.py
+index 26b2cb3..fda4ef0 100644
+--- tensorfold/families/glm5_next/cuda/segments.py
++++ tensorfold/families/glm5_next/cuda/segments.py
+@@ -19,17 +19,21 @@ MAX_SEGS = 4          # streams a window holds (GlmEngine raises it to --paralle
+ EXTENT = 2048         # a stream's extent starts at a multiple of this many tokens (its pooled keys at base / 4)
+ 
+ 
++WINDOW_LEAST, WINDOW_MOST = 16, 256  # TF_GLM_MULTI_WINDOW's range (wide windows past 63 rows: wide.py)
++
++
+ def window_rows(value: str | None = None) -> int:
+     """TF_GLM_MULTI_WINDOW: rows of every stream's verify windows together in one --parallel
+-    round (default 32, as before). 16 to 63: the decode buffers hold 64 rows (geometry.MLA_DECODE_ROWS) and a window
+-    of 64 rows or more would take the routed experts' prompt kernels (exl3_mm.PROMPT_ROWS)."""
++    round (default 32, as before), 16 to 256. A window of 64 rows or more keeps the decode kernels (its buffers are
++    decode buffers, sized by the window; the routed experts take the grouped or streamed kernels, the decode kernel's
++    bits), and the startup estimate counts its rows past 64 (``wide.extra_bytes``)."""
+ 
+     import os
+ 
+     value = (os.environ.get("TF_GLM_MULTI_WINDOW", "") if value is None else value).strip()
+     rows = 32 if value == "" else int(value) if value.isdecimal() else -1
+-    if not 16 <= rows <= 63:
+-        raise ValueError(f"TF_GLM_MULTI_WINDOW: 16 to 63 rows, not {value!r}")
++    if not WINDOW_LEAST <= rows <= WINDOW_MOST:
++        raise ValueError(f"TF_GLM_MULTI_WINDOW: {WINDOW_LEAST} to {WINDOW_MOST} rows, not {value!r}")
+     return rows
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/segprof.py tensorfold/families/glm5_next/cuda/segprof.py
+new file mode 100644
+index 0000000..6653b99
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/segprof.py
+@@ -0,0 +1,347 @@
++"""TF_GLM_SEGPROF=K: where a batched decode round's GPU time goes, by kind of segment, every K-th batched round
++(0, the default: off). Graph-safe: no host sync inside the round, nothing changes in what any kernel computes.
++
++How: with the setting on, ``verify.BatchedVerify.capture`` captures every window width twice, the plain graph as
++always and a profiled one in which every segment boundary is a CUDA event-record node (``torch.cuda.Event(
++enable_timing=True, external=True)`` recorded during the capture: an external event, which a replay records, instead
++of a cross-stream dependency). Every K-th batched round replays the profiled graph (an eager window records the same
++events live); after the round's own sync (the sampler's), rank 0 reads the time from each event to the next and adds
++it to the kind that ran there. The other rounds replay the plain graphs, as without the setting. At start, each
++checked width's profiled graph is replayed against its plain graph on the same window: the logits must be the same
++bit for bit (else the profile turns itself off with a line), and the replay times give the profile's cost.
++
++Kinds (TF_GLM_SEGPROF_DETAIL=kinds, the default): ``experts`` (routed experts), ``shared`` (the shared expert),
++``dsa`` (DSA attention: latent write, indexer, token selection, absorb, attention, expand), ``kda`` (the KDA
++recurrence), ``dense`` (projections: KDA's and DSA's in and out projections, the dense MLP layers), ``head`` (the
++vocabulary projection), ``exchange`` (the ranks' all-gathers), ``glue`` (everything else: hyper-connections, norms,
++routing, combine, embedding). TF_GLM_SEGPROF_DETAIL=layers: fewer events, by layer kind (``kda layer``, ``dsa layer``,
++``moe layer``, ``mlp layer``, ``head``, ``glue``). Spans outside the window's graph, on the GPU timeline (they include
++time the GPU waits for the host there): ``sampler`` and ``commit``.
++
++The boundaries come from the forward's existing ``prof.timed`` blocks, ``forward.mm`` (a projection called outside
++any timed block is ``dense``; the one writing the logits is ``head``) and ``forward.gather`` (``exchange``): this
++module wraps those three functions while the setting is on (``install``) and they pass straight through when no
++profiled window is being recorded. The ranks must agree on the setting (compared at start): the start check replays
++graphs whose all-gathers every rank joins.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab (the multi-stream engine, its batched verify windows and
++their CUDA graphs, the forward's timed blocks)."""
++
++from __future__ import annotations
++
++import os
++import time
++import zlib
++from contextlib import ExitStack, contextmanager
++
++KINDS = ("experts", "shared", "dsa", "kda", "dense", "head", "exchange", "glue")
++LAYER_KINDS = ("kda layer", "dsa layer", "moe layer", "mlp layer", "head", "glue")
++SPANS = ("sampler", "commit")
++END = "end"
++
++# the forward's prof.timed blocks -> kind (detail "kinds"); blocks not listed keep the kind they run in
++BLOCKS = {
++    "kda: projections": "dense", "kda: recurrence": "kda",
++    "dsa: latent write": "dsa", "dsa: indexer update": "dsa", "dsa: select tokens": "dsa", "dsa: absorb": "dsa",
++    "dsa: attention": "dsa", "dsa: dense attention": "dsa", "dsa: sparse attention": "dsa", "dsa: expand": "dsa",
++    "moe: shared expert": "shared", "moe: routed (exl3)": "experts", "moe: gate/up": "experts", "moe: down": "experts",
++    "moe: combine": "glue", "moe: route": "glue", "moe: all-gather": "exchange", "hc": "glue", "hc (layer end)": "glue",
++}
++# detail "layers": the layer blocks only
++LAYER_BLOCKS = {"kda": "kda layer", "dsa (total)": "dsa layer", "moe (total)": "moe layer", "mlp": "mlp layer"}
++CHECK_EVERY = 64            # the start check's widths: every captured width up to 64 that is a power of two, then 64s
++REPORT_DEFAULT = 20
++
++
++def settings(env=None) -> tuple[int, int, str]:
++    """(every, report, detail) from TF_GLM_SEGPROF (0 off, else profile every K-th batched round, K <= 1,000,000),
++    TF_GLM_SEGPROF_REPORT (profiled rounds a report line, default 20) and TF_GLM_SEGPROF_DETAIL (kinds or layers).
++    ValueError on a value that is not valid."""
++
++    env = os.environ if env is None else env
++
++    def number(name: str, default: int, least: int, most: int) -> int:
++        v = (env.get(name, "") or str(default)).strip()
++        if not v.isdigit() or not least <= int(v) <= most:
++            raise ValueError(f"{name}: {least} to {most}, not {v!r}")
++        return int(v)
++
++    every = number("TF_GLM_SEGPROF", 0, 0, 1_000_000)
++    report = number("TF_GLM_SEGPROF_REPORT", REPORT_DEFAULT, 1, 1_000_000)
++    detail = (env.get("TF_GLM_SEGPROF_DETAIL", "") or "kinds").strip().lower()
++    if detail not in ("kinds", "layers"):
++        raise ValueError(f"TF_GLM_SEGPROF_DETAIL: kinds or layers, not {detail!r}")
++    return every, report, detail
++
++
++def code() -> int:
++    """The settings for the ranks' start comparison (ValueError when not valid)."""
++
++    every, report, detail = settings()
++    return zlib.crc32(f"{every},{report},{detail}".encode()) & 0x3FFFFFFF
++
++
++class Prof:
++    """One process's segment profile: the event pool, each captured width's event kinds, the sums."""
++
++    def __init__(self, every: int, report: int = REPORT_DEFAULT, detail: str = "kinds", reader: bool = True,
++                 log=print, event=None) -> None:
++        import torch
++
++        self.every, self.report_every, self.detail, self.reader, self.log = every, report, detail, reader, log
++        self.make = event or (lambda: torch.cuda.Event(enable_timing=True, external=True))
++        self.span_make = event or (lambda: torch.cuda.Event(enable_timing=True))
++        self.kinds_all = KINDS if detail == "kinds" else LAYER_KINDS
++        self.pool: list = []                   # events, shared by every log: a log's i-th boundary is pool[i]
++        self.kinds: list[str] | None = None    # the log being recorded: kinds[i] runs from event i to event i + 1
++        self.cur: str | None = None
++        self.logs: dict[int, list[str]] = {}   # captured width -> its kinds
++        self.pending: list[str] | None = None  # this round's log, read after the round
++        self.pending_rows = 0
++        self.spans: dict[str, tuple] = {}      # name -> (start, end) events of this round
++        self.queue: list = []                  # spans read once their end event has completed (the commit's later)
++        self.n = 0                             # batched rounds seen
++        self.off: str | None = None            # why the profile turned itself off (the start check)
++        self._reset()
++
++    def _reset(self) -> None:
++        self.rounds = 0
++        self.rows = 0
++        self.total = 0.0
++        self.sums = dict.fromkeys(self.kinds_all, 0.0)
++        self.span_sums = dict.fromkeys(SPANS, 0.0)
++        self.span_counts = dict.fromkeys(SPANS, 0)
++        self.events = 0
++        self.t_report = time.perf_counter()
++
++    # -- recording -----------------------------------------------------------------------------------------------------
++    def kind_of(self, block: str) -> str | None:
++        return (BLOCKS if self.detail == "kinds" else LAYER_BLOCKS).get(block)
++
++    def _event(self, kind: str) -> None:
++        k = self.kinds
++        if k is None or kind == self.cur:
++            return
++        i = len(k)
++        if i == len(self.pool):
++            self.pool.append(self.make())
++        self.pool[i].record()
++        k.append(kind)
++        self.cur = kind
++
++    @contextmanager
++    def seg(self, kind: str):
++        """GPU work issued inside runs under ``kind``; the kind before resumes after."""
++
++        prev = self.cur
++        self._event(kind)
++        try:
++            yield
++        finally:
++            if prev is not None:
++                self._event(prev)
++
++    def start(self) -> None:
++        self.kinds, self.cur = [], None
++        self._event("glue")
++
++    def stop(self) -> list[str]:
++        self._event(END)
++        k, self.kinds, self.cur = self.kinds or [], None, None
++        return k
++
++    @contextmanager
++    def recording(self):
++        """Record one forward's boundaries (inside a capture: as event-record nodes of the graph)."""
++
++        self.start()
++        out: list[str] = []
++        try:
++            yield out
++        finally:
++            out.extend(self.stop())
++
++    # -- rounds --------------------------------------------------------------------------------------------------------
++    def want(self) -> bool:
++        """Whether this batched round is a profiled one (every K-th; never once the start check turned it off)."""
++
++        self.n += 1
++        return self.off is None and self.every > 0 and self.n % self.every == 0
++
++    def replayed(self, width: int, rows: int) -> None:
++        """A profiled graph of ``width`` rows ran for a round of ``rows`` rows: read its events after the round."""
++
++        self.pending, self.pending_rows = self.logs.get(width), rows
++
++    @contextmanager
++    def eager(self, rows: int):
++        """A profiled round's eager window (no graph of its width): record its events live."""
++
++        with self.recording() as log:
++            yield
++        self.pending, self.pending_rows = log, rows
++
++    @contextmanager
++    def span(self, name: str):
++        """A span outside the window's graph (the sampler, the commit) of a profiled round, on the GPU timeline."""
++
++        if self.pending is None or not self.reader:
++            yield
++            return
++        a, b = self.span_make(), self.span_make()
++        a.record()
++        try:
++            yield
++        finally:
++            b.record()
++            self.spans[name] = (a, b)
++
++    def collect(self) -> None:
++        """At the end of every batched round (after its sampler's sync): rank 0 adds a profiled round's event
++        intervals to their kinds, and each span once its end event has completed (the commit's, a round later at
++        most); every rank forgets the round. A report line every TF_GLM_SEGPROF_REPORT profiled rounds."""
++
++        log, spans = self.pending, self.spans
++        self.pending, self.spans = None, {}
++        if not self.reader:
++            return
++        self.queue.extend(spans.items())
++        if log is not None and len(log) >= 2:
++            ev = self.pool
++            t = [0.0] + [ev[0].elapsed_time(ev[i]) for i in range(1, len(log))]
++            for i in range(len(log) - 1):
++                k = log[i]
++                self.sums[k] = self.sums.get(k, 0.0) + (t[i + 1] - t[i])
++            self.total += t[-1]
++            self.rounds += 1
++            self.rows += self.pending_rows
++            self.events += len(log)
++        waiting = []
++        for name, (a, b) in self.queue:
++            if b.query():
++                self.span_sums[name] = self.span_sums.get(name, 0.0) + a.elapsed_time(b)
++                self.span_counts[name] = self.span_counts.get(name, 0) + 1
++            else:
++                waiting.append((name, (a, b)))
++        self.queue = waiting
++        if self.rounds >= self.report_every:
++            self.report()
++
++    def report(self) -> None:
++        n = max(self.rounds, 1)
++        total = self.total / n
++        parts = " + ".join(f"{k} {self.sums[k] / n:.2f} ({100 * self.sums[k] / max(self.total, 1e-9):.1f}%)"
++                           for k in self.kinds_all if k in self.sums)
++        spans = ", ".join(f"{k} span {self.span_sums[k] / max(self.span_counts[k], 1):.2f}" for k in SPANS
++                          if self.span_counts.get(k))
++        self.log(f"[tensorfold] segment profile, {self.rounds} rounds (1 in {self.every} batched rounds), "
++                 f"{self.rows / n:.1f} rows a round, {self.events / n:.0f} events a forward: ms a round: verify GPU "
++                 f"{total:.2f} = {parts}" + (f"; {spans}" if spans else ""), flush=True)
++        self._reset()
++
++    # -- the start check -----------------------------------------------------------------------------------------------
++    def check(self, v, reps: int = 3) -> str:
++        """Every rank, after ``v.capture``: each checked width's profiled graph against its plain graph on the
++        capture's window (slot 0, timing tokens): the logits bit for bit, and the fastest of ``reps`` replays each.
++        Turns the profile off when any width differs. The same replays on every rank (their all-gathers)."""
++
++        import torch
++
++        from .sparse import SPARSE_FROM
++        from .verify import timing_tokens
++
++        widths = sorted(set(w for w in v.pgraphs if (w <= CHECK_EVERY and w & (w - 1) == 0) or w % CHECK_EVERY == 0)
++                        | {max(v.pgraphs)}) if v.pgraphs else []
++        index = v.e.caches.index is not None
++        tokens = timing_tokens(v.w.cfg.vocab, v.rows_max)
++        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        bad, costs = [], []
++        for W in widths:
++            v._stage(tokens[:W])
++            v.seg_rows.set([v._span(v.e.home, 0, W)], sparse_from=SPARSE_FROM if index else None)
++            v._write_table([(W, 0, 0, 0, W)])
++            best = {}
++            outs = {}
++            for _ in range(reps + 1):
++                for name, g in (("plain", v.graphs[W]), ("profiled", v.pgraphs[W])):
++                    a.record()
++                    g.replay()
++                    b.record()
++                    b.synchronize()
++                    best[name] = min(best.get(name, float("inf")), a.elapsed_time(b))
++                    outs[name] = v.b.logits[:W].clone()
++            if not torch.equal(outs["plain"].view(torch.uint8), outs["profiled"].view(torch.uint8)):
++                bad.append(W)
++            costs.append((W, best["plain"], best["profiled"], len(self.logs.get(W, ()))))
++        if bad:
++            self.off = f"the profiled windows' logits differ from the plain ones at widths {bad}"
++        cost = ", ".join(f"{W}: +{p - q:.2f} ms ({100 * (p - q) / max(q, 1e-9):+.1f}%, {e} events)"
++                         for W, q, p, e in costs)
++        return (f"[tensorfold] segment profile (TF_GLM_SEGPROF={self.every}, {self.detail}): "
++                + (f"OFF: {self.off}" if self.off else
++                   f"the profiled windows' logits equal the plain ones bit for bit at widths {widths}")
++                + f"; replay cost (fastest of {reps}) by width: {cost}")
++
++
++ACTIVE: Prof | None = None
++
++
++def setup(rank: int) -> Prof | None:
++    """The process's profile from the settings (None when off), its hooks installed (``install``)."""
++
++    global ACTIVE
++    every, report, detail = settings()
++    if every <= 0:
++        ACTIVE = None
++        return None
++    ACTIVE = Prof(every, report, detail, reader=rank == 0)
++    install()
++    return ACTIVE
++
++
++_installed = False
++
++
++def install() -> None:
++    """Wrap ``prof.timed``, ``forward.mm`` and ``forward.gather`` (module attributes the forward looks up at each
++    call): while a profiled window is recorded they mark its segment boundaries, else they pass straight through."""
++
++    global _installed
++    if _installed:
++        return
++    from . import forward, prof
++
++    timed0, mm0, gather0 = prof.timed, forward.mm, forward.gather
++
++    def timed(name: str):
++        p = ACTIVE
++        kind = p.kind_of(name) if p is not None and p.kinds is not None else None
++        if kind is None:
++            return timed0(name)
++        stack = ExitStack()
++        stack.enter_context(p.seg(kind))
++        stack.enter_context(timed0(name))
++        return stack
++
++    def mm(b, x, q, xs, out, f32: bool = False):
++        p = ACTIVE
++        if p is None or p.kinds is None or p.cur != "glue":
++            return mm0(b, x, q, xs, out, f32)
++        logits = getattr(b, "logits", None)
++        kind = "head" if logits is not None and out.data_ptr() == logits.data_ptr() else (
++            "dense" if p.detail == "kinds" else None)
++        if kind is None:
++            return mm0(b, x, q, xs, out, f32)
++        with p.seg(kind):
++            return mm0(b, x, q, xs, out, f32)
++
++    def gather(w, b, R: int):
++        p = ACTIVE
++        if p is None or p.kinds is None or p.detail != "kinds":
++            return gather0(w, b, R)
++        with p.seg("exchange"):
++            return gather0(w, b, R)
++
++    prof.timed, forward.mm, forward.gather = timed, mm, gather
++    _installed = True
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index b548884..ee36bd8 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -115,23 +115,38 @@ class BatchedVerify:
+         self.segments: list[Segment] = []
+         self.R = 0
+         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        self.pgraphs: dict[int, torch.cuda.CUDAGraph] = {}    # TF_GLM_SEGPROF (segprof): the profiled graphs
+         self.replays = {"graph": 0, "eager": 0}
++        self.widths: list[int] = []                 # the captured widths (``wide.widths``), ascending
++
++    def width(self, R: int) -> int | None:
++        """The captured width a window of R rows replays (``wide.width_for``): R itself, or the next one a padded
++        round reaches (TF_GLM_MULTI_GRAPH_STEP); None past every one."""
++
++        from .wide import width_for
++
++        return width_for(R, self.widths)
+ 
+     @torch.no_grad()
+     def capture(self, rows: Sequence[int] | None = None) -> None:
+-        """CUDA graphs of the window for each row count (default 1 .. its rows), both ranks together: positions,
++        """CUDA graphs of the window for each row count (default ``wide.widths``: 1 .. its rows, past 64 rows every
++        TF_GLM_MULTI_GRAPH_STEP rows), both ranks together: positions,
+         extents, slots and parities live in the device tables, so one graph a row count covers every mix. Captured on
+         a window of slot 0 at the pool's first rows (the warm-up runs write there; slot 0's states are cleared after,
+         so capture before any stream is admitted). With the indexer the graphs always run the token selection (its
+-        dense rows ignore it: the same bits as a window that skips it)."""
++        dense rows ignore it: the same bits as a window that skips it). TF_GLM_SEGPROF: each width a second time, its
++        segment boundaries as event-record nodes (``segprof``), then checked against the plain graphs."""
+ 
++        from . import segprof
+         from .forward import compute
+         from .sparse import SPARSE_FROM
+ 
++        from .wide import widths
++
+         e, w, b = self.e, self.w, self.b
+         index = e.caches.index is not None
+         pool = torch.cuda.graph_pool_handle()
+-        for R in rows or range(1, self.rows_max + 1):
++        for R in rows or widths(self.rows_max):
+             self._stage([0] * R)
+             self.seg_rows.set([self._span(e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+             self._write_table([(R, 0, 0, 0, R)])
+@@ -143,7 +158,19 @@ class BatchedVerify:
+             with torch.cuda.graph(g, pool=pool):
+                 run()
+             self.graphs[R] = g
++            sp = segprof.ACTIVE
++            if sp is not None:                  # the same calls with event-record nodes at the segment boundaries
++                pg = torch.cuda.CUDAGraph()
++                with torch.cuda.graph(pg, pool=pool):
++                    with sp.recording() as log:
++                        run()
++                self.pgraphs[R], sp.logs[R] = pg, log
++        self.widths = sorted(self.graphs)
+         torch.cuda.synchronize()
++        if segprof.ACTIVE is not None and self.pgraphs:
++            line = segprof.ACTIVE.check(self)   # every rank: its replays' all-gathers
++            if segprof.ACTIVE.reader:
++                print(line, flush=True)
+         e.slots.rec[0].zero_()
+         e.slots.conv[0].zero_()
+ 
+@@ -161,19 +188,23 @@ class BatchedVerify:
+         out = []
+         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+         tokens = timing_tokens(self.w.cfg.vocab, self.rows_max)
++        timed: dict[int, float] = {}
+         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
+-            g = self.graphs[R]
+-            self._stage(tokens[:R])
+-            self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+-            self._write_table([(R, 0, 0, 0, R)])
+-            best = float("inf")
+-            for _ in range(reps + 1):
+-                start.record()
+-                g.replay()
+-                stop.record()
+-                stop.synchronize()
+-                best = min(best, start.elapsed_time(stop))
+-            out.append(best)
++            W = R if R in self.graphs else self.width(R)       # a round of R rows pads to W (wide.py)
++            if W not in timed:
++                g = self.graphs[W]
++                self._stage(tokens[:W])
++                self.seg_rows.set([self._span(self.e.home, 0, W)], sparse_from=SPARSE_FROM if index else None)
++                self._write_table([(W, 0, 0, 0, W)])
++                best = float("inf")
++                for _ in range(reps + 1):
++                    start.record()
++                    g.replay()
++                    stop.record()
++                    stop.synchronize()
++                    best = min(best, start.elapsed_time(stop))
++                timed[W] = best
++            out.append(timed[W])
+         self.e.slots.rec[0].zero_()
+         self.e.slots.conv[0].zero_()
+         return out
+@@ -237,14 +268,28 @@ class BatchedVerify:
+         self._tables(segments)
+         self.segments, self.R = list(segments), R
+         g = self.graphs.get(R)
++        from . import segprof
++
++        sp = segprof.ACTIVE
++        profiled = sp is not None and sp.want()           # TF_GLM_SEGPROF: every K-th batched round
+         if g is not None:
+             self.replays["graph"] += 1
+-            g.replay()
++            pg = self.pgraphs.get(R) if profiled else None
++            if pg is not None:
++                pg.replay()
++                sp.replayed(R, R)
++            else:
++                g.replay()
+             logits = b.logits[:R]
+         else:
+             self.replays["eager"] += 1
+             select = index and self.seg_rows.any_sparse()
+-            logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
++            if profiled:
++                with sp.eager(R):
++                    compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
++                logits = b.logits[:R]
++            else:
++                logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
+         out, taps, at = [], [], 0
+         whole = torch.cat([t[:R] for t in b.taps], dim=1) if self.one_cat else None     # views of one copy, the same rows
+         for seg in segments:
+diff --git tensorfold/families/glm5_next/cuda/wide.py tensorfold/families/glm5_next/cuda/wide.py
+new file mode 100644
+index 0000000..eed3609
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/wide.py
+@@ -0,0 +1,145 @@
++"""Wide verify windows for --parallel (TF_GLM_MULTI_WINDOW up to 256 rows): the captured widths, a round's padding to
++them, and the window's bytes past the 64 rows the startup estimate always held.
++
++At 16-32 streams a 63-row window leaves each stream one to four rows a round. A wider window lets every stream keep
++its drafts: 32 streams of a pending token and seven drafts are 256 rows. The decode path takes such windows as they
++are: its buffers are decode buffers sized by the window (no prompt kernel runs on them), and every kernel's choice by
++rows (row tiles of the 4-bit, BF16 and FP8 matmuls and the router, heads a latent attention tile, rows a latent
++absorb program, the routed experts' kernels) keeps each row's chain, so a row's bits never depend on the window.
++tests/K3/test_wide_window_gpu.py checks that row by row at every row count 1-256.
++
++CUDA graphs: every width up to 64 rows is captured as before. TF_GLM_MULTI_GRAPH_STEP (default 1: every width up to
++the window) captures the widths past 64 every STEP rows only (and the window itself): fewer graphs, a shorter start.
++A round whose rows fall between two captured widths then pads its window to the next one with extra draft rows,
++repeating a stream's last token (streams without a grammar, the fewest rows first, within each stream's room).
++Drafts only propose: a padded row is kept only where it equals the stream's own sample at that position, so replies
++keep their bits; the draft policies and the reply's counts see the rows the drafters proposed, not the padding. A
++round that cannot pad (every stream under a grammar, no room) runs its own width eagerly.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab (the multi-stream engine and its batched verify windows)."""
++
++from __future__ import annotations
++
++import os
++from typing import Callable, Sequence
++
++ALL_UP_TO = 64              # every window width up to this many rows is captured
++SEG_MOST = 32               # rows a stream's padded window may reach (its index ring holds 64 rows and the 3 before)
++
++
++def graph_step(value: str | None = None) -> int:
++    """TF_GLM_MULTI_GRAPH_STEP: captured widths past ALL_UP_TO rows every this many rows (1 to 64; default 1)."""
++
++    v = (os.environ.get("TF_GLM_MULTI_GRAPH_STEP", "") if value is None else value).strip()
++    step = 1 if v == "" else int(v) if v.isdecimal() else -1
++    if not 1 <= step <= 64:
++        raise ValueError(f"TF_GLM_MULTI_GRAPH_STEP: 1 to 64 rows, not {v!r}")
++    return step
++
++
++def code() -> int:
++    """The graph step for the ranks' start comparison (every rank must capture and pad alike)."""
++    return graph_step()
++
++
++def widths(window: int, step: int | None = None) -> list[int]:
++    """The batched window widths that get a CUDA graph: 1 .. min(window, ALL_UP_TO), then every ``step`` rows to the
++    window, and the window itself."""
++
++    step = graph_step() if step is None else step
++    out = list(range(1, min(window, ALL_UP_TO) + 1))
++    out += list(range(ALL_UP_TO + step, window, step)) if window > ALL_UP_TO else []
++    if window > ALL_UP_TO:
++        out.append(window)
++    return sorted(set(out))
++
++
++def width_for(R: int, captured: Sequence[int]) -> int | None:
++    """The smallest captured width of at least R rows (None: past every one)."""
++
++    best = None
++    for w in captured:
++        if w >= R and (best is None or w < best):
++            best = w
++    return best
++
++
++def plan(lengths: Sequence[int], eligible: Sequence[bool], room: Sequence[int], target: int) -> list[int] | None:
++    """Rows to add to each segment so ``lengths`` sum to ``target``: one at a time to the eligible segment with the
++    fewest rows (the earliest of equals), each within its ``room``. [] when nothing is needed; None when the target
++    cannot be reached."""
++
++    need = target - sum(lengths)
++    if need <= 0:
++        return []
++    pads = [0] * len(lengths)
++    while need > 0:
++        best = None
++        for k, ok in enumerate(eligible):
++            if ok and pads[k] < room[k] and (best is None or lengths[k] + pads[k] < lengths[best] + pads[best]):
++                best = k
++        if best is None:
++            return None
++        pads[best] += 1
++        need -= 1
++    return pads
++
++
++def pad(segments: list, eligible: Sequence[bool], room_of: Callable[[object], int], captured: Sequence[int],
++        most: int = SEG_MOST) -> list[int]:
++    """Pad a round's segments (``verify.Segment``: st, tokens) in place to the next captured width: each padded
++    segment repeats its last token. Returns the rows added to each segment ([] when none were needed or the width
++    cannot be reached, so the window runs as it is)."""
++
++    lengths = [len(s.tokens) for s in segments]
++    R = sum(lengths)
++    target = width_for(R, captured)
++    if target is None or target == R:
++        return []
++    room = [max(0, min(most - n, room_of(s))) for s, n in zip(segments, lengths)]
++    pads = plan(lengths, eligible, room, target)
++    if not pads:
++        return []
++    for s, p in zip(segments, pads):
++        if p:
++            s.tokens = list(s.tokens) + [s.tokens[-1]] * p
++    return pads
++
++
++def row_bytes(t: dict, world: int, share=None) -> int:
++    """Bytes one more row of a batched verify window takes on a rank (``forward.Buffers`` with its expert scratch,
++    the latent scratch, the window's KDA projections and replay scratch, the selection's tokens and split scratch;
++    the selection's fp32 pool scores are counted with the pool), from the text config, rounded up generously."""
++
++    from tensorfold.cuda.geometry import even_share, layer_counts
++
++    share = even_share(world) if share is None else share
++    D, S = int(t["hidden_size"]), int(t.get("hc_mult", 4))
++    linear, _ = layer_counts(t)
++    lin = t.get("linear_attn_config") or {}
++    LL = share("lin", int(lin.get("num_heads", t.get("linear_num_heads", 64))))
++    ld = int(lin.get("head_dim", t.get("linear_head_dim", 128)))
++    HL = share("heads", int(t["num_attention_heads"]))
++    qk = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
++    vd, lw = int(t["v_head_dim"]), int(t.get("kv_lora_rank", 512))
++    slots = int(t["num_experts_per_tok"]) + 1
++    ml = share("moe", int(t["moe_intermediate_size"]))
++    dl = share("dense", int(t.get("intermediate_size", ml)))
++    V = share("vocab", int(t["vocab_size"]))
++    experts = int(t["n_routed_experts"])
++    qi = int(t.get("index_n_heads", 32)) * int(t.get("index_head_dim", 128))
++    buffers = (S * D * 2 + 8 * D * 2 + 3 * D * 4 + world * D * 4 + slots * D * 4 + 2 * slots * D * 2
++               + 2 * slots * ml * 2 + slots * max(8 * ml, D) * 4 + V * 2 + 8 * 16384 * 4 + 5 * D * 2
++               + HL * (2 * qk + vd) * 2 + (int(t.get("q_lora_rank", D)) + lw) * 4 + qi * 2 + 4 * LL * 128 * 2
++               + 3 * dl * 2 + experts * 4 + 48 * 32 * 4 + 16384)
++    latent = 7 * HL * (lw + 2) * 4 + 2 * HL * lw * 2
++    kda = linear * ((3 * LL * ld + 2 * ld + LL) * 2 + LL * (ld * 2 + ld * 4 + ld * 2 + ld * 4 + 4))
++    select = 2051 * 4 + 4 + (1024 + 64 * 257) * 4
++    return int(1.1 * (buffers + latent + kda + select))
++
++
++def extra_bytes(t: dict, world: int, window: int, share=None) -> int:
++    """The window's bytes past the ALL_UP_TO rows the startup estimate's decode buffers always held."""
++
++    return max(0, window - ALL_UP_TO) * row_bytes(t, world, share)

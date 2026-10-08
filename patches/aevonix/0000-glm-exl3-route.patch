@@ -1,0 +1,292 @@
+0000-glm-exl3-route: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: new in this port (Apache-2.0).
+Port: new for 0.6.1, on 0.6.2: keeps GLM's own EXL3 expert kernels beside the universal route (TF_GLM_EXL3_PATH); its codebook beside 0.6.2's bits_of (a mixed-bit checkpoint refused by name).
+Files: families/glm5_next/cuda/exl3_generic.py, families/glm5_next/cuda/forward.py, families/glm5_next/cuda/weights.py.
+
+diff --git tensorfold/families/glm5_next/cuda/exl3_generic.py tensorfold/families/glm5_next/cuda/exl3_generic.py
+index 992c7f6..b7abffb 100644
+--- tensorfold/families/glm5_next/cuda/exl3_generic.py
++++ tensorfold/families/glm5_next/cuda/exl3_generic.py
+@@ -1,9 +1,25 @@
+ """GLM's universal EXL3 route uses buffer-owned scratch and the existing bf16 expert epilogue."""
+ 
++import copy
++
+ from tensorfold.cuda.exl3 import experts as generic
+ 
++# Rows a call groups at once: the grouping kernel holds a window's picks in shared memory (rows x slots x 4 bytes),
++# 2,048 rows of GLM's 9 slots = 72 KiB, under every supported GPU's per-block limit. A larger window (a 4,096-row
++# prompt chunk, TF_GLM_PREFILL_ROWS) runs in pieces of this many rows: rows never depend on the window, so the bits
++# are the one call's.
++PIECE_ROWS = 2048
++
+ 
+ def routed(x, pick, ex, scratch, rows, limit):
+     """Write the live routed pairs into scratch.y; the caller supplies each row's shared-expert slot."""
+ 
+-    return generic.routed(x, pick, None, ex, scratch, None, rows, limit, act_mode=generic.ACT_BF16)
++    if rows <= PIECE_ROWS:
++        return generic.routed(x, pick, None, ex, scratch, None, rows, limit, act_mode=generic.ACT_BF16)
++    slots = scratch.slots
++    for lo in range(0, rows, PIECE_ROWS):
++        hi = min(rows, lo + PIECE_ROWS)
++        piece = copy.copy(scratch)               # the same buffers; this piece's rows of y
++        piece.y = scratch.y[lo * slots:hi * slots]
++        generic.routed(x[lo:hi], pick[lo:hi], None, ex, piece, None, hi - lo, limit, act_mode=generic.ACT_BF16)
++    return scratch.y[:rows * slots]
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index f073b6e..d0cc51d 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -99,14 +99,22 @@ class Buffers:
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
+         self.eact = torch.empty((rows * slots, ml), dtype=bf, device=dev)
+         exl3 = c.quant == "exl3"
+-        self.ey = None if exl3 else torch.empty((rows, slots, D), dtype=bf if prefill else f32, device=dev)
+-        self.plan = None if exl3 else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill)
++        # EXL3 on the universal route (weights.exl3_route): its scratch owns the routed outputs and groups the pairs
++        universal = exl3 and w.meta.get("exl3_route") == "universal"
++        self.ey = None if universal else torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32,
++                                                     device=dev)
++        self.plan = None if universal else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill and not exl3)
+         self.exl3 = None
+         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
+             sl = c.shared_width // w.world
+-            shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
+-            self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
+-            self.ey = self.exl3.y.view(rows, slots, D)
++            if universal:
++                shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
++                self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
++                self.ey = self.exl3.y.view(rows, slots, D)
++            else:                        # GLM's own kernels (exl3_mm): their scratch, routed by the plan
++                from .exl3_mm import Scratch
++
++                self.exl3 = Scratch(rows, slots, D, ml, dev)
+             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
+             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
+             self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
+@@ -395,11 +403,16 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     with prof.timed("moe: route"):
+         glue.router(b.normed[:R], m.router, b.mlog[:R])
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+-        if m.shared is None:
++        if b.plan is not None:           # (the universal EXL3 route groups its own pairs)
+             grouped.route(b.pick[:R], b.plan)
+     if m.shared is not None:
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+-        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
++        if b.plan is None:
++            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
++        else:
++            from . import exl3_mm
++
++            exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+         s = m.shared
+         mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 5f81a7b..b5abd66 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -3,7 +3,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from dataclasses import dataclass, field
++from functools import lru_cache
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -11,7 +13,8 @@ import torch
+ 
+ from tensorfold.cuda import experts as grouped
+ 
+-from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
++from tensorfold.cuda.exl3.experts import Exl3RoutedExperts
++from .exl3_mm import Exl3Experts, words as exl3_words
+ from . import latent
+ from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+ 
+@@ -65,6 +68,7 @@ class Config:
+     group_size: int
+     bits: int
+     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
++    codebook: str = "mcg"      # EXL3: the trellis codebook (quantization_config.codebook: 3inst, mcg or mul1)
+ 
+     @classmethod
+     def read(cls, model_dir: str | Path) -> "Config":
+@@ -103,6 +107,7 @@ class Config:
+             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
+             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
+             bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
++            codebook=str(quant.get("codebook") or "mcg").lower(),
+         )
+ 
+     @property
+@@ -181,7 +186,8 @@ class MLPW:
+ class MoEW:
+     router: torch.Tensor      # [E, D] bf16
+     bias: torch.Tensor        # [E] fp32
+-    experts: grouped.Experts | Exl3Experts  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
++    # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts (``exl3_route``: GLM's own kernels or universal)
++    experts: grouped.Experts | Exl3Experts | Exl3RoutedExperts
+     shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (BF16)
+ 
+ 
+@@ -236,7 +242,8 @@ class Weights:
+             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
++            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, Exl3RoutedExperts, HCW, KDAW, DSAW, MLPW, MoEW,
++                                LayerW, MTPW, IndexW)):
+                 for v in vars(t).values():
+                     add(v)
+             elif isinstance(t, (list, tuple)):
+@@ -255,6 +262,95 @@ class Weights:
+         return total
+ 
+ 
++EXL3_ROUTES = ("auto", "glm", "universal")
++
++
++def exl3_route_setting(env=None) -> str:
++    """TF_GLM_EXL3_PATH: which kernels serve an EXL3 checkpoint's routed experts. ``auto`` (default): GLM's own
++    (``exl3_mm``: 4-bit mcg trellises, the kernels the GLM patches tune) when every routed expert of the checkpoint is
++    one, else TensorFold's universal path (``tensorfold.cuda.exl3.experts``: any width a matrix, any codebook);
++    ``glm``: GLM's own, refusing a checkpoint they cannot read; ``universal``: the universal path for every one."""
++
++    value = ((os.environ if env is None else env).get("TF_GLM_EXL3_PATH", "") or "auto").strip().lower()
++    if value not in EXL3_ROUTES:
++        raise ValueError(f"TF_GLM_EXL3_PATH: {', '.join(EXL3_ROUTES)}, not {value!r}")
++    return value
++
++
++def routed_trellises(cfg: Config, mtp: bool = True) -> list[str]:
++    """The checkpoint names of every routed expert trellis (MoE layers, then the MTP layer's)."""
++
++    layers = [i for i in range(cfg.layers) if cfg.mlp_kinds[i] == "moe"]
++    if mtp and cfg.mtp_layers:
++        layers.append(cfg.layers)
++    return [PREFIX + f"layers.{i}.mlp.experts.{e}.{proj}.trellis" for i in layers
++            for proj in ("gate_proj", "up_proj", "down_proj") for e in range(cfg.experts)]
++
++
++def dedicated_reads(stored: list[tuple[str, list[int]]], codebook: str) -> bool:
++    """Whether GLM's own EXL3 kernels read every trellis: (safetensors dtype, shape) pairs, 4-bit mcg only (int16
++    [..., 64]: 16 values of 4 bits a 64-bit word pair, the layout ``exl3_mm.words`` takes)."""
++
++    return codebook == "mcg" and bool(stored) and all(dtype == "I16" and shape and shape[-1] == 64
++                                                     for dtype, shape in stored)
++
++
++@lru_cache(maxsize=8)
++def exl3_route(model_dir: str, rank: int, world: int) -> str:
++    """``glm`` or ``universal`` (TF_GLM_EXL3_PATH, ``exl3_route_setting``) for an EXL3 checkpoint on ``rank``: read
++    from the safetensors headers alone (every routed trellis' dtype and last dimension) and the config's codebook.
++    The startup estimate and the loader ask the same question, so they size the same scratch."""
++
++    from .split import rank_files, read_header
++
++    want = exl3_route_setting()
++    if want == "universal":
++        return "universal"
++    cfg = Config.read(model_dir)
++    names = routed_trellises(cfg)
++    root = Path(model_dir)
++    files = rank_files(root, rank)
++    headers: dict[str, dict] = {}
++    if files:                                   # a pre-split rank folder: its own files' headers
++        where = {}
++        for f in files:
++            header = read_header(f)[0]
++            headers[str(f)] = header
++            where.update(dict.fromkeys((k for k in header if k != "__metadata__"), str(f)))
++    else:
++        index = root / "model.safetensors.index.json"
++        if index.exists():
++            where = {k: str(root / v) for k, v in json.loads(index.read_text())["weight_map"].items()}
++        else:
++            where = {}
++            for f in sorted(root.glob("*.safetensors")):
++                headers[str(f)] = read_header(f)[0]
++                where.update(dict.fromkeys((k for k in headers[str(f)] if k != "__metadata__"), str(f)))
++    stored = []
++    for name in names:
++        f = where.get(name)
++        if f is None:                           # e.g. no MTP layer in this checkpoint
++            continue
++        if f not in headers:
++            headers[f] = read_header(f)[0]
++        info = headers[f][name]
++        stored.append((str(info["dtype"]), list(info["shape"])))
++    widths = sorted({shape[-1] / 16 for _, shape in stored if shape})
++    if dedicated_reads(stored, cfg.codebook):
++        route = "glm"
++    elif want == "glm":
++        raise ValueError(f"TF_GLM_EXL3_PATH=glm: GLM's own EXL3 expert kernels read 4-bit mcg trellises only; this "
++                         f"checkpoint's routed experts are {cfg.codebook} at {widths} bits (TF_GLM_EXL3_PATH=auto "
++                         "serves them on the universal path)")
++    else:
++        route = "universal"
++    if rank == 0:
++        print(f"[tensorfold] EXL3 routed experts ({cfg.codebook}, {', '.join(f'{b:g}' for b in widths)} bits): "
++              + ("GLM's own kernels" if route == "glm" else "the universal route") + f" (TF_GLM_EXL3_PATH={want})",
++              flush=True)
++    return route
++
++
+ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
+     """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
+ 
+@@ -266,6 +362,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+     exl3 = cfg.quant == "exl3"
+     dev = torch.device(device)
++    route = exl3_route(str(model_dir), rank, world) if exl3 else ""
+     rd = RankReader(model_dir, rank)
+     HL = cfg.heads // world
+     LL = cfg.lin_heads // world
+@@ -355,7 +452,20 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+             slot.copy_(x)
+         return out
+ 
+-    def moe_exl3(p: str) -> Exl3Experts:
++    def moe_exl3(p: str) -> Exl3Experts | Exl3RoutedExperts:
++        if route == "glm":                     # GLM's own kernels: every expert's trellis stacked a projection
++            parts = {}
++            for proj in ("gate_proj", "up_proj", "down_proj"):
++                ts, us, vs = [], [], []
++                for e in range(cfg.experts):
++                    name = PREFIX + p + f"experts.{e}.{proj}."
++                    ts.append(exl3_words(rd.get(name + "trellis")))
++                    us.append(rd.get(name + "suh"))
++                    vs.append(rd.get(name + "svh"))
++                parts[proj] = (torch.stack(ts).to(dev), torch.stack(us).to(dev), torch.stack(vs).to(dev))
++                del ts, us, vs
++            (gt, sg, vg), (ut, su, vu), (dt, sd, vd) = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
++            return Exl3Experts(gt, ut, dt, sg, su, vg, vu, sd, vd, cfg.experts, int(vg.shape[1]), int(vd.shape[1]))
+         from tensorfold.cuda.exl3 import experts as generic
+         gate = generic.prepare(
+             [(rd.get(PREFIX + p + f"experts.{e}.gate_proj.trellis").to(dev),
+@@ -367,7 +477,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+             [(rd.get(PREFIX + p + f"experts.{e}.down_proj.trellis").to(dev),
+               rd.get(PREFIX + p + f"experts.{e}.down_proj.suh").to(dev),
+               rd.get(PREFIX + p + f"experts.{e}.down_proj.svh").to(dev)) for e in range(cfg.experts)],
+-            "mcg", device=dev)
++            cfg.codebook, device=dev)
+         return gate
+ 
+     def moe(i: int) -> MoEW:
+@@ -441,7 +551,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
+                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
+         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
+-        w.meta.update(layers=which)
++        w.meta.update(layers=which, exl3_route=route)
+     finally:
+         rd.close()
+     torch.cuda.empty_cache()

@@ -1,0 +1,360 @@
+0060-glm-index-split: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: conflict resolved: import line only (the universal route imports its adapter where it runs).
+Files: families/glm5_next/cuda/engine.py, families/glm5_next/cuda/forward.py, families/glm5_next/cuda/index_split.py, families/glm5_next/cuda/sparse.py.
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 8645b10..500c149 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -646,6 +646,9 @@ class GlmEngine:
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                  KV_KINDS.index(kv), MULTI_WINDOW]
++        from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
++
++        mine += index_split_settings().code()
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -658,7 +661,7 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -719,6 +722,8 @@ class GlmEngine:
+                 if not self.e.pbuf.split.applies(prefill_rows):      # e.g. TF_GLM_HC_SPLIT_MIN_ROWS past a chunk
+                     print(f"[tensorfold] note: a full {prefill_rows}-row prompt chunk runs unsplit at {world} ranks "
+                           "(only shorter ones split)", flush=True)
++        if rank == 0 and index_split_settings().on and world > 1:
++            print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
+         c = self.copy
+         if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
+             print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index dd6d53a..8966900 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
++from . import glue, index_split, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -689,9 +689,15 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+                             hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
+     if sparse_rows:
+         with prof.timed("dsa: select tokens"):
+-            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+-            tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+-                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np)
++            if index_split.applies(w, b, R, host_pos, all_sparse, sparse_np):
++                # TF_GLM_INDEX_SPLIT (patch 0120): each rank selects its blocks of rows, the pools all-gathered
++                tokens, counts = index_split.select(w, b, b.qr[rs], b.xs_qr[rs], ix.qb, b.qi[rs],
++                                                    b.ikr[rs, c.index_dim:], pk, host_pos, R, pk.shape[0] - 2,
++                                                    pos_dev, lambda x, q, xs, out: mm(b, x, q, xs, out))
++            else:
++                mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
++                tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
++                                                      pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+             if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
+                 latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
+@@ -788,6 +794,8 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+             done = (0, R)
+         with prof.timed("moe: routed (exl3)"):
+             if b.plan is None:           # the universal route (weights.exl3_route)
++                from . import exl3_generic
++
+                 exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+             else:
+                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+diff --git tensorfold/families/glm5_next/cuda/index_split.py tensorfold/families/glm5_next/cuda/index_split.py
+new file mode 100644
+index 0000000..5baebba
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/index_split.py
+@@ -0,0 +1,166 @@
++"""TF_GLM_INDEX_SPLIT=1 (patch 0120): a prompt chunk's DSA token selection split between the ranks.
++
++Without it every rank scores every row of a prompt chunk against every pooled key for all 32 index heads and selects
++each row's 512 best pools (``sparse._select_prompt``), the same work four times over at TP4: the indexer is replicated
++(``tp``'s layout), and it is the part of a prompt chunk whose cost grows with the context (a row scores pos / 4 pools).
++
++Split, the chunk's selection blocks (``sparse.PromptSelect``: rows in blocks of SELECT_ROWS, 512) are dealt to the
++ranks round-robin, block i to rank i % N: each rank computes its blocks' index queries (``qb``), scores and pools,
++the ranks all-gather the chosen pools (int32 [512 rows, 512] a block, 1 MiB), and every rank writes every block's
++tokens and counts from them. A rank therefore does about 1 / N of the indexer's matmul, scoring and selection.
++
++Exactness: every block goes through the very launches ``_select_prompt`` makes for it (``PromptSelect.pools`` then
++``PromptSelect.write_tokens``: the same kernels, grids, constexprs, the same NP, rows and device position), only on one
++rank instead of on each; the ranks run one compiled kernel set on one GPU model, and a row's scores read nothing but
++its own index query, head weights, position and the pooled keys (which every rank holds the same: the pool cache is
++replicated and written by the same kernels). The pools cross the wire as int32 (values below 2^31: exact) and are
++widened back to the int64 rows ``_tokens`` reads. So tokens and counts equal the unsplit ones bit for bit.
++TF_GLM_INDEX_SPLIT_CHECK=1 also runs the unsplit selection and stops the server on any difference (a test setting:
++it costs the full selection again and a device sync a layer).
++
++When: prompt chunks only (eager, ``host_pos`` known), every row of the piece past the dense limit, at least two
++blocks (R > SELECT_ROWS), the piece's first position at least TF_GLM_INDEX_SPLIT_FROM (default 16,384: shorter
++contexts score few pools, where the gather costs more than it saves), two or more ranks. Every rank decides from the
++same numbers, so they all take the same branch; the startup comparison holds the settings (``code``).
++
++Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap
++(``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else on the current stream."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++import torch
++
++
++def _flag(env, name: str) -> bool:
++    value = str(env.get(name, "") or "0").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"{name}: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++@dataclass(frozen=True)
++class IndexSplit:
++    on: bool = False
++    start: int = 16384             # TF_GLM_INDEX_SPLIT_FROM: the first position a split piece may start at
++    check: bool = False            # TF_GLM_INDEX_SPLIT_CHECK: compare with the unsplit selection (tests)
++
++    @classmethod
++    def from_env(cls, env=None) -> "IndexSplit":
++        env = os.environ if env is None else env
++        on = _flag(env, "TF_GLM_INDEX_SPLIT")
++        raw = str(env.get("TF_GLM_INDEX_SPLIT_FROM", "") or "16384").strip()
++        if not raw.isdecimal():
++            raise ValueError(f"TF_GLM_INDEX_SPLIT_FROM: a token position (0 or more), not {raw!r}")
++        check = _flag(env, "TF_GLM_INDEX_SPLIT_CHECK")
++        if check and not on:
++            raise ValueError("TF_GLM_INDEX_SPLIT_CHECK=1 checks the split selection: it needs TF_GLM_INDEX_SPLIT=1")
++        return cls(on, int(raw), check)
++
++    def code(self) -> list[int]:
++        return [int(self.on), self.start if self.on else 0, int(self.check)]
++
++    def describe(self) -> str:
++        what = f"prompt chunks' DSA token selection split between the ranks from position {self.start}"
++        return what + (" (checked against the unsplit selection)" if self.check else "")
++
++
++SETTINGS: IndexSplit | None = None
++
++
++def settings() -> IndexSplit:
++    global SETTINGS
++    if SETTINGS is None:
++        SETTINGS = IndexSplit.from_env()
++    return SETTINGS
++
++
++def applies(w, b, R: int, host_pos: int | None, all_sparse: bool, sparse_np: int | None) -> bool:
++    """Whether a piece of R rows from ``host_pos`` selects split (the same answer on every rank)."""
++
++    from .sparse import SELECT_ROWS
++
++    s = settings()
++    world = int(getattr(w, "world", 1))
++    return (s.on and world > 1 and getattr(w, "comm", None) is not None and b.prefill and sparse_np is None
++            and host_pos is not None and all_sparse and host_pos >= s.start and R > SELECT_ROWS)
++
++
++def _side_stream(b):
++    """The row split's second stream while a split prompt chunk runs (its NCCL calls go there), else None."""
++
++    sp = getattr(b, "split", None)
++    if sp is not None and getattr(sp, "active", False) and getattr(sp, "stream", None) is not None:
++        return sp.stream
++    return None
++
++
++def deal(blocks: int, world: int, rank: int) -> tuple[list[int], int]:
++    """Block i goes to rank i % world, into its slot i // world: this rank's blocks and the slots a rank holds."""
++
++    return list(range(rank, blocks, world)), -(-blocks // world)
++
++
++def select(w, b, qr: torch.Tensor, xs_qr: torch.Tensor, qb, qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor,
++           host_pos: int, R: int, np_max: int, pos_dev: torch.Tensor, mm) -> tuple[torch.Tensor, torch.Tensor]:
++    """``sparse.select_tokens`` for a prompt piece of R rows (``applies``), split: ``qr`` / ``xs_qr`` the rows' query
++    latents, ``qb`` the indexer's query projection, ``qi`` the rows' index query buffer (written for this rank's
++    blocks only, or every row when checking), ``wts`` their head weights, ``mm(x, q, xs, out)`` the forward's
++    projection call. Returns every row's tokens and counts, as the unsplit selection."""
++
++    from .sparse import PromptSelect, _select_prompt
++
++    s = settings()
++    world, rank = int(w.world), int(w.rank)
++    sel = PromptSelect(qi, wts, pk, host_pos, R, np_max, pos_dev)
++    starts = list(sel.blocks())
++    mine, slots = deal(len(starts), world, rank)
++    if s.check:
++        mm(qr[:R], qb, xs_qr[:R], qi[:R])
++    else:
++        for i in mine:                       # the index queries of this rank's rows only (row-independent matmul)
++            a = starts[i]
++            n = sel.rows(a)
++            mm(qr[a:a + n], qb, xs_qr[a:a + n], qi[a:a + n])
++    B = sel.B
++    send = torch.empty((slots, B, 512), dtype=torch.int32, device=qi.device)
++    for j, i in enumerate(mine):
++        a = starts[i]
++        n = sel.rows(a)
++        send[j, :n].copy_(sel.pools(a, sel.at(a)))                                    # int64 -> int32: exact
++    recv = torch.empty((world, slots, B, 512), dtype=torch.int32, device=qi.device)
++    comm = getattr(w.comm, "nccl", w.comm)
++    side = _side_stream(b)
++    if side is None:
++        comm.all_gather(send.reshape(-1), recv.reshape(-1))
++    else:
++        main = torch.cuda.current_stream()
++        ready = torch.cuda.Event()
++        ready.record(main)
++        with torch.cuda.stream(side):
++            side.wait_event(ready)
++            comm.all_gather(send.reshape(-1), recv.reshape(-1))
++            done = torch.cuda.Event()
++            done.record(side)
++        send.record_stream(side)
++        recv.record_stream(side)
++        main.wait_event(done)
++    tokens, counts = sel.outputs()
++    for i, a in enumerate(starts):
++        n = sel.rows(a)
++        pools = recv[i % world, i // world, :n].to(torch.int64)                        # contiguous, as top_pools'
++        sel.write_tokens(a, pools, sel.at(a), tokens, counts)
++    if s.check:
++        ref_tokens, ref_counts = _select_prompt(qi[:R], wts, pk, host_pos, R, np_max, pos_dev)
++        same_counts = torch.equal(counts, ref_counts)
++        # rows with count 0 attend densely and nothing reads their tokens (``_select_prompt``): compare counted rows
++        live = ref_counts > 0
++        same_tokens = torch.equal(tokens[live], ref_tokens[live])
++        if not (same_counts and same_tokens):
++            bad = (counts != ref_counts) | ((tokens != ref_tokens).any(dim=1) & live)
++            rows = bad.nonzero().flatten()[:8].tolist()
++            raise RuntimeError(f"TF_GLM_INDEX_SPLIT_CHECK: rank {rank}: the split selection differs from the unsplit "
++                               f"one at position {host_pos} ({R} rows; first rows {rows})")
++    return tokens, counts
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index bfdbf40..0d8d9a4 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -366,36 +366,77 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+       radix select's threshold and ties are the same. (Rows with count 0, whose tokens nothing reads, may differ.)
+       The scores buffer keeps pool_bucket's size (the allocator's few sizes), used as a contiguous [R, NP] prefix;
+     - _scores takes score_rows() rows a program: a row's keys are masked to its own pools before its dot, as with 1;
+-    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
+-
+-    dev = qi.device
+-    NP = pool_count(pos, R, np_max)
+-    # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the same
+-    # bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
+-    B = min(R, SELECT_ROWS)
+-    buf = torch.empty((B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)
+-    H = wts.shape[1]
+-    D = qi.shape[1] // H
+-    wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+-    rb = score_rows()
+-    width = TOPK_POOLS * POOL + POOL - 1
+-    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
+-    counts = torch.empty((R,), dtype=torch.int32, device=dev)
+-    pkv, pks, rs, fp8 = kv8.parts(pk)
+-    for a in range(0, R, B):
+-        n = min(B, R - a)
+-        at = pos_dev if a == 0 else pos_dev + a
+-        scores = buf[:n * NP].view(n, NP)
+-        _scores[(triton.cdiv(n, rb), triton.cdiv(NP, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks, scores,
+-                                                           at, n, NP, D ** -0.5, wscale, H=H,
+-                                                           HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, RB=rb,
+-                                                           RS=rs, FP8=fp8, num_warps=4)
+-        pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
+-        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
+-                      num_warps=4)
++    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas.
++
++    The work goes block by block (``PromptSelect``, patch 0120): a block's pools, then its tokens; the index
++    split (``index_split``, TF_GLM_INDEX_SPLIT) runs the very same two steps for each block, the pools on one rank."""
++
++    sel = PromptSelect(qi, wts, pk, pos, R, np_max, pos_dev)
++    tokens, counts = sel.outputs()
++    for a in sel.blocks():
++        at = sel.at(a)
++        sel.write_tokens(a, sel.pools(a, at), at, tokens, counts)
+     return tokens, counts
+ 
+ 
++class PromptSelect:
++    """``_select_prompt``'s constants for one prompt chunk (or one piece of a multi-prompt chunk) and its two steps
++    for the block of rows a .. a + n (n = min(B, R - a), B = min(R, SELECT_ROWS)): ``pools`` scores the block's rows
++    over the chunk's NP pools and selects each row's 512 best (int64 [n, 512], ascending), ``write_tokens`` turns
++    them into the rows' tokens and counts. Every launch is the one _select_prompt made before this class existed (the
++    same kernels, grids, constexprs and arguments: patch 0120 only cut the loop body in two)."""
++
++    def __init__(self, qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
++                 pos_dev: torch.Tensor) -> None:
++        self.qi, self.wts, self.R, self.pos_dev = qi, wts, int(R), pos_dev
++        self.dev = qi.device
++        self.NP = pool_count(pos, R, np_max)
++        # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the
++        # same bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
++        self.B = min(R, SELECT_ROWS)
++        self.buf = torch.empty((self.B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=self.dev)
++        self.H = wts.shape[1]
++        self.D = qi.shape[1] // self.H
++        self.wscale = 1.0 / 5.656854249492381 if self.H == 32 else self.H ** -0.5   # 32 ** -0.5 exactly as before
++        self.rb = score_rows()
++        self.width = TOPK_POOLS * POOL + POOL - 1
++        self.pkv, self.pks, self.rs, self.fp8 = kv8.parts(pk)
++
++    def outputs(self) -> tuple[torch.Tensor, torch.Tensor]:
++        return (torch.empty((self.R, self.width), dtype=torch.int32, device=self.dev),
++                torch.empty((self.R,), dtype=torch.int32, device=self.dev))
++
++    def blocks(self) -> range:
++        """Each block's first row."""
++        return range(0, self.R, self.B)
++
++    def rows(self, a: int) -> int:
++        return min(self.B, self.R - a)
++
++    def at(self, a: int) -> torch.Tensor:
++        """The device position of the block's first row."""
++        return self.pos_dev if a == 0 else self.pos_dev + a
++
++    def pools(self, a: int, at: torch.Tensor) -> torch.Tensor:
++        """The block's rows' 512 best pools, ascending (int64 [n, 512]); reads qi and wts rows a .. a + n only."""
++
++        n, NP = self.rows(a), self.NP
++        scores = self.buf[:n * NP].view(n, NP)
++        _scores[(triton.cdiv(n, self.rb), triton.cdiv(NP, 64))](
++            self.qi[a:a + n], self.wts[a:a + n], self.wts.stride(0), self.pkv, self.pks, scores, at, n, NP,
++            self.D ** -0.5, self.wscale, H=self.H, HP=max(16, triton.next_power_of_2(self.H)), D=self.D, BP=64,
++            RB=self.rb, RS=self.rs, FP8=self.fp8, num_warps=4)
++        return top_pools(scores, TOPK_POOLS)                                           # ascending pool index
++
++    def write_tokens(self, a: int, pools: torch.Tensor, at: torch.Tensor, tokens: torch.Tensor,
++                     counts: torch.Tensor) -> None:
++        """The block's rows' tokens and counts from their pools (int64 [n, 512], contiguous)."""
++
++        n = self.rows(a)
++        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=self.width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
++                      num_warps=4)
++
++
+ @triton.jit
+ def _gtile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
+     scores = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE

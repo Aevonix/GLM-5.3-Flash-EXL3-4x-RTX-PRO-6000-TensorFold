@@ -1,0 +1,2117 @@
+diff --git tensorfold/families/glm5_next/cuda/ce.py tensorfold/families/glm5_next/cuda/ce.py
+index 018720d..87e34fd 100644
+--- tensorfold/families/glm5_next/cuda/ce.py
++++ tensorfold/families/glm5_next/cuda/ce.py
+@@ -105,12 +105,14 @@ class _Raw:
+                                          "version": 3, "strides": None}
+ 
+ 
+-def arena_bytes(rows: int, world: int, width: int, tensors: int) -> tuple[int, int]:
++def arena_bytes(rows: int, world: int, width: int, tensors: int, narrow: int = 0) -> tuple[int, int]:
+     """(partials' staging bytes, rows' staging bytes) for prompt buffers of ``rows`` rows: H = ceil(rows / world)
+-    rows a rank; [N, H, D] fp32 (hc_post reads every rank's slot) and [T, N - 1, H, D] bf16 (one slot a peer)."""
++    rows a rank; [N, H, D] fp32 (hc_post reads every rank's slot) and [T, N - 1, H, D] bf16 (one slot a peer), then
++    ``narrow`` bytes a row for the narrow row buffers ``rows`` may carry beside them ([N - 1, H, narrow]: a sender's
++    rows of each narrow buffer back to back; TF_GLM_MOE_GLUE rowsplit's picks and weights)."""
+ 
+     H = -(-int(rows) // int(world))
+-    return world * H * width * 4, tensors * (world - 1) * H * width * 2
++    return world * H * width * 4, tensors * (world - 1) * H * width * 2 + (world - 1) * H * int(narrow)
+ 
+ 
+ def arena_cap() -> int:
+@@ -131,14 +133,17 @@ def timeout_s() -> float:
+ class CeExchange:
+     """One rank's copy-engine exchange for a prompt buffer's row split (set up collectively by every rank)."""
+ 
+-    def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce") -> None:
++    def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce",
++                 narrow: int = 0) -> None:
+         self.rank, self.world, self.store = int(rank), int(world), store
++        self.narrow = int(narrow)            # bytes a row of narrow row buffers ``rows`` carries (0: none)
+         # peers in rotated order (rank + 1, rank + 2, ..): at each moment every rank copies to a different peer, so
+         # no GPU takes three senders' traffic at once while another takes none
+         self.peers = [(self.rank + i) % self.world for i in range(1, self.world)]
+         self.width, self.tensors = int(width), int(tensors)
+         self.H = -(-int(rows) // self.world)
+-        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors)
++        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors, self.narrow)
++        self.ag_main = self.tensors * (self.world - 1) * self.H * self.width * 2      # the bf16 rows' part
+         self.timeout = timeout_s()
+         self.step = 0
+         self.key = f"tf_{tag}"
+@@ -206,7 +211,9 @@ class CeExchange:
+         if arena.data_ptr() != self.base or arena.numel() != total:
+             raise RuntimeError("the arena's tensor view does not cover the allocation")
+         self.rs = arena[:self.rs_bytes].view(torch.float32)
+-        self.ag = arena[self.rs_bytes:].view(torch.bfloat16).view(self.tensors, self.world - 1, self.H, self.width)
++        self.ag = arena[self.rs_bytes:self.rs_bytes + self.ag_main].view(torch.bfloat16).view(
++            self.tensors, self.world - 1, self.H, self.width)
++        self.nw = arena[self.rs_bytes + self.ag_main:]       # the narrow rows' part (bytes), empty without it
+         handle = _IpcHandle()
+         self._check(lib.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(self.base)), "cudaIpcGetMemHandle")
+         s.set(f"{self.key}/mem/{self.rank}", bytes(handle))
+@@ -377,10 +384,13 @@ class CeExchange:
+         d = self.width
+         return self.rs[self.world * off * d:self.world * (off + n) * d].view(self.world, n, d)
+ 
+-    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None) -> None:
++    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None,
++             narrow: tuple | list = ()) -> None:
+         """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging
+         (its rows ``at`` .., ``at`` = off unless given), then the peers' rows from this rank's staging into place
+-        (rows p H + off ..)."""
++        (rows p H + off ..). ``narrow``: contiguous row buffers of any dtype whose rows together take at most the
++        arena's ``narrow`` bytes, moved the same way in the same step (their staging: a sender's slot of [H, row]
++        a buffer, back to back)."""
+ 
+         if len(outs) > self.tensors:
+             raise ValueError(f"ce rows: {len(outs)} buffers, the staging holds {self.tensors}")
+@@ -398,7 +408,31 @@ class CeExchange:
+             for q in self.peers:                 # sender r's slot in receiver q's staging: (r - q - 1) mod N
+                 pos = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + at) * row
+                 copies.append((self.remote[q] + self.rs_bytes + pos, buf[mine].data_ptr(), n * row))
++        lay = self._narrow_layout(narrow)
++        for buf, start, rb in lay:
++            for q in self.peers:
++                pos = ((self.rank - q - 1) % N) * self.H * self.narrow + start * self.H + at * rb
++                copies.append((self.remote[q] + self.rs_bytes + self.ag_main + pos, buf[mine].data_ptr(), n * rb))
+         self.exchange(copies)
+         for t, buf in enumerate(outs):
+             for p in self.peers:
+                 buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, at:at + n])
++        for buf, start, rb in lay:
++            for p in self.peers:
++                pos = ((p - self.rank - 1) % N) * self.H * self.narrow + start * self.H + at * rb
++                got = self.nw[pos:pos + n * rb].view(buf.dtype).view(n, *buf.shape[1:])
++                buf[p * H + off:p * H + off + n].copy_(got)
++
++    def _narrow_layout(self, narrow) -> list[tuple[torch.Tensor, int, int]]:
++        """(buffer, byte offset of its rows within a row's narrow bytes, row bytes) for each narrow buffer."""
++
++        out, start = [], 0
++        for buf in narrow:
++            rb = buf[0].numel() * buf.element_size()
++            if not buf.is_contiguous() or rb % 4:
++                raise ValueError("ce rows: contiguous narrow rows of whole 4-byte words")
++            out.append((buf, start, rb))
++            start += rb
++        if start > self.narrow:
++            raise ValueError(f"ce rows: narrow rows of {start} bytes, the arena holds {self.narrow}")
++        return out
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 625c8cf..ba2987d 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -677,6 +677,7 @@ class GlmEngine:
+         from tensorfold.cuda import gpu_sample as _gpu_sample
+ 
+         from . import fuse as _fuse
++        from . import moe_glue as moe_glue_mod
+         from . import tune as _tune
+ 
+         def quiet(read) -> tuple[int, str | None]:
+@@ -685,7 +686,8 @@ class GlmEngine:
+             except ValueError as exc:
+                 return -1, str(exc)
+ 
+-        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted)]
++        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
++                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1)]
+         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
+         tables = [row[0] for row in got]
+         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
+@@ -695,7 +697,8 @@ class GlmEngine:
+         settings = [row[1:] for row in got]
+         if any(-1 in row for row in settings) or any(row != settings[0] for row in settings):
+             why = "; ".join(w for _, w in mine if w)
+-            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE by rank "
++            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
++                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1 by rank "
+                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
+                                + ": give every rank the same valid values")
+         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
+@@ -760,6 +763,8 @@ class GlmEngine:
+             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
+         if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
+             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
++        if rank == 0 and moe_glue_mod.on():
++            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+         if rank == 0 and lanes_mod.LANES > 1:
+             print(f"[tensorfold] {lanes_mod.describe()}"
+                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 5e486e9..3525beb 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, prof, qmm, sparse, tp
++from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, moe_glue, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -892,6 +892,8 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int |
+ 
+ def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
+     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
++        if moe_glue.on():                # TF_GLM_MOE_GLUE: the MoE glue's kernels and second stream (moe_glue.py)
++            return moe_glue.ffn(layer, w, b, R, done)
+         return mlp_block(layer, w, b, R, done) if layer.mlp is not None else moe_block(layer, w, b, R, done)
+ 
+ 
+@@ -910,6 +912,8 @@ def ffn_front(layer: LayerW, w: Weights, b: Buffers):
+     if layer.mlp is not None:
+         return lambda lo, hi: mlp_front(layer, w, b, lo, hi)
+     if layer.moe.shared is not None:
++        if moe_glue.on():                # TF_GLM_MOE_GLUE shared: the fused gate/up there too (the same bits)
++            return lambda lo, hi: moe_glue.shared_rows(layer, w, b, lo, hi)
+         return lambda lo, hi: shared_front(layer, w, b, lo, hi)
+     return None
+ 
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 36bff35..2bfb58a 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -195,11 +195,14 @@ class HcSplit:
+         if self.ce_mode:
+             from .ce import CeExchange
+ 
++            from .moe_glue import narrow_bytes
++
+             b = self.b
+             taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
+             store = getattr(self.w.comm, "nccl", self.w.comm).store
++            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it)
+             self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
+-                                 taps + 1)
++                                 taps + 1, narrow=narrow_bytes())
+             return
+         if self.gather:
+             return
+@@ -286,14 +289,17 @@ class HcSplit:
+         else:
+             self.w.comm.exchange([send], [self.got[j]], self.peer)
+ 
+-    def _swap_rows(self, j: int, outs: list[torch.Tensor]) -> None:
+-        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares)."""
++    def _swap_rows(self, j: int, outs: list[torch.Tensor], narrow: tuple | list = ()) -> None:
++        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares).
++        ``narrow``: narrow row buffers moved in the same copy-engine step (TF_GLM_MOE_GLUE rowsplit; ce only)."""
+ 
+         off, n = self.pieces[j]
+         mine = self.mine() + off
+         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
+-            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off)
++            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow)
+             return
++        if narrow:
++            raise RuntimeError("narrow rows travel with the copy-engine exchange only (TF_GLM_HC_EXCHANGE=ce)")
+         if self.gather:                                 # one piece: rank order is row order
+             for t in outs:
+                 self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))
+diff --git tensorfold/families/glm5_next/cuda/lanes.py tensorfold/families/glm5_next/cuda/lanes.py
+index 910796c..880557d 100644
+--- tensorfold/families/glm5_next/cuda/lanes.py
++++ tensorfold/families/glm5_next/cuda/lanes.py
+@@ -39,7 +39,7 @@ from types import SimpleNamespace
+ 
+ import torch
+ 
+-from . import glue, prof
++from . import glue, moe_glue, prof
+ from .hcsplit import HcSplit, SplitSettings
+ 
+ # Buffers attributes whose first axis is the window's rows: a lane views its rows of each
+@@ -173,18 +173,25 @@ class LaneSplit(HcSplit):
+         self.ce_at = ce_at
+ 
+     def partial(self, fill) -> None:
+-        """The lane's whole partial on the main stream, then its exchange on the exchange stream."""
++        """The lane's whole partial on the main stream, then its exchange on the exchange stream. A fill that left
++        its last rows to another stream says so in ``fill.ready`` (an event: TF_GLM_MOE_GLUE defer); the exchange
++        waits for it too."""
+ 
+         main = torch.cuda.current_stream()
+         fill(0, self.R)
+         self.ev_fill[0].record(main)
++        ready = getattr(fill, "ready", None)
+         with torch.cuda.stream(self.stream):
+             self.stream.wait_event(self.ev_fill[0])
++            if ready is not None:
++                self.stream.wait_event(ready)
+             self._swap_partial(0)
+ 
+-    def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False) -> None:
++    def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
+         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
+-        exchange: hc_post, the taps' and final stream means, the next hc_pre, the rows' exchange."""
++        exchange: hc_post, the taps' and final stream means, the next hc_pre, the rows' exchange. ``moe``: the layer
++        whose MoE reads these rows (TF_GLM_MOE_GLUE rowsplit routes them here and swaps their picks and weights with
++        them; ``moe_glue.lane_route``)."""
+ 
+         b, c = self.b, self.w.cfg
+         lo, hi = self.mine(), self.mine() + self.H
+@@ -199,7 +206,11 @@ class LaneSplit(HcSplit):
+             if hc is not None:
+                 glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                             b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+-            self._swap_rows(0, outs)
++            narrow = moe_glue.lane_route(self, moe, lo, hi) if moe is not None and hc is not None else []
++            if narrow:
++                self._swap_rows(0, outs, narrow)
++            else:
++                self._swap_rows(0, outs)
+             self.ev_done.record(self.stream)
+ 
+     def wait(self) -> None:
+@@ -274,7 +285,8 @@ def kda_lanes(layer, w, run, main, rec, mode: int) -> None:
+         with torch.cuda.stream(rec if on_rec else main):
+             with prof.timed("kda"), prof.timed("kda: out + all-gather"):
+                 out_proj(w, view, out, layer.kda.o, None, n, site=(layer.index, "a"))
+-            ls.glue_async(layer.ffn_hc, layer.post_norm)
++            ls.glue_async(layer.ffn_hc, layer.post_norm, **moe_glue.glue_args(layer))
++        moe_glue.lane_front(layer, w, view, ls, n)   # TF_GLM_MOE_GLUE side: the FFN front once the rows are in
+ 
+ 
+ def _lane_state(st, lo: int):
+@@ -322,7 +334,8 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
+                 for view, ls, lst, n, nch in run:     # attention blocks: lane A's, then lane B's (reads A's caches)
+                     ls.wait()
+                     _mixer(layer, w, lst, view, n, nch, lst.pos, None, None)
+-                    ls.glue_async(layer.ffn_hc, layer.post_norm)
++                    ls.glue_async(layer.ffn_hc, layer.post_norm, **moe_glue.glue_args(layer))
++                    moe_glue.lane_front(layer, w, view, ls, n)    # TF_GLM_MOE_GLUE side (moe_glue.py)
+             for view, ls, lst, n, nch in run:     # MLP / MoE blocks
+                 ls.wait()
+                 _ffn(layer, w, view, n, None)
+diff --git tensorfold/families/glm5_next/cuda/moe_glue.cpp tensorfold/families/glm5_next/cuda/moe_glue.cpp
+new file mode 100644
+index 0000000..72f90ad
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/moe_glue.cpp
+@@ -0,0 +1,114 @@
++// Bindings of moe_glue.cu (TF_GLM_MOE_GLUE): the fused route, the combine and the shared expert's gate/up + SwiGLU.
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void moe_route_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
++                    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, double, bool, int64_t,
++                    int64_t, int64_t, int64_t);
++void moe_plan_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
++                   int64_t, int64_t);
++int64_t moe_route_blocks(int64_t);
++int64_t moe_route_bytes(int64_t, int64_t);
++void moe_combine_cuda(const at::Tensor&, const c10::optional<at::Tensor>&, const at::Tensor&, at::Tensor&);
++void moe_shared_gu_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
++                        int64_t, double, int64_t);
++
++static void need(bool ok, const char* what) { TORCH_CHECK(ok, "moe_glue: ", what); }
++
++static bool rows16(const at::Tensor& t) {         // unit-stride rows, 16-byte aligned rows (cp.async)
++    return t.dim() == 2 && t.stride(1) == 1 && (t.size(0) <= 1 || t.stride(0) % 8 == 0) &&
++           reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0;
++}
++
++// x [M, D] bf16 rows, w [NE, D] bf16 (the router), bias [NE] fp32 -> logits [M, NE] fp32, pick / wts [M, 9], and the
++// plan of the M * 9 pairs over ``experts`` (NE + 1: the shared expert's id NE last) in items of ``tile`` pairs:
++// members [M * 9], items [>= items, 3], counts [2]; scratch rank [M * 9], hist [blocks(M) * experts], tick
++// [blocks(M) + 1] (zero; the kernel leaves it zero). ``block``: glue._topk's BLOCK (next power of two above NE).
++// ``plan`` false: logits, picks and weights only (the plan's buffers and scratch are not touched).
++void route(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bias, at::Tensor logits, at::Tensor pick,
++           at::Tensor wts, at::Tensor members, at::Tensor items, at::Tensor counts, at::Tensor rank, at::Tensor hist,
++           at::Tensor tick, double scale, bool norm, int64_t experts, int64_t tile, int64_t block, bool plan) {
++    const int64_t M = x.size(0), D = x.size(1), NE = w.size(0);
++    need(x.is_cuda() && x.scalar_type() == at::kBFloat16 && rows16(x), "x: [M, D] bf16, unit-stride 16-byte rows");
++    need(w.is_cuda() && w.scalar_type() == at::kBFloat16 && w.is_contiguous() && w.size(1) == D &&
++         reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0, "w: [NE, D] bf16, 16-byte aligned");
++    need(D % 512 == 0, "D: a multiple of 512 (8 K slices of 64-input chunks)");
++    need(bias.is_cuda() && bias.scalar_type() == at::kFloat && bias.is_contiguous() && bias.numel() == NE, "bias");
++    need(NE % 8 == 0 && NE + 1 <= 512 && block >= NE + 1 && block <= 512, "experts: NE + 1 <= BLOCK <= 512");
++    need(experts == NE + 1 && experts <= 1024, "plan experts: NE + 1");
++    need(tile >= 1, "tile");
++    const int64_t P = M * 9, blocks = moe_route_blocks(M);
++    auto ok = [](const at::Tensor& t, at::ScalarType s, int64_t n) {
++        return t.is_cuda() && t.scalar_type() == s && t.is_contiguous() && t.numel() >= n;
++    };
++    need(ok(logits, at::kFloat, M * NE) && logits.stride(0) == NE, "logits [M, NE] fp32");
++    need(ok(pick, at::kInt, P) && ok(wts, at::kFloat, P), "pick / wts [M, 9]");
++    need(ok(tick, at::kInt, blocks + 1), "tick");
++    if (plan) {
++        need(ok(members, at::kInt, P) && ok(counts, at::kInt, 2) && ok(items, at::kInt, 3), "plan buffers");
++        need(ok(rank, at::kInt, P) && ok(hist, at::kInt, blocks * experts), "scratch");
++        // items: an item per used expert plus one per tile pairs past its first, at most (experts.max_items)
++        need(items.numel() / 3 >= std::min(P, experts) + P / tile, "items: experts.max_items rows");
++    }
++    moe_route_cuda(x, w, bias, logits, pick, wts, members, items, counts, rank, hist, tick, scale, norm, experts, tile,
++                   block, plan ? 0 : 1);
++}
++
++// The plan of given picks [M, 9] int32 (values below ``experts``): experts.route's members, items and counts.
++void plan(const at::Tensor& pick, at::Tensor members, at::Tensor items, at::Tensor counts, at::Tensor rank,
++          at::Tensor hist, at::Tensor tick, int64_t experts, int64_t tile) {
++    const int64_t M = pick.size(0), P = M * 9, blocks = moe_route_blocks(M);
++    need(pick.is_cuda() && pick.scalar_type() == at::kInt && pick.is_contiguous() && pick.dim() == 2 &&
++         pick.size(1) == 9, "pick [M, 9] int32");
++    need(experts >= 1 && experts <= 1024 && tile >= 1, "experts / tile");
++    auto ok = [](const at::Tensor& t, int64_t n) {
++        return t.is_cuda() && t.scalar_type() == at::kInt && t.is_contiguous() && t.numel() >= n;
++    };
++    need(ok(members, P) && ok(counts, 2) && ok(items, 3 * (std::min(P, experts) + P / tile)), "plan buffers");
++    need(ok(rank, P) && ok(hist, blocks * experts) && ok(tick, blocks + 1), "scratch");
++    moe_plan_cuda(pick, members, items, counts, rank, hist, tick, experts, tile);
++}
++
++// y [R, 9, D] fp32, sy [R, D] fp32 or None (the last slot from y), wts [R, 9] fp32 -> out [R, D] fp32
++void combine(const at::Tensor& y, const c10::optional<at::Tensor>& sy, const at::Tensor& wts, at::Tensor out) {
++    const int64_t R = out.size(0), D = out.size(1);
++    need(y.is_cuda() && y.scalar_type() == at::kFloat && y.is_contiguous() && y.dim() == 3 && y.size(0) == R &&
++         y.size(1) == 9 && y.size(2) == D, "y [R, 9, D] fp32 contiguous");
++    need(wts.is_cuda() && wts.scalar_type() == at::kFloat && wts.is_contiguous() && wts.size(0) == R && wts.size(1) == 9,
++         "wts [R, 9] fp32");
++    need(out.is_cuda() && out.scalar_type() == at::kFloat && out.is_contiguous() && D % 4 == 0, "out [R, D] fp32");
++    need(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
++         "16-byte aligned rows");
++    if (sy.has_value())
++        need(sy->is_cuda() && sy->scalar_type() == at::kFloat && sy->is_contiguous() && sy->size(0) == R &&
++             sy->size(1) == D && reinterpret_cast<uintptr_t>(sy->data_ptr()) % 16 == 0, "sy [R, D] fp32");
++    moe_combine_cuda(y, sy, wts, out);
++}
++
++// x [M, K] bf16 rows, the shared expert's stacked [gate | up] 4-bit weight (shared prompt-matmul packing, groups of
++// 64: weight words, scales / biases [K / 64, npad] bf16) -> act [M, ni] bf16 = SwiGLU of the bf16 gate and up
++void shared_gu(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++               at::Tensor act, int64_t ni, double limit, int64_t cfg) {
++    const int64_t M = x.size(0), K = x.size(1);
++    need(x.is_cuda() && x.scalar_type() == at::kBFloat16 && rows16(x), "x: [M, K] bf16, unit-stride 16-byte rows");
++    need(K % 64 == 0 && ni % 128 == 0, "K a multiple of 64, the intermediate width of 128");
++    need(scales.dim() == 2 && scales.size(0) == K / 64 && scales.size(1) >= 2 * ni && biases.sizes() == scales.sizes() &&
++         scales.is_contiguous() && biases.is_contiguous() && scales.scalar_type() == at::kBFloat16 &&
++         biases.scalar_type() == at::kBFloat16, "scales / biases [K / 64, npad] bf16");
++    need(w.is_cuda() && w.is_contiguous() && w.numel() * w.element_size() >= 2 * ni * K / 2 &&
++         reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0, "weight words, 16-byte aligned");
++    need(reinterpret_cast<uintptr_t>(scales.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(biases.data_ptr()) % 16 == 0
++         && scales.size(1) % 8 == 0, "scales / biases: 16-byte aligned rows");
++    need(act.is_cuda() && act.scalar_type() == at::kBFloat16 && act.is_contiguous() && act.size(0) == M &&
++         act.size(1) == ni, "act [M, ni] bf16");
++    moe_shared_gu_cuda(x, w, scales, biases, act, ni, limit, cfg);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("route", &route);
++    m.def("plan", &plan);
++    m.def("route_blocks", &moe_route_blocks);
++    m.def("route_bytes", &moe_route_bytes);
++    m.def("combine", &combine, py::arg("y"), py::arg("sy"), py::arg("wts"), py::arg("out"));
++    m.def("shared_gu", &shared_gu);
++}
+diff --git tensorfold/families/glm5_next/cuda/moe_glue.cu tensorfold/families/glm5_next/cuda/moe_glue.cu
+new file mode 100644
+index 0000000..64d3752
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/moe_glue.cu
+@@ -0,0 +1,894 @@
++// The MoE layer's glue (TF_GLM_MOE_GLUE, moe_glue.py) in fewer kernels with the bits of the kernels it replaces.
++//
++// route:   router matmul + slice sums + sigmoid / bias top-k + normalization + the plan (stable counting sort of the
++//          (row, slot) pairs by expert, items of T pairs, counts) in ONE launch: a cluster of 8 CTAs a (row block,
++//          expert block), one CTA a K slice; the slices' partials are added in slice order through distributed shared
++//          memory; the cluster that completes a row block (a ticket) selects its rows' experts and ranks their pairs;
++//          the cluster that completes the last row block (a second ticket) finishes the plan.
++//          Bits: every logit is glue._router_part's chain (32 mma.sync m16n8k16 steps of its K slice in ascending k,
++//          from a zero accumulator) and glue._router_sum's slice-order adds; the selection, weights and plan are
++//          glue._topk's and experts.cu's (same instructions: sub.f32, mul.f32 by log2e, ex2.approx.f32, add.f32,
++//          div.full.f32; max value, lowest index among equals; pairs of an expert in pair order).
++// combine: a rank's fp32 MoE share, one thread 4 columns: glue._combine(_sy)'s fma.rn.f32 chain in slot order.
++// shared:  a prompt chunk's shared-expert gate/up matmul with SwiGLU in its epilogue: the prompt matmul's chain
++//          (qmm_prefill.cu: weights bf16(fma(q, s, b)), one fp32 chain over K in k16 steps), its bf16 rounding, then
++//          glue._swiglu's operations; the gate and up columns of an output sit in one thread's fragments.
++//
++// Licensed under the Apache License, Version 2.0. Builds on TensorFold (its Triton glue kernels, the grouped-expert
++// plan and the 4-bit prompt matmul, whose arithmetic these kernels reproduce) and on the GLM-5.3-Flash recipe and
++// patches 0001-0056 by MiaAI-Lab.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cooperative_groups.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++#include <algorithm>
++
++namespace cg = cooperative_groups;
++
++namespace {
++
++// ------------------------------------------------------------------------------------------------- PTX helpers
++__device__ __forceinline__ uint32_t sptr(const void* p) {
++    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
++}
++
++// 16 bytes into shared memory, or zeros without reading when ``read`` is false
++__device__ __forceinline__ void cp16z(void* dst, const void* src, bool read) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sptr(dst)), "l"(src), "r"(read ? 16 : 0));
++}
++
++__device__ __forceinline__ void cp16(void* dst, const void* src) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sptr(dst)), "l"(src));
++}
++
++__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++
++template <int N>
++__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++
++__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(sptr(p)));
++}
++
++__device__ __forceinline__ void ldsm2(uint32_t (&r)[2], const void* p) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(sptr(p)));
++}
++
++// the instruction Triton's tl.dot of bf16 tiles emits on sm_120 (and qmm_frag.cuh's mma)
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++        "{%0, %1, %2, %3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++// fp32 operations as the Triton glue kernels compile them on sm_120 (tests/k4/ptx_contract.py reads their PTX): the
++// uncontracted IEEE ops (.rn: never fused with a neighbour), the approximate exp2 and division Triton emits for
++// tl.exp and an fp32 '/', and min / max without NaN propagation.
++__device__ __forceinline__ float add_rn(float a, float b) {
++    float r;
++    asm("add.rn.f32 %0, %1, %2;\n" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ float sub_rn(float a, float b) {
++    float r;
++    asm("sub.rn.f32 %0, %1, %2;\n" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ float mul_rn(float a, float b) {
++    float r;
++    asm("mul.rn.f32 %0, %1, %2;\n" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ float ex2_approx(float a) {
++    float r;
++    asm("ex2.approx.f32 %0, %1;\n" : "=f"(r) : "f"(a));
++    return r;
++}
++
++__device__ __forceinline__ float div_full(float a, float b) {
++    float r;
++    asm("div.full.f32 %0, %1, %2;\n" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ float min_f32(float a, float b) {
++    float r;
++    asm("min.f32 %0, %1, %2;\n" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ float max_f32(float a, float b) {
++    float r;
++    asm("max.f32 %0, %1, %2;\n" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ float fma_rn(float a, float b, float c) {
++    float r;
++    asm("fma.rn.f32 %0, %1, %2, %3;\n" : "=f"(r) : "f"(a), "f"(b), "f"(c));
++    return r;
++}
++
++// Triton's tl.exp(x) on sm_120: ex2.approx.f32(x * 0f3FB8AA3B)
++__device__ __forceinline__ float log2e() { return __int_as_float(0x3FB8AA3B); }
++
++// glue._topk's score: 1.0 / (1.0 + tl.exp(-lg)) = div.full(1, ex2(sub(0, lg) * log2e) + 1)
++__device__ __forceinline__ float sigmoid_tf(float lg) {
++    return div_full(1.0f, add_rn(ex2_approx(mul_rn(sub_rn(0.0f, lg), log2e())), 1.0f));
++}
++
++// glue._swiglu on bf16 gate / up values (as fp32): bf16(u * bf16(g / (1 + exp(-g)))) with g = min(g, L) and
++// u = clip(u, -L, L), in the order its PTX holds them
++__device__ __forceinline__ __nv_bfloat16 swiglu_tf(float g, float u, float limit) {
++    g = min_f32(g, limit);
++    u = min_f32(max_f32(u, sub_rn(0.0f, limit)), limit);
++    const float silu = div_full(g, add_rn(ex2_approx(mul_rn(sub_rn(0.0f, g), log2e())), 1.0f));
++    const float sb = __bfloat162float(__float2bfloat16_rn(silu));
++    return __float2bfloat16_rn(mul_rn(u, sb));
++}
++
++// ======================================================================================================= route
++constexpr int KS = 8;             // K slices (glue.ROUTER_KS): a logit is 8 slice chains added in slice order
++constexpr int BK = 64;            // inputs a pipeline chunk: one 128-byte row of bf16 a tile row
++constexpr int TOPK = 8;           // GLM-5.3-Flash's experts a token (the host refuses others)
++constexpr int SLOTS = TOPK + 1;   // the shared expert's slot last
++constexpr int QB = 16;            // glue._topk's BLOCK (next power of two above NE) / 32 at most: NE + 1 <= 512
++
++struct RouteArgs {
++    const __nv_bfloat16* x;
++    const __nv_bfloat16* w;
++    const float* bias;
++    float* logits;
++    int* pick;
++    float* wts;
++    int* members;
++    int* items;
++    int* counts;
++    int* rank;
++    int* hist;
++    int* tick;
++    float scale;
++    int ldx, M, D, NE, E, T, norm, NRB, NEB, block;     // block: glue._topk's BLOCK
++    int mode;                                            // 0: route and plan; 1: route only; 2: plan only (from pick)
++};
++
++template <int BM, int BE, int WM, int WN, int STAGES>
++struct RouteTile {
++    static constexpr int WARPS = WM * WN, THREADS = WARPS * 32;
++    static constexpr int MT = BM / WM / 16, NT = BE / WN / 8;
++    static constexpr int XB = BM * BK * 2, WB = BE * BK * 2, STAGE = XB + WB;
++    static constexpr int ACC = MT * NT * 4;                 // a thread's accumulators
++    static constexpr int PART = ACC * THREADS * 4;          // a slice's partial tile, bytes
++    static constexpr int RPC = BM / KS;                     // rows of a row block each CTA of its finisher selects
++    static_assert(MT >= 1 && NT >= 1 && BM % (WM * 16) == 0 && BE % (WN * 8) == 0, "tile");
++    static_assert(RPC >= 1 && BM % KS == 0, "rows a CTA finishes");
++    static_assert((ACC * THREADS) % KS == 0, "slices share the reduction");
++};
++
++__device__ __forceinline__ bool better(float v, int i, float bv, int bi) {
++    // glue._topk's rule: the largest value (max.f32 ignores NaN: a NaN never wins), then the lowest index among equals
++    return v > bv || (v == bv && i < bi);
++}
++
++// One row's experts and weights (glue._topk on the row's logits), by one warp; the picks also into ``spick``. Lane l
++// holds candidates l, l + 32, ... below BLOCK (glue._topk's masked ones too: score sigmoid(0), choice -inf); a pick is
++// the largest choice, the lowest index among equals (NaN never: max.f32 drops it, == never holds); a picked candidate
++// becomes -inf and stays a candidate, as there. No array is indexed by a run-time value (registers only).
++__device__ void topk_row(const RouteArgs& a, int r, int lane, int* spick) {
++    const float neg = __int_as_float(0xff800000);
++    const float sig0 = sigmoid_tf(0.0f);              // a masked lane's score (its logit loads as 0.0 in glue._topk)
++    float sc[QB], ch[QB];
++#pragma unroll
++    for (int q = 0; q < QB; ++q) {
++        const int e = lane + 32 * q;
++        if (e < a.NE) {
++            const float lg = __ldcg(a.logits + static_cast<size_t>(r) * a.NE + e);
++            sc[q] = sigmoid_tf(lg);
++            ch[q] = add_rn(sc[q], __ldg(a.bias + e));
++        } else {
++            sc[q] = sig0;
++            ch[q] = neg;                               // masked (NE .. BLOCK - 1), and nothing past BLOCK below
++        }
++    }
++    float total = 0.0f, myw = 1.0f;                    // lane k < TOPK: pick k's weight; lane TOPK: the shared slot's
++    int myp = a.NE;                                    // lane k < TOPK: pick k; lane TOPK: the shared expert's id
++#pragma unroll
++    for (int k = 0; k < TOPK; ++k) {
++        float bv = neg, bs = 0.0f;
++        int bi = 1 << 30;
++#pragma unroll
++        for (int q = 0; q < QB; ++q) {
++            const int e = lane + 32 * q;
++            if (e < a.block && better(ch[q], e, bv, bi)) {
++                bv = ch[q];
++                bi = e;
++                bs = sc[q];
++            }
++        }
++#pragma unroll
++        for (int o = 16; o; o >>= 1) {
++            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++            const float os = __shfl_xor_sync(0xffffffffu, bs, o);
++            if (better(ov, oi, bv, bi)) {
++                bv = ov;
++                bi = oi;
++                bs = os;
++            }
++        }
++        // every lane now holds the pick (bi) and its score (bs: glue._topk's sk, the sum of one score and zeros)
++#pragma unroll
++        for (int q = 0; q < QB; ++q) ch[q] = (lane + 32 * q == bi) ? neg : ch[q];
++        if (lane == k) {
++            myp = bi;
++            myw = bs;
++        }
++        total = add_rn(total, bs);
++    }
++    if (lane < TOPK) {
++        if (a.norm) myw = div_full(myw, add_rn(total, __int_as_float(0x1E3CE508)));   // / (total + 1e-20)
++        myw = mul_rn(a.scale, myw);
++    }
++    if (lane < SLOTS) {
++        a.pick[static_cast<size_t>(r) * SLOTS + lane] = myp;
++        a.wts[static_cast<size_t>(r) * SLOTS + lane] = myw;
++        spick[lane] = myp;
++    }
++}
++
++// Exclusive scans over e < E of tot[e] (into off) and of its items ceil(tot / T) (into ioff); returns
++// (items, experts used) in scr[2 WARPS], scr[2 WARPS + 1]. One CTA; ``scr`` holds 2 * WARPS ints + 2, zeroed.
++template <int THREADS>
++__device__ void scan_experts(const int* tot, int* off, int* ioff, int E, int T, int* scr) {
++    constexpr int WARPS = THREADS / 32;
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int per = (E + THREADS - 1) / THREADS;
++    const int lo = min(E, tid * per), hi = min(E, lo + per);
++    int a = 0, b = 0, u = 0;
++    for (int e = lo; e < hi; ++e) {
++        a += tot[e];
++        b += (tot[e] + T - 1) / T;
++        u += tot[e] > 0;
++    }
++    int ia = a, ib = b;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int va = __shfl_up_sync(0xffffffffu, ia, o), vb = __shfl_up_sync(0xffffffffu, ib, o);
++        if (lane >= o) {
++            ia += va;
++            ib += vb;
++        }
++    }
++#pragma unroll
++    for (int o = 16; o; o >>= 1) u += __shfl_xor_sync(0xffffffffu, u, o);
++    if (lane == 31) {
++        scr[warp] = ia;
++        scr[WARPS + warp] = ib;
++    }
++    if (lane == 0) atomicAdd(scr + 2 * WARPS + 1, u);
++    __syncthreads();
++    int wa = 0, wb = 0;
++    for (int k = 0; k < warp; ++k) {
++        wa += scr[k];
++        wb += scr[WARPS + k];
++    }
++    int ra = wa + ia - a, rbb = wb + ib - b;
++    for (int e = lo; e < hi; ++e) {
++        off[e] = ra;
++        ioff[e] = rbb;
++        ra += tot[e];
++        rbb += (tot[e] + T - 1) / T;
++    }
++    if (tid == THREADS - 1) scr[2 * WARPS] = wb + ib;
++    __syncthreads();
++}
++
++template <int BM, int BE, int WM, int WN, int STAGES>
++__global__ void __launch_bounds__(WM * WN * 32) route_kernel(const RouteArgs a) {
++    using T = RouteTile<BM, BE, WM, WN, STAGES>;
++    constexpr int THREADS = T::THREADS, WARPS = T::WARPS, NT = T::NT, MT = T::MT, RPC = T::RPC;
++    extern __shared__ __align__(128) unsigned char smem[];
++    cg::cluster_group cluster = cg::this_cluster();
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp / WN, wn = warp % WN;
++    const int s = static_cast<int>(cluster.block_rank());          // this CTA's K slice
++    const int clus = blockIdx.x / KS;
++    const int eb = clus % a.NEB, rb = clus / a.NEB;
++    const int m0 = rb * BM, e0 = eb * BE;
++    const int KSL = a.D / KS, kbase = s * KSL, NCH = KSL / BK;
++
++    // region B (control) after region A (the pipeline, then the slice partial, then the plan's prefix table): the
++    // host computes the same sizes (route_launch)
++    const int region_a = max(max(STAGES * T::STAGE, T::PART), a.NRB * a.E * 4);
++    int* ctl = reinterpret_cast<int*>(smem + ((region_a + 127) & ~127));
++    int* sflag = ctl;                      // [0]: the row block is done here, [1]: the plan is finished here
++    int* cnt = ctl + 4;                    // [E]
++    int* base = cnt + a.E;                 // [E]
++    int* spick = base + a.E;               // [RPC * SLOTS]
++    int* slr = spick + RPC * SLOTS;        // [RPC * SLOTS]
++    int* tot = slr + RPC * SLOTS;          // [E]
++    int* off = tot + a.E;                  // [E]
++    int* ioff = off + a.E;                 // [E]
++    int* scr = ioff + a.E;                 // [2 * WARPS + 2]
++
++    if (a.mode != 2) {
++    // ---- 1. this slice's partial of the tile: glue._router_part's chain (k16 steps in ascending k from zero)
++    auto load = [&](int st, int chunk) {
++        unsigned char* px = smem + st * T::STAGE;
++        unsigned char* pw = px + T::XB;
++        const int kk = kbase + chunk * BK;
++        for (int c = tid; c < BM * 8; c += THREADS) {
++            const int r = c >> 3, q = c & 7, row = m0 + r;
++            const bool ok = row < a.M;
++            cp16z(px + r * 128 + ((q ^ (r & 7)) << 4),
++                  a.x + static_cast<size_t>(ok ? row : 0) * a.ldx + kk + q * 8, ok);
++        }
++        for (int c = tid; c < BE * 8; c += THREADS) {
++            const int r = c >> 3, q = c & 7, e = e0 + r;
++            const bool ok = e < a.NE;
++            cp16z(pw + r * 128 + ((q ^ (r & 7)) << 4), a.w + static_cast<size_t>(ok ? e : 0) * a.D + kk + q * 8, ok);
++        }
++    };
++    float acc[MT][NT][4];
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++#pragma unroll
++    for (int st = 0; st < STAGES - 1; ++st) {
++        if (st < NCH) load(st, st);
++        cp_commit();
++    }
++    for (int chunk = 0; chunk < NCH; ++chunk) {
++        cp_wait<STAGES - 2>();
++        __syncthreads();
++        const int nx = chunk + STAGES - 1;
++        if (nx < NCH) load(nx % STAGES, nx);
++        cp_commit();
++        const unsigned char* px = smem + (chunk % STAGES) * T::STAGE;
++        const unsigned char* pw = px + T::XB;
++#pragma unroll
++        for (int kt = 0; kt < BK / 16; ++kt) {
++            uint32_t af[MT][4];
++#pragma unroll
++            for (int i = 0; i < MT; ++i) {
++                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                const int q = kt * 2 + (lane >> 4);
++                ldsm4(af[i], px + r * 128 + ((q ^ (r & 7)) << 4));
++            }
++#pragma unroll
++            for (int j = 0; j < NT; ++j) {
++                uint32_t bf[2];
++                const int r = wn * (BE / WN) + j * 8 + (lane & 7);
++                const int q = kt * 2 + ((lane >> 3) & 1);
++                ldsm2(bf, pw + r * 128 + ((q ^ (r & 7)) << 4));
++#pragma unroll
++                for (int i = 0; i < MT; ++i) mma16816(acc[i][j], af[i], bf[0], bf[1]);
++            }
++        }
++    }
++    cp_wait<0>();
++    __syncthreads();
++
++    // ---- 2. the partial into shared memory, every slice's at once
++    float* part = reinterpret_cast<float*>(smem);
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) part[((i * NT + j) * 4 + e) * THREADS + tid] = acc[i][j][e];
++    cluster.sync();
++
++    // ---- 3. logits: the 8 slice partials added in slice order (glue._router_sum), this CTA's eighth of the tile
++    {
++        constexpr int F = T::ACC * THREADS, PER = F / KS;
++        const float* peer[KS];
++#pragma unroll
++        for (int j = 0; j < KS; ++j) peer[j] = cluster.map_shared_rank(part, j);
++        for (int f = s * PER + tid; f < (s + 1) * PER; f += THREADS) {
++            float l = peer[0][f];
++#pragma unroll
++            for (int j = 1; j < KS; ++j) l = add_rn(l, peer[j][f]);
++            const int t = f % THREADS, v = f / THREADS;
++            const int tl = t & 31, tw = t >> 5, twm = tw / WN, twn = tw % WN;
++            const int i = v / (NT * 4), j = (v >> 2) % NT, e = v & 3;
++            const int row = m0 + twm * (BM / WM) + i * 16 + (tl >> 2) + (e >> 1) * 8;
++            const int col = e0 + twn * (BE / WN) + j * 8 + (tl & 3) * 2 + (e & 1);
++            if (row < a.M && col < a.NE) a.logits[static_cast<size_t>(row) * a.NE + col] = l;
++        }
++    }
++    __threadfence();
++    cluster.sync();                         // every CTA's logits written and fenced; the partials no longer read
++
++    // ---- 4. the row block's ticket: the cluster that completes it selects its rows' experts
++    if (s == 0 && tid == 0) {
++        __threadfence();
++        const int old = atomicAdd(a.tick + rb, 1);
++        const int last = old == a.NEB - 1;
++        if (last) a.tick[rb] = 0;           // every expert block of this row block has arrived: ready for the next call
++        for (int j = 0; j < KS; ++j) *cluster.map_shared_rank(sflag, j) = last;
++    }
++    cluster.sync();
++    if (!sflag[0]) return;
++    __threadfence();
++    }
++
++    // ---- 5. selection (glue._topk), RPC rows a CTA, a warp a row; or (plan only) the rows' picks as given
++    const int r0 = m0 + s * RPC;
++    const int nrows = max(0, min(RPC, a.M - r0));
++    if (a.mode != 2) {
++        for (int lr = warp; lr < nrows; lr += WARPS) topk_row(a, r0 + lr, lane, spick + lr * SLOTS);
++        if (a.mode == 1) return;
++    } else {
++        for (int p = tid; p < nrows * SLOTS; p += THREADS) spick[p] = a.pick[static_cast<size_t>(r0) * SLOTS + p];
++    }
++    for (int e = tid; e < a.E; e += THREADS) cnt[e] = 0;
++    __syncthreads();
++
++    // ---- 6. the plan's ranks: pairs of an expert in pair order (experts.cu); within the CTA, then the row block
++    const int np = nrows * SLOTS;
++    if (warp == 0) {
++        for (int c0 = 0; c0 < np; c0 += 32) {
++            const int p = c0 + lane;
++            const bool ok = p < np;
++            const int e = ok ? spick[p] : -1 - lane;
++            const unsigned same = __match_any_sync(0xffffffffu, e);
++            const int below = __popc(same & ((1u << lane) - 1u));
++            const int b0 = ok ? cnt[e] : 0;
++            __syncwarp();
++            if (ok && below == 0) cnt[e] = b0 + __popc(same);
++            __syncwarp();
++            if (ok) slr[p] = b0 + below;
++        }
++    }
++    cluster.sync();
++    for (int e = tid; e < a.E; e += THREADS) {
++        int before = 0, all = 0;
++#pragma unroll
++        for (int j = 0; j < KS; ++j) {
++            const int v = *cluster.map_shared_rank(cnt + e, j);
++            before += j < s ? v : 0;
++            all += v;
++        }
++        base[e] = before;
++        if (s == 0) a.hist[static_cast<size_t>(rb) * a.E + e] = all;
++    }
++    __syncthreads();
++    for (int p = tid; p < np; p += THREADS) a.rank[static_cast<size_t>(r0) * SLOTS + p] = base[spick[p]] + slr[p];
++    __threadfence();
++    cluster.sync();                         // the counts read by every peer; hist and ranks fenced
++
++    // ---- 7. the chunk's ticket: the cluster that completes the last row block finishes the plan (one row block,
++    // a decode window: this cluster, no ticket)
++    if (a.NRB > 1) {
++        if (s == 0 && tid == 0) {
++            __threadfence();
++            const int old = atomicAdd(a.tick + a.NRB, 1);
++            const int last = old == a.NRB - 1;
++            if (last) a.tick[a.NRB] = 0;
++            for (int j = 0; j < KS; ++j) *cluster.map_shared_rank(sflag + 1, j) = last;
++        }
++        cluster.sync();
++        if (!sflag[1]) return;
++        __threadfence();
++    }
++
++    int* pre = reinterpret_cast<int*>(smem);          // [NRB][E]: an expert's pairs in earlier row blocks
++    for (int e = tid; e < a.E; e += THREADS) {
++        int run = 0;
++        for (int b = 0; b < a.NRB; ++b) {
++            const int h = __ldcg(a.hist + static_cast<size_t>(b) * a.E + e);
++            pre[b * a.E + e] = run;
++            run += h;
++        }
++        tot[e] = run;
++    }
++    if (tid < 2 * WARPS + 2) scr[tid] = 0;
++    __syncthreads();
++    scan_experts<THREADS>(tot, off, ioff, a.E, a.T, scr);
++    if (s == 0) {                                     // experts.cu's place_items: items of <= T pairs, expert order
++        for (int e = tid; e < a.E; e += THREADS) {
++            const int c = tot[e], tiles = (c + a.T - 1) / a.T;
++            for (int j = 0; j < tiles; ++j) {
++                int* it = a.items + 3 * (ioff[e] + j);
++                it[0] = e;
++                it[1] = off[e] + a.T * j;
++                it[2] = min(a.T, c - a.T * j);
++            }
++        }
++        if (tid == 0) {
++            a.counts[0] = scr[2 * WARPS];
++            a.counts[1] = scr[2 * WARPS + 1];
++        }
++    }
++    const int P = a.M * SLOTS, per = (P + KS - 1) / KS;
++    const int plo = s * per, phi = min(P, plo + per);
++    for (int p = plo + tid; p < phi; p += THREADS) {
++        const int b = (p / SLOTS) / BM;
++        const int e = __ldcg(a.pick + p);
++        a.members[off[e] + pre[b * a.E + e] + __ldcg(a.rank + p)] = p;
++    }
++}
++
++// The route kernel's dynamic shared memory for ``nrb`` row blocks and ``E`` plan experts (route_kernel's regions A
++// and B: the pipeline / slice partial / plan prefix table, then the control arrays).
++template <int BM, int BE, int WM, int WN, int STAGES>
++int route_smem(int nrb, int E) {
++    using T = RouteTile<BM, BE, WM, WN, STAGES>;
++    const int region_a = std::max(std::max(STAGES * T::STAGE, T::PART), nrb * E * 4);
++    const int region_b = (4 + 5 * E + 2 * T::RPC * SLOTS + 2 * T::WARPS + 2) * 4;
++    return ((region_a + 127) & ~127) + region_b;
++}
++
++template <int BM, int BE, int WM, int WN, int STAGES>
++void route_launch(RouteArgs a, cudaStream_t stream) {
++    using T = RouteTile<BM, BE, WM, WN, STAGES>;
++    auto kernel = route_kernel<BM, BE, WM, WN, STAGES>;
++    a.NRB = (a.M + BM - 1) / BM;
++    a.NEB = a.mode == 2 ? 1 : (a.NE + BE - 1) / BE;      // plan only: a cluster a row block
++    const int bytes = route_smem<BM, BE, WM, WN, STAGES>(a.NRB, a.E);
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
++    int most = 0;
++    C10_CUDA_CHECK(cudaDeviceGetAttribute(&most, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
++    TORCH_CHECK(bytes <= most, "moe_glue route: ", bytes, " bytes of shared memory, the GPU takes ", most,
++                " (fewer rows a chunk)");
++    static int configured = 0;
++    if (bytes > configured) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, most));
++        configured = most;
++    }
++    cudaLaunchConfig_t config = {};
++    config.gridDim = dim3(KS * a.NEB * a.NRB, 1, 1);
++    config.blockDim = dim3(T::THREADS, 1, 1);
++    config.dynamicSmemBytes = bytes;
++    config.stream = stream;
++    cudaLaunchAttribute attr[1];
++    attr[0].id = cudaLaunchAttributeClusterDimension;
++    attr[0].val.clusterDim.x = KS;
++    attr[0].val.clusterDim.y = 1;
++    attr[0].val.clusterDim.z = 1;
++    config.attrs = attr;
++    config.numAttrs = 1;
++    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, a));
++}
++
++// ===================================================================================================== combine
++// out[r, d] = the fma chain over the slots in order (y[r, k, d] * w[r, k], from 0), the last slot's row from sy[r, d]
++// (SY) or y[r, SLOTS - 1, d]: glue._combine / _combine_sy's fma.rn.f32 chain. A thread 4 columns of one row; every
++// row's slots are loaded at once (streaming: each is read once), then added in slot order.
++template <bool SY>
++__global__ void __launch_bounds__(256) combine_kernel(const float4* __restrict__ y, const float4* __restrict__ sy,
++                                                      const float* __restrict__ wts, float4* __restrict__ out, int R,
++                                                      int D4) {
++    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (idx >= static_cast<long long>(R) * D4) return;
++    const int r = static_cast<int>(idx / D4), c = static_cast<int>(idx % D4);
++    const float* w = wts + static_cast<size_t>(r) * SLOTS;
++    const float4* yr = y + static_cast<size_t>(r) * SLOTS * D4 + c;
++    float4 v[SLOTS];
++#pragma unroll
++    for (int k = 0; k < SLOTS; ++k)
++        v[k] = (SY && k == SLOTS - 1) ? __ldcs(sy + static_cast<size_t>(r) * D4 + c) : __ldcs(yr + static_cast<size_t>(k) * D4);
++    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++#pragma unroll
++    for (int k = 0; k < SLOTS; ++k) {
++        const float wk = __ldg(w + k);
++        acc.x = fma_rn(v[k].x, wk, acc.x);
++        acc.y = fma_rn(v[k].y, wk, acc.y);
++        acc.z = fma_rn(v[k].z, wk, acc.z);
++        acc.w = fma_rn(v[k].w, wk, acc.w);
++    }
++    out[static_cast<size_t>(r) * D4 + c] = acc;
++}
++
++// ============================================================================================ shared gate / up
++// qmm_prefill.cu's prompt matmul on the shared expert's stacked [gate | up] 4-bit weight (n = 2 NI), a CTA BM rows by
++// BNA output columns of each half: its gate columns n0 .. n0 + BNA and up columns NI + n0 .. NI + n0 + BNA in one
++// tile (virtual columns 0 .. 2 BNA), a warp BNA / WN columns of each, so one thread holds an element's gate and up.
++// Every gate / up value is the prompt matmul's (the same weights' bf16(fma(q, s, b)), the same mma chain over K) and is
++// rounded to bf16 as it stores them; then SwiGLU (glue._swiglu's operations) into act [M, NI] bf16.
++__device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
++    uint32_t d;
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
++    return d;
++}
++
++// qmm_frag.cuh's pair(): nibbles at bits [s, s + 4) and [16 + s, 20 + s) as a bf16 pair
++__device__ __forceinline__ uint32_t nib_pair(uint32_t w, int s) {
++    const uint32_t t = ((w >> s) & 0x000F000Fu) | 0x43004300u;
++    uint32_t r;
++#if __CUDA_ARCH__ >= 900
++    asm("sub.rn.bf16x2 %0, %1, %2;\n" : "=r"(r) : "r"(t), "r"(0x43004300u));
++#else
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC300C300u));
++#endif
++    return r;
++}
++
++// qmm_frag.cuh's tile_of: block b's (first row, first column), row tiles fastest in bands of ``group``
++__device__ __forceinline__ int2 tile_of(int b, int M, int N, int BM, int BN, int group) {
++    const int rows_t = (M + BM - 1) / BM, cols_t = (N + BN - 1) / BN, band = group * cols_t;
++    const int first = b / band * group, in_band = b % band, height = min(group, rows_t - first);
++    return make_int2((first + in_band % height) * BM, in_band / height * BN);
++}
++
++template <int BM, int BNA, int WM, int WN, int STAGES>
++struct GuTile {
++    static constexpr int GS = 64;                        // the dense 4-bit groups (TF_GLM_DENSE=q4)
++    static constexpr int THREADS = WM * WN * 32;
++    static constexpr int MT = BM / WM / 16;
++    static constexpr int NTH = BNA / WN / 8;             // n8 tiles a warp, of each half
++    static constexpr int ROW = GS * 2, CHUNKS = ROW / 16;
++    static constexpr int X = BM * ROW;                   // stage bytes: inputs,
++    static constexpr int W = 2 * BNA * GS / 2;           // weights (gate tiles, then up tiles),
++    static constexpr int S = 2 * BNA * 2;                // scales (then biases), bf16
++    static constexpr int STAGE = X + W + 2 * S;
++    static constexpr int SMEM = STAGES * STAGE;
++    static_assert(BNA % 64 == 0 && NTH >= 1 && MT >= 1, "tile");
++};
++
++template <int BM, int BNA, int WM, int WN, int STAGES>
++__global__ void __launch_bounds__(WM * WN * 32) shared_gu_kernel(
++        const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
++        const __nv_bfloat16* __restrict__ biases, __nv_bfloat16* __restrict__ act, int M, int NI, int K, int npad,
++        int ldx, int group, float limit) {
++    using T = GuTile<BM, BNA, WM, WN, STAGES>;
++    constexpr int GS = T::GS, MT = T::MT, NTH = T::NTH, NT = 2 * NTH;
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K / GS;
++    const int2 at = tile_of(blockIdx.x, M, NI, BM, BNA, group);
++    const int m0 = at.x, n0 = at.y;                      // act columns n0 .. n0 + BNA
++    constexpr int TILE_BYTES = 64 * GS / 2;              // one stored 64-column tile's group block
++    constexpr int HALF_TILES = BNA / 64;
++
++    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    auto load = [&](int s, int g) {
++        unsigned char* p = stage(s);
++        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
++            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
++            const int row = min(m0 + r, M - 1);
++            cp16z(p + r * T::ROW + ((ch ^ (r % T::CHUNKS)) << 4), x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
++                  m0 + r < M);
++        }
++        unsigned char* pw = p + T::X;
++        for (int c = tid; c < T::W / 16; c += T::THREADS) {
++            const int t = c / (TILE_BYTES / 16), o = c % (TILE_BYTES / 16);
++            const int col = (t < HALF_TILES ? n0 : NI + n0) + (t % HALF_TILES) * 64;      // gate tiles, then up
++            const size_t tile = static_cast<size_t>(col / 64) * KG + g;
++            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + o * 16);
++        }
++        unsigned char* ps = pw + T::W;
++        for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {      // scales: gate then up; then biases alike
++            const int which = c / (T::S / 16), o = c % (T::S / 16);
++            const int half = (o * 8) / BNA, within = (o * 8) % BNA;
++            const __nv_bfloat16* src = (which ? biases : scales) + static_cast<size_t>(g) * npad +
++                                       (half ? NI + n0 : n0) + within;
++            cp16(ps + which * T::S + o * 16, src);
++        }
++    };
++
++    float acc[MT][NT][4];
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++#pragma unroll
++    for (int s = 0; s < STAGES - 1; ++s) {
++        if (s < KG) load(s, s);
++        cp_commit();
++    }
++    for (int it = 0; it < KG; ++it) {
++        cp_wait<STAGES - 2>();
++        __syncthreads();
++        const int next = it + STAGES - 1;
++        if (next < KG) load(next % STAGES, next);
++        cp_commit();
++        const unsigned char* p = stage(it % STAGES);
++        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
++        const uint16_t* ps = reinterpret_cast<const uint16_t*>(p + T::X + T::W);
++        uint32_t words[NT][GS / 32], sv[NT], bv[NT];
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            // virtual n8 tile: the warp's j-th gate tile, then (j >= NTH) its up tile for the same columns
++            const int jv = (j < NTH ? 0 : BNA / 8) + wn * NTH + (j % NTH);
++#pragma unroll
++            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[(jv * 32 + lane) * (GS / 32) + v];
++            const int col = jv * 8 + (lane >> 2);
++            sv[j] = ps[col] * 0x10001u;
++            bv[j] = ps[2 * BNA + col] * 0x10001u;
++        }
++#pragma unroll
++        for (int kt = 0; kt < GS / 16; ++kt) {
++            uint32_t a[MT][4];
++#pragma unroll
++            for (int i = 0; i < MT; ++i) {
++                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                const int ch = kt * 2 + (lane >> 4);
++                ldsm4(a[i], p + r * T::ROW + ((ch ^ (r % T::CHUNKS)) << 4));
++            }
++#pragma unroll
++            for (int j = 0; j < NT; ++j) {
++                const uint32_t b0 = fma2(nib_pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
++                const uint32_t b1 = fma2(nib_pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
++#pragma unroll
++                for (int i = 0; i < MT; ++i) mma16816(acc[i][j], a[i], b0, b1);
++            }
++        }
++    }
++    cp_wait<0>();
++    __syncthreads();
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int j = 0; j < NTH; ++j) {
++            const int col = n0 + wn * (BNA / WN) + j * 8 + (lane & 3) * 2;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++                if (row >= M) continue;
++                // the prompt matmul stores gate / up as bf16 (round to nearest); SwiGLU reads them back
++                const float g0 = __bfloat162float(__float2bfloat16_rn(acc[i][j][2 * h]));
++                const float g1 = __bfloat162float(__float2bfloat16_rn(acc[i][j][2 * h + 1]));
++                const float u0 = __bfloat162float(__float2bfloat16_rn(acc[i][j + NTH][2 * h]));
++                const float u1 = __bfloat162float(__float2bfloat16_rn(acc[i][j + NTH][2 * h + 1]));
++                __nv_bfloat162 o;
++                o.x = swiglu_tf(g0, u0, limit);
++                o.y = swiglu_tf(g1, u1, limit);
++                *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(row) * NI + col) = o;
++            }
++        }
++}
++
++template <int BM, int BNA, int WM, int WN, int STAGES>
++void shared_gu_launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++                      at::Tensor& act, int NI, float limit) {
++    using T = GuTile<BM, BNA, WM, WN, STAGES>;
++    const int M = x.size(0), K = x.size(1);
++    auto kernel = shared_gu_kernel<BM, BNA, WM, WN, STAGES>;
++    static bool configured = false;
++    if (!configured) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM));
++        configured = true;
++    }
++    const int rows_t = (M + BM - 1) / BM;
++    // a group's inputs stay near 12 MB of L2 while its blocks sweep the column tiles (as the prompt matmul)
++    const int group = std::max(1, std::min(rows_t, static_cast<int>((12LL << 20) / (static_cast<long long>(BM) * K * 2))));
++    kernel<<<rows_t * (NI / BNA), T::THREADS, T::SMEM, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const uint32_t*>(w.data_ptr()),
++        reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(biases.data_ptr()),
++        reinterpret_cast<__nv_bfloat16*>(act.data_ptr()), M, NI, K, static_cast<int>(scales.size(1)),
++        M == 1 ? K : static_cast<int>(x.stride(0)), group, limit);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++// ============================================================================================= host entries
++void moe_route_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bias, at::Tensor& logits,
++                    at::Tensor& pick, at::Tensor& wts, at::Tensor& members, at::Tensor& items, at::Tensor& counts,
++                    at::Tensor& rank, at::Tensor& hist, at::Tensor& tick, double scale, bool norm, int64_t experts,
++                    int64_t tile, int64_t block, int64_t mode) {
++    const c10::cuda::CUDAGuard guard(x.device());
++    RouteArgs a{};
++    a.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
++    a.w = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
++    a.bias = bias.data_ptr<float>();
++    a.logits = logits.data_ptr<float>();
++    a.pick = pick.data_ptr<int>();
++    a.wts = wts.data_ptr<float>();
++    a.members = members.data_ptr<int>();
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.rank = rank.data_ptr<int>();
++    a.hist = hist.data_ptr<int>();
++    a.tick = tick.data_ptr<int>();
++    a.scale = static_cast<float>(scale);
++    a.ldx = static_cast<int>(x.stride(0));
++    a.M = static_cast<int>(x.size(0));
++    a.D = static_cast<int>(x.size(1));
++    a.NE = static_cast<int>(w.size(0));
++    a.E = static_cast<int>(experts);
++    a.T = static_cast<int>(tile);
++    a.norm = norm ? 1 : 0;
++    a.block = static_cast<int>(block);
++    a.mode = static_cast<int>(mode);
++    if (a.M == 0) return;
++    const auto stream = at::cuda::getCurrentCUDAStream();
++    // decode windows: every K chunk's load in flight at once (latency-bound); prompt chunks: two stages
++    if (a.M <= 16) route_launch<16, 32, 1, 4, 8>(a, stream);
++    else if (a.M <= 32) route_launch<32, 32, 2, 2, 8>(a, stream);
++    else if (a.M <= 64) route_launch<64, 32, 4, 1, 6>(a, stream);
++    else route_launch<128, 96, 4, 2, 2>(a, stream);
++}
++
++// The plan alone from given picks [M, 9] (route mode 2): the same kernel's ranking and finishing, a cluster a row block.
++void moe_plan_cuda(const at::Tensor& pick, at::Tensor& members, at::Tensor& items, at::Tensor& counts, at::Tensor& rank,
++                   at::Tensor& hist, at::Tensor& tick, int64_t experts, int64_t tile) {
++    const c10::cuda::CUDAGuard guard(pick.device());
++    RouteArgs a{};
++    a.pick = pick.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.items = items.data_ptr<int>();
++    a.counts = counts.data_ptr<int>();
++    a.rank = rank.data_ptr<int>();
++    a.hist = hist.data_ptr<int>();
++    a.tick = tick.data_ptr<int>();
++    a.M = static_cast<int>(pick.size(0));
++    a.D = 512;
++    a.NE = static_cast<int>(experts) - 1;
++    a.E = static_cast<int>(experts);
++    a.T = static_cast<int>(tile);
++    a.mode = 2;
++    if (a.M == 0) return;
++    const auto stream = at::cuda::getCurrentCUDAStream();
++    // decode windows: every K chunk's load in flight at once (latency-bound); prompt chunks: two stages
++    if (a.M <= 16) route_launch<16, 32, 1, 4, 8>(a, stream);
++    else if (a.M <= 32) route_launch<32, 32, 2, 2, 8>(a, stream);
++    else if (a.M <= 64) route_launch<64, 32, 4, 1, 6>(a, stream);
++    else route_launch<128, 96, 4, 2, 2>(a, stream);
++}
++
++int64_t moe_route_blocks(int64_t rows) {          // row blocks a call of ``rows`` rows takes (scratch sizes)
++    return rows <= 64 ? 1 : (rows + 127) / 128;
++}
++
++// The dynamic shared memory a route / plan call of ``rows`` rows and ``experts`` plan experts takes (the configs
++// moe_route_cuda picks), for the caller to compare with the device's opt-in maximum before using the kernel.
++int64_t moe_route_bytes(int64_t rows, int64_t experts) {
++    const int E = static_cast<int>(experts), nrb = static_cast<int>(moe_route_blocks(rows));
++    if (rows <= 16) return route_smem<16, 32, 1, 4, 8>(nrb, E);
++    if (rows <= 32) return route_smem<32, 32, 2, 2, 8>(nrb, E);
++    if (rows <= 64) return route_smem<64, 32, 4, 1, 6>(nrb, E);
++    return route_smem<128, 96, 4, 2, 2>(nrb, E);
++}
++
++void moe_combine_cuda(const at::Tensor& y, const c10::optional<at::Tensor>& sy, const at::Tensor& wts, at::Tensor& out) {
++    const c10::cuda::CUDAGuard guard(y.device());
++    const int R = static_cast<int>(out.size(0)), D = static_cast<int>(out.size(1));
++    TORCH_CHECK(wts.size(1) == SLOTS && D % 4 == 0, "moe_glue combine: ", SLOTS, " slots and a width of 4s");
++    if (R == 0) return;
++    const long long n = static_cast<long long>(R) * (D / 4);
++    const int threads = 256;
++    const int blocks = static_cast<int>((n + threads - 1) / threads);
++    const auto stream = at::cuda::getCurrentCUDAStream();
++    const float4* yp = reinterpret_cast<const float4*>(y.data_ptr<float>());
++    float4* op = reinterpret_cast<float4*>(out.data_ptr<float>());
++    if (sy.has_value())
++        combine_kernel<true><<<blocks, threads, 0, stream>>>(yp, reinterpret_cast<const float4*>(sy->data_ptr<float>()),
++                                                             wts.data_ptr<float>(), op, R, D / 4);
++    else
++        combine_kernel<false><<<blocks, threads, 0, stream>>>(yp, nullptr, wts.data_ptr<float>(), op, R, D / 4);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void moe_shared_gu_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
++                        at::Tensor& act, int64_t ni, double limit, int64_t cfg) {
++    const c10::cuda::CUDAGuard guard(x.device());
++    if (x.size(0) == 0) return;
++    const int NI = static_cast<int>(ni);
++    const float L = static_cast<float>(limit);
++    switch (cfg) {
++        case 1: shared_gu_launch<64, 64, 1, 4, 3>(x, w, scales, biases, act, NI, L); break;
++        case 2: shared_gu_launch<128, 64, 4, 2, 3>(x, w, scales, biases, act, NI, L); break;
++        case 3: shared_gu_launch<64, 128, 2, 4, 3>(x, w, scales, biases, act, NI, L); break;
++        default: shared_gu_launch<128, 64, 2, 4, 3>(x, w, scales, biases, act, NI, L); break;
++    }
++}
+diff --git tensorfold/families/glm5_next/cuda/moe_glue.py tensorfold/families/glm5_next/cuda/moe_glue.py
+new file mode 100644
+index 0000000..4899594
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/moe_glue.py
+@@ -0,0 +1,802 @@
++"""TF_GLM_MOE_GLUE: the MoE layer's work around the routed experts (router, top-k, plan, shared expert, combine) in
++fewer kernels and off the critical path, with the bits of today's kernels.
++
++A MoE layer runs, for a window or a prompt chunk of R rows: the router matmul (8 K slices), their sum, the sigmoid /
++bias top-k with its normalization, the plan (the (row, slot) pairs grouped by expert), the routed experts, the shared
++expert (gate/up, SwiGLU, down) and the combine (the routed slots' weighted sum, the shared expert's row last, a rank's
++fp32 partial). The parts, each on its own in the setting:
++
++  side     the shared expert on a second stream beside the route and the routed experts (it reads only the layer's
++           normed rows). Prompt chunks in two lanes (TF_GLM_PREFILL_LANES=2) start it as soon as the lane's normed rows
++           exist (right after the lane's glue, beside the other lane's attention block); decode windows fork it inside
++           their CUDA graphs. The same kernels on the same rows: scheduling only.
++  defer    (with side, prompt lanes) the combine on that stream too, so the main stream goes on with the other lane's
++           route and routed experts while it runs; the lane's exchange waits for it. Scheduling only.
++  route    one kernel for the router matmul, the slice sums, the top-k, the weights and the plan (moe_glue.cu):
++           6 launches of a prompt chunk (router, sum, top-k, three plan passes) and 3 of a decode window (fused
++           router + top-k, plan) become 1, with no host round trip.
++  combine  the combine as a CUDA kernel (4 columns a thread, every slot's load in flight at once, streaming loads).
++  shared   a prompt chunk's shared-expert gate/up matmul with SwiGLU in its epilogue (one launch, no gate/up round trip).
++  rowsplit (prompt lanes on the copy-engine exchange, TF_GLM_HC_EXCHANGE=ce) each rank routes only its own quarter of
++           a lane's rows, on the exchange stream right after their glue (the fused kernel's route-only mode, or the
++           replaced kernels on those rows), and their picks and weights (72 bytes a row) travel with the normed rows in
++           the same copy-engine step; the main stream then builds the plan alone (the plan-only mode). Every rank
++           decides it from its settings alone (the swap must carry the same buffers everywhere).
++
++Value: unset, "0", "off" or "none": none of it (the default: today's code path, unchanged); "all", "1" or "on":
++every part; or a comma-separated list of names. TF_GLM_MOE_SHARED_TILE (0-3, default 0) picks the shared gate/up
++kernel's tile (0: 128 rows x 64 columns, 8 warps; 1: 64 x 64, 4 warps; 2: 128 x 64, 8 warps along M; 3: 64 x 128);
++TF_GLM_MOE_SIDE_PRIORITY (0, the default, or -1: high) the second stream's priority. Every rank must be given the same
++values (the engine compares them at start).
++
++Exactness. side and defer change no kernel: each runs on the same rows with the same inputs, events ordering every
++buffer a call writes and another reads (tests/k4/test_side_streams_cpu.py proves it on the real lane schedule). route,
++combine and shared reproduce the replaced kernels' arithmetic instruction for instruction: every logit is
++glue._router_part's chain of mma.sync m16n8k16 steps over its K slice in ascending k, the slices added in order; the
++selection is glue._topk's (sub.f32, mul.f32 by log2(e), ex2.approx.f32, add.f32, div.full.f32; the largest choice,
++the lowest index among equal ones, NaN never; weights in pick order over their sum + 1e-20, then times the scale);
++the plan is experts.cu's (an expert's pairs in pair order, items of T pairs in expert order); the combine is
++glue._combine's fma.rn.f32 chain in slot order; the shared gate/up is the prompt matmul's chain (bf16(fma(q, s, b))
++weights, one fp32 chain over K), rounded to bf16 as it stores them, then glue._swiglu's operations
++(tests/k4/ptx_contract.py reads those instructions from the Triton kernels' sm_120 PTX). On top, each kernel is
++compared byte for byte with the kernels it replaces on this GPU at its first use outside a CUDA graph capture (random
++rows over many magnitudes, ties, the layer's own weights); any difference turns that part off for the process (a line
++says so) and the replaced kernels run. Every bit of every reply is therefore today's.
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (the Triton glue kernels, the grouped-expert
++plan and the 4-bit prompt matmul, whose arithmetic it reproduces) and on the GLM-5.3-Flash recipe and patches
++0001-0056 by MiaAI-Lab."""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++
++import torch
++
++from . import prof
++
++PARTS = ("side", "defer", "route", "combine", "shared", "rowsplit")
++CHECKED = ("route", "combine", "shared")          # kernels compared bit for bit on this GPU before their first use
++OFF = ("", "0", "off", "none")
++TOPK = 8                                          # the fused route's experts a token (GLM-5.3-Flash's)
++MAX_ROWS = 10240                                  # the fused route's rows a call at most (its plan table's shared memory)
++
++_wanted: frozenset | None = None
++_decided: dict[str, bool] = {}
++
++
++def parse(value: str | None) -> frozenset:
++    """TF_GLM_MOE_GLUE's value as the set of parts it asks for (ValueError on an unknown name)."""
++
++    v = (value or "").strip().lower()
++    if v in OFF:
++        return frozenset()
++    if v in ("all", "1", "on"):
++        return frozenset(PARTS)
++    names = {n.strip() for n in v.split(",") if n.strip()}
++    bad = names - set(PARTS)
++    if bad:
++        raise ValueError(f"TF_GLM_MOE_GLUE: off, all or names among {', '.join(PARTS)}; not {', '.join(sorted(bad))}")
++    if "defer" in names and "side" not in names:
++        raise ValueError("TF_GLM_MOE_GLUE: defer runs the combine on side's stream: name side as well")
++    return frozenset(names)
++
++
++def rowsplit_on() -> bool:
++    """rowsplit asked for and usable: prompt lanes on the copy-engine exchange (settings only, the same on every
++    rank). Read where the arena is made (``narrow_bytes``) and where a lane's glue runs (``lane_route``)."""
++
++    if not asks("rowsplit"):
++        return False
++    env = os.environ
++    return ((env.get("TF_GLM_HC_EXCHANGE", "") or "p2p").strip() == "ce"
++            and (env.get("TF_GLM_PREFILL_LANES", "") or "1").strip() == "2")
++
++
++def wanted() -> frozenset:
++    global _wanted
++    if _wanted is None:
++        _wanted = parse(os.environ.get("TF_GLM_MOE_GLUE", ""))
++    return _wanted
++
++
++def reset(value: str | None = None) -> None:
++    """Forget the setting and the kernel decisions (tests); ``value``: set TF_GLM_MOE_GLUE first."""
++
++    global _wanted, _side_stream
++    if value is not None:
++        os.environ["TF_GLM_MOE_GLUE"] = value
++    _wanted = None
++    _side_stream = None
++    _decided.clear()
++    _states.clear()
++
++
++def on() -> bool:
++    return bool(wanted())
++
++
++def asks(name: str) -> bool:
++    return name in wanted()
++
++
++def shared_tile() -> int:
++    v = (os.environ.get("TF_GLM_MOE_SHARED_TILE", "") or "0").strip()
++    if v not in ("0", "1", "2", "3"):
++        raise ValueError(f"TF_GLM_MOE_SHARED_TILE: 0, 1, 2 or 3, not {v!r}")
++    return int(v)
++
++
++def side_priority() -> int:
++    v = (os.environ.get("TF_GLM_MOE_SIDE_PRIORITY", "") or "0").strip()
++    if v not in ("0", "-1"):
++        raise ValueError(f"TF_GLM_MOE_SIDE_PRIORITY: 0 or -1, not {v!r}")
++    return int(v)
++
++
++def narrow_bytes() -> int:
++    """Bytes a row the copy-engine arena keeps beside the swapped rows for rowsplit's picks and weights (int32 and fp32
++    [rows, 9]); 0 without rowsplit (the arena as before). Settings only: every rank gets the same arena."""
++
++    return 2 * (TOPK + 1) * 4 if rowsplit_on() else 0
++
++
++def mask() -> int:
++    """TF_GLM_MOE_GLUE as a bit mask over PARTS (ValueError when the value is not valid)."""
++
++    return sum(1 << i for i, n in enumerate(PARTS) if n in wanted())
++
++
++def code() -> list[int]:
++    """The settings as integers (the engine compares mask, shared_tile and side_priority across ranks: every rank
++    must run the same calls)."""
++
++    return [mask(), shared_tile(), side_priority()]
++
++
++def describe() -> str:
++    parts = [n for n in PARTS if n in wanted()]
++    what = {"side": "the shared expert on a second stream (prompt lanes: from the lane's glue on)",
++            "defer": "prompt lanes' combine on that stream",
++            "route": "router, top-k and plan in one kernel",
++            "combine": "a CUDA combine",
++            "shared": f"the shared expert's gate/up with SwiGLU in one prompt kernel (tile {shared_tile()})",
++            "rowsplit": "prompt lanes' routes split between the ranks (own rows on the exchange stream, the picks "
++                        "swapped with the rows)" + ("" if rowsplit_on() else
++                                                   " [not used: it needs TF_GLM_HC_EXCHANGE=ce and "
++                                                   "TF_GLM_PREFILL_LANES=2]")}
++    return "MoE glue (TF_GLM_MOE_GLUE): " + "; ".join(what[n] for n in parts) + \
++        (" (kernels checked bit for bit at first use)" if set(parts) & set(CHECKED) else "")
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from pathlib import Path
++
++    from tensorfold.cuda.build import CLUSTERS, load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_moe_glue_v1", sources=[str(here / "moe_glue.cpp"), str(here / "moe_glue.cu")],
++                need=CLUSTERS, extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def kernel_on(name: str, check) -> bool:
++    """Whether to run kernel part ``name`` now: asked for and its check passed (run here, on its first call outside a
++    CUDA graph capture; inside a capture before it: False, the replaced kernels run). Per process."""
++
++    if name not in wanted():
++        return False
++    got = _decided.get(name)
++    if got is not None:
++        return got
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        ok = bool(check())
++        why = "" if ok else ": its outputs differ from the replaced kernels' on this GPU"
++    except Exception as exc:  # noqa: BLE001 - a part that cannot run here is off, the replaced kernels run
++        ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++    _decided[name] = ok
++    print(f"[tensorfold] MoE glue {name}: {'on (checked bit for bit)' if ok else 'off' + why}", flush=True)
++    return ok
++
++
++# -- per buffer set state -------------------------------------------------------------------------------------------
++class State:
++    """One buffer set's (``forward.Buffers`` or a prompt lane's view) second stream, events and route scratch."""
++
++    def __init__(self, b) -> None:
++        self.b = b                                   # held: the key is id(b)
++        self.stream = None
++        self.ev_fork = self.ev_side = self.ev_routed = self.ev_part = self.ev_early = None
++        self.early: dict[int, object] = {}           # layer index -> the event after its front ran on the stream
++        self.split_routed: dict[int, bool] = {}      # layer index -> its rows' picks came from the rows' owners
++        self.rank = self.hist = self.tick = None
++
++    def side(self):
++        """The second stream (one for the process: prompt chunks and decode windows run one at a time on the main
++        stream, so their second-stream work is in host order there too) and this buffer set's events."""
++
++        global _side_stream
++        if self.stream is None:
++            if _side_stream is None:
++                _side_stream = torch.cuda.Stream(priority=side_priority())
++            self.stream = _side_stream
++            self.ev_fork, self.ev_side = torch.cuda.Event(), torch.cuda.Event()
++            self.ev_routed, self.ev_part, self.ev_early = torch.cuda.Event(), torch.cuda.Event(), torch.cuda.Event()
++        return self.stream
++
++    def scratch(self, R: int, slots: int, experts: int, device):
++        """The fused route's scratch, sized once for every window this buffer set holds (its rows with any pad rows):
++        never reallocated, since captured CUDA graphs keep its addresses. The ticket counters start at zero and the
++        kernel leaves them at zero."""
++
++        if self.rank is None:
++            rows = max(int(getattr(self.b, "alloc_rows", 0) or 0), int(self.b.rows))
++            blocks = int(_ext().route_blocks(rows))
++            self.rank = torch.zeros((rows * slots,), dtype=torch.int32, device=device)
++            self.hist = torch.zeros((blocks * experts,), dtype=torch.int32, device=device)
++            self.tick = torch.zeros((blocks + 1,), dtype=torch.int32, device=device)
++        if self.rank.numel() < R * slots:
++            raise ValueError(f"moe_glue: a window of {R} rows past the buffers' {self.rank.numel() // slots}")
++        return self.rank, self.hist, self.tick
++
++
++_states: dict[int, State] = {}
++_side_stream = None
++
++
++def state(b) -> State:
++    """``b``'s state, made on first use (a dict by identity: a prompt lane's view copies its parent's attributes,
++    so nothing of this lives on the buffer object itself)."""
++
++    s = _states.get(id(b))
++    if s is None or s.b is not b:
++        s = _states[id(b)] = State(b)
++    return s
++
++
++# -- route ----------------------------------------------------------------------------------------------------------
++def _block(experts: int) -> int:
++    """glue.select's BLOCK: the next power of two above the routed experts (the shared slot's id among them)."""
++
++    n = 1
++    while n < experts + 1:
++        n *= 2
++    return n
++
++
++def route_ok(x: torch.Tensor, router: torch.Tensor, b, c) -> bool:
++    """Whether the fused route takes this call: glue.router's sliced path (8 K slices: the bits it reproduces),
++    8 experts a token, at most 511 routed experts, unit-stride 16-byte rows."""
++
++    from . import glue
++
++    return (glue.ROUTER_KS == 8 and c.top_k == TOPK and b.plan.slots == TOPK + 1 and x.dim() == 2
++            and x.shape[1] % 512 == 0 and x.stride(1) == 1 and (x.shape[0] <= 1 or x.stride(0) % 8 == 0)
++            and x.data_ptr() % 16 == 0 and router.is_contiguous() and router.dtype == torch.bfloat16
++            and router.data_ptr() % 16 == 0 and router.shape == (c.experts, x.shape[1]) and _block(c.experts) <= 512
++            and b.plan.experts == c.experts + 1 and b.mlog.is_contiguous() and x.shape[0] <= b.plan.rows
++            and x.shape[0] <= MAX_ROWS)
++
++
++def _route_fits(rows: int, experts: int) -> bool:
++    """The fused route's shared memory for ``rows`` rows fits this GPU (else the replaced kernels run). Asked after
++    the part's check passed (the extension is loaded then); never raises."""
++
++    try:
++        most = _smem_optin()
++        return most > 0 and int(_ext().route_bytes(rows, experts)) <= most
++    except Exception:  # noqa: BLE001
++        return False
++
++
++@lru_cache(maxsize=1)
++def _smem_optin() -> int:
++    props = torch.cuda.get_device_properties(torch.cuda.current_device())
++    return int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
++
++
++def route(b, layer, c, R: int) -> None:
++    """The layer's route of rows 0 .. R: logits, picks and weights into b.mlog / b.pick / b.wts and the plan into
++    b.plan (with its item size: a prompt plan's own, a decode plan's experts.TILE)."""
++
++    from tensorfold.cuda import experts as grouped
++
++    from . import forward as F
++    from . import glue
++
++    m = layer.moe
++    x = b.normed[:R]
++    tile = b.plan.tile if b.plan.prefill else grouped.TILE
++    if state(b).split_routed.pop(layer.index, False):
++        # rowsplit: every row's picks and weights are in (this rank's own rows routed by ``lane_route``, the others
++        # swapped in with the normed rows): the plan alone
++        if asks("route") and route_ok(x, m.router, b, c) and kernel_on(
++                "route", lambda: check_route(m.router, m.bias, c, b.plan.tile, x.device)) and _route_fits(
++                R, c.experts + 1):
++            rank, hist, tick = state(b).scratch(R, b.plan.slots, c.experts + 1, x.device)
++            b.plan.tile = tile
++            _ext().plan(b.pick[:R], b.plan.members, b.plan.items, b.plan.counts, rank, hist, tick, c.experts + 1,
++                        tile)
++        else:
++            grouped.route(b.pick[:R], b.plan, b.plan.tile)
++        return
++    if (asks("route") and route_ok(x, m.router, b, c)
++            and kernel_on("route", lambda: check_route(m.router, m.bias, c, b.plan.tile, x.device))
++            and _route_fits(R, c.experts + 1)):
++        rank, hist, tick = state(b).scratch(R, b.plan.slots, c.experts + 1, x.device)
++        b.plan.tile = tile
++        _ext().route(x, m.router, m.bias, b.mlog[:R], b.pick[:R], b.wts[:R], b.plan.members, b.plan.items,
++                     b.plan.counts, rank, hist, tick, float(c.routed_scale), bool(c.norm_topk), c.experts + 1, tile,
++                     _block(c.experts), True)
++        return
++    # the replaced kernels, as forward.moe_block calls them
++    if not b.prefill and F._fused("router", glue.router_select_ok(x, m.router, b.mlog[:R]), lambda: F._fuse().check_router(
++            x, m.router, m.bias, c.top_k, c.experts, c.routed_scale, c.norm_topk)):
++        glue.router_select(x, m.router, b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts,
++                           c.routed_scale, c.norm_topk)
++    else:
++        glue.router(x, m.router, b.mlog[:R])
++        glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
++    grouped.route(b.pick[:R], b.plan, b.plan.tile)
++
++
++# -- combine --------------------------------------------------------------------------------------------------------
++def combine_ok(y: torch.Tensor, sy: torch.Tensor | None, wts: torch.Tensor, out: torch.Tensor) -> bool:
++    return (y.dtype == torch.float32 and y.dim() == 3 and y.shape[1] == TOPK + 1 and y.is_contiguous()
++            and wts.is_contiguous() and wts.shape[1] == TOPK + 1 and out.is_contiguous() and out.shape[1] % 4 == 0
++            and y.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0
++            and (sy is None or (sy.dtype == torch.float32 and sy.is_contiguous() and sy.data_ptr() % 16 == 0)))
++
++
++def combine_rows(b, c, lo: int, hi: int) -> None:
++    """Rows lo .. hi of this rank's fp32 MoE share into b.part: the routed slots' weighted sum, the shared expert's
++    row (b.sy) last with its weight (forward.moe_block's combine)."""
++
++    from . import glue
++
++    if hi <= lo:
++        return
++    with_sy = b.prefill or os.environ.get("TF_GLM_COMBINE_SY", "1") != "0"
++    y, sy, wts, out = b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi]
++    if (asks("combine") and combine_ok(y, sy, wts, out)
++            and kernel_on("combine", lambda: check_combine(c.hidden, y.device))):
++        # the shared row read from sy where it is: the same terms in the same order as the copy into the last slot
++        _ext().combine(y, sy, wts, out)
++        return
++    if with_sy:
++        glue.combine_shared(y, sy, wts, out)
++    else:
++        b.ey[lo:hi, c.top_k].copy_(sy)
++        glue.combine(y, wts, out)
++
++
++# -- the shared expert ----------------------------------------------------------------------------------------------
++def shared_ok(b, s) -> bool:
++    """A prompt chunk's shared expert the fused gate/up kernel takes: 4-bit gate/up of groups of 64 (TF_GLM_DENSE=q4)
++    on the prompt matmul's packing, an intermediate width of 128s."""
++
++    from . import qmm
++
++    gu = s.gu
++    return (b.prefill and isinstance(gu, qmm.Q4) and gu.gs == 64 and gu.n % 256 == 0 and gu.k % 64 == 0
++            and gu.scales.dim() == 2 and gu.scales.shape[0] == gu.k // 64 and gu.scales.shape[1] >= gu.n
++            and all(t.data_ptr() % 16 == 0 for t in (gu.weight, gu.scales, gu.biases)))
++
++
++def shared_rows(layer, w, b, lo: int, hi: int) -> None:
++    """The MoE's shared expert of rows lo .. hi into b.sy (forward.shared_front, or the fused gate/up kernel)."""
++
++    from . import forward as F
++
++    if hi <= lo:
++        return
++    s, c = layer.moe.shared, w.cfg
++    if (asks("shared") and shared_ok(b, s)
++            and kernel_on("shared", lambda: check_shared(s.gu, c.limit, b.normed.device))):
++        ni = s.gu.n // 2
++        with prof.timed("moe: shared expert"):
++            _ext().shared_gu(b.normed[lo:hi], s.gu.weight, s.gu.scales, s.gu.biases, b.sact[lo:hi], ni,
++                             float(c.limit), shared_tile())
++            # b.sxs (the act's group sums) is not written: a prompt chunk's down projection never reads it
++            F.mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
++        return
++    F.shared_front(layer, w, b, lo, hi)
++
++
++def side_ok(b, layer) -> bool:
++    """Whether the shared expert may run beside the main stream here: a decode window (its projections keep their
++    split-K partials in clusters, or in b.sk, which nothing on the main stream uses meanwhile); a prompt chunk only
++    with 4-bit projections (the prompt matmul keeps no partials: BF16 / FP8 ones would share b.sk with the other
++    lane's blocks)."""
++
++    from . import qmm
++
++    s = layer.moe.shared
++    if s is None:
++        return False
++    if not b.prefill:
++        return True
++    return isinstance(s.gu, qmm.Q4) and isinstance(s.down, qmm.Q4)
++
++
++def _lane_split(b) -> bool:
++    sp = getattr(b, "split", None)
++    return sp is not None and getattr(sp, "active", False) and type(sp).__name__ == "LaneSplit"
++
++
++# -- the blocks ------------------------------------------------------------------------------------------------------
++def ffn(layer, w, b, R: int, done=None):
++    """forward._ffn under TF_GLM_MOE_GLUE: the dense MLP (its front perhaps run by ``lane_front``) or the MoE."""
++
++    from . import forward as F
++
++    early = state(b).early.pop(layer.index, None)
++    if layer.mlp is not None:
++        if early is not None:
++            torch.cuda.current_stream().wait_event(early)
++            return F.mlp_block(layer, w, b, R, (0, R))
++        return F.mlp_block(layer, w, b, R, done)
++    return moe_block(layer, w, b, R, done, early)
++
++
++def _after_route(b, m, R: int) -> None:
++    """Calls that follow the routing plan in forward.moe_block: builder K3's routed-expert L2 prefetch
++    (exl3_stream.prefetch_experts, TF_GLM_L2PF_EXPERT_MB) when that module is present and the prefetcher runs."""
++
++    from . import l2pf
++
++    if l2pf.ACTIVE is None or getattr(b, "plan", None) is None:
++        return
++    k3 = _k3_stream()
++    if k3 is not None:
++        k3.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
++
++
++@lru_cache(maxsize=1)
++def _k3_stream():
++    """Builder K3's exl3_stream module when it is installed, else None (looked up once; a module that is there but
++    fails to import raises, as forward.moe_block's import would)."""
++
++    import importlib
++    import importlib.util
++
++    name = __name__.rsplit(".", 1)[0] + ".exl3_stream"
++    if importlib.util.find_spec(name) is None:
++        return None
++    return importlib.import_module(name)
++
++
++def lane_front(layer, w, b, ls, rows: int) -> None:
++    """A prompt lane's FFN front (the MoE's shared expert, or the dense MLP's gate/up) on the second stream as soon as
++    the lane's normed rows exist: right after its glue (``ls.glue_async``, which records ls.ev_done on the exchange
++    stream once the rows are swapped in), beside the other lane's attention block. ``ffn`` then waits for it where its
++    output is read. (TF_GLM_MOE_GLUE side; prompt lanes, patch 0123.)"""
++
++    from . import forward as F
++
++    if not asks("side") or rows <= 0:
++        return
++    if layer.mlp is not None:
++        if not _q4_mlp(layer):
++            return
++        front = lambda lo, hi: F.mlp_front(layer, w, b, lo, hi)  # noqa: E731
++    elif side_ok(b, layer):
++        front = lambda lo, hi: shared_rows(layer, w, b, lo, hi)  # noqa: E731
++    else:
++        return
++    st = state(b)
++    stream = st.side()
++    with torch.cuda.stream(stream):
++        stream.wait_event(ls.ev_done)
++        front(0, rows)
++        st.ev_early.record(stream)
++    st.early[layer.index] = st.ev_early
++
++
++def glue_args(layer) -> dict:
++    """lanes' FFN-side ``glue_async`` call's extra argument: the layer, for rowsplit's own-rows route ({} without
++    rowsplit: the call as before)."""
++
++    return {"moe": layer} if rowsplit_on() else {}
++
++
++def lane_route(ls, layer, lo: int, hi: int) -> list:
++    """rowsplit: a prompt lane's route of this rank's own rows lo .. hi, called by ``lanes.LaneSplit.glue_async`` on
++    the exchange stream right after their hc_pre; returns the row buffers (picks, weights) its rows' swap carries beside
++    the normed rows ([] when rowsplit does not run: the swap as before). The main stream's ``route`` then builds the
++    plan alone. Decided from the settings alone (every rank's swap must carry the same buffers); the fused kernel's
++    route-only mode when its check passed, else glue.router + glue.select on those rows: the same bits."""
++
++    from . import glue
++
++    if layer is None or getattr(layer, "moe", None) is None or not rowsplit_on() or getattr(ls, "ce", None) is None:
++        return []
++    b, c, m = ls.b, ls.w.cfg, layer.moe
++    if c.top_k != TOPK:                             # (the model's config: the same on every rank)
++        return []
++    if hi > lo:
++        x = b.normed[lo:hi]
++        if (asks("route") and route_ok(x, m.router, b, c)
++                and kernel_on("route", lambda: check_route(m.router, m.bias, c, b.plan.tile, x.device))
++                and _route_fits(hi - lo, c.experts + 1)):
++            rank, hist, tick = state(b).scratch(hi - lo, b.plan.slots, c.experts + 1, x.device)
++            _ext().route(x, m.router, m.bias, b.mlog[lo:hi], b.pick[lo:hi], b.wts[lo:hi], b.plan.members,
++                         b.plan.items, b.plan.counts, rank, hist, tick, float(c.routed_scale), bool(c.norm_topk),
++                         c.experts + 1, b.plan.tile, _block(c.experts), False)
++        else:
++            glue.router(x, m.router, b.mlog[lo:hi])
++            glue.select(b.mlog[lo:hi], m.bias, b.pick[lo:hi], b.wts[lo:hi], c.top_k, c.experts, c.routed_scale,
++                        c.norm_topk)
++    state(b).split_routed[layer.index] = True
++    return [b.pick, b.wts]
++
++
++def _q4_mlp(layer) -> bool:
++    from . import qmm
++
++    return isinstance(layer.mlp.gu, qmm.Q4)
++
++
++def moe_block(layer, w, b, R: int, done=None, early=None):
++    """forward.moe_block under TF_GLM_MOE_GLUE. ``done``: rows whose shared expert already ran on the main stream
++    (TF_GLM_PREFILL_OVERLAP=2); ``early``: the second stream's event after ``lane_front`` ran it on every row."""
++
++    from tensorfold.cuda import experts as grouped
++
++    from . import exl3_mm, l2pf
++    from . import forward as F
++
++    c, m = w.cfg, layer.moe
++    main = torch.cuda.current_stream()
++    st = state(b)
++    done0 = done                                    # the caller's (forward.moe_block's conditions read it)
++    ready = None                                    # the second stream's event once the shared rows are in b.sy
++    if m.shared is not None:
++        if early is not None:
++            ready, done = early, (0, R)
++        elif asks("side") and side_ok(b, layer) and any(z > a for a, z in F.undone(R, done)):
++            stream = st.side()
++            st.ev_fork.record(main)
++            with torch.cuda.stream(stream):
++                stream.wait_event(st.ev_fork)
++                for a, z in F.undone(R, done):
++                    shared_rows(layer, w, b, a, z)
++                st.ev_side.record(stream)
++            ready, done = st.ev_side, (0, R)
++    with prof.timed("moe: route"):
++        route(b, layer, c, R)
++    if m.shared is not None and done0 is None:
++        _after_route(b, m, R)                       # integration point: work that needs the plan, before the experts
++    if m.shared is not None and ready is None and l2pf.ACTIVE is not None and done is None:
++        # TF_GLM_L2PF (as forward.moe_block): the shared expert before the routed experts while L2 holds what site "a"
++        # prefetched for it
++        shared_rows(layer, w, b, 0, R)
++        done = (0, R)
++    if m.shared is not None:
++        with prof.timed("moe: routed (exl3)"):
++            exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
++        defer = asks("defer") and ready is not None and _lane_split(b)
++
++        def fill(lo: int, hi: int) -> None:
++            for a, z in F.undone(hi, done):       # rows lo .. hi the front has not run on
++                if max(a, lo) < z:
++                    shared_rows(layer, w, b, max(a, lo), z)
++            if defer and (lo, hi) == (0, R):
++                # the lane's whole partial at once (lanes.LaneSplit.partial): the combine after the shared rows on the
++                # second stream (stream order) and after the routed experts (this event); the lane's exchange waits
++                # for ``fill.ready`` (lanes.py)
++                st.ev_routed.record(main)
++                stream = st.side()
++                with torch.cuda.stream(stream):
++                    stream.wait_event(st.ev_routed)
++                    with prof.timed("moe: combine"):
++                        combine_rows(b, c, lo, hi)
++                    st.ev_part.record(stream)
++                fill.ready = st.ev_part
++                return
++            if ready is not None:
++                main.wait_event(ready)
++            with prof.timed("moe: combine"):
++                combine_rows(b, c, lo, hi)
++
++        return F.partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
++    with prof.timed("moe: gate/up"):
++        grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
++    with prof.timed("moe: down"):
++        grouped.down(b.eact, m.experts, b.plan, b.ey.view(-1, c.hidden), R)
++
++    def fill(lo: int, hi: int) -> None:
++        from . import glue
++
++        with prof.timed("moe: combine"):
++            glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++
++    return F.partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
++
++
++# -- the checks (on this GPU, before first use) ---------------------------------------------------------------------
++def _same(*pairs) -> bool:
++    for a, b in pairs:
++        if a.shape != b.shape or a.dtype != b.dtype:
++            return False
++        if not torch.equal(a.contiguous().view(-1).view(torch.uint8), b.contiguous().view(-1).view(torch.uint8)):
++            return False
++    return True
++
++
++def _wide(shape, gen, device, spread: int) -> torch.Tensor:
++    """Normal values times 2^e, e uniform in [-spread, spread]: sums of them round differently in any other order."""
++
++    e = torch.randint(-spread, spread + 1, shape, device=device, generator=gen).to(torch.float32)
++    return torch.randn(shape, device=device, generator=gen) * torch.exp2(e)
++
++
++CHECK_ROUTE_ROWS = (1, 5, 16, 17, 32, 33, 64, 65, 300, 1100)
++
++
++def route_inputs(R: int, D: int, seed: int, device, draw: str) -> torch.Tensor:
++    """Router input rows of a check: ``wide`` (magnitudes 2^-4 .. 2^4), ``ties`` (every 4th row zero, so every logit is
++    0 and every choice is its bias: ties wherever biases tie; the others repeat 3 rows, so equal rows tie exactly)."""
++
++    g = torch.Generator(device=device).manual_seed(seed)
++    x = (_wide((R, D), g, device, 4) * 0.05).to(torch.bfloat16)
++    if draw == "ties":
++        x[::4] = 0
++        if R > 3:
++            x[1::4] = x[1].clone()          # x[1::4] holds row 1 itself: copy it first (torch refuses aliased writes)
++    return x
++
++
++def route_reference(x, router, bias, c, tile, prefill: bool):
++    """glue.router + glue.select + experts.route on fresh buffers: (logits, pick, wts, plan)."""
++
++    from tensorfold.cuda import experts as grouped
++
++    from . import glue
++
++    R, dev = x.shape[0], x.device
++    logits = torch.empty((R, c.experts), dtype=torch.float32, device=dev)
++    pick = torch.empty((R, TOPK + 1), dtype=torch.int32, device=dev)
++    wts = torch.empty((R, TOPK + 1), dtype=torch.float32, device=dev)
++    plan = grouped.Plan(R, TOPK + 1, c.experts + 1, dev, prefill=prefill, tile=tile)
++    glue.router(x, router, logits)
++    glue.select(logits, bias, pick, wts, c.top_k, c.experts, c.routed_scale, c.norm_topk)
++    grouped.route(pick, plan, plan.tile)
++    return logits, pick, wts, plan
++
++
++def route_fused(x, router, bias, c, tile, prefill: bool):
++    """The fused route on fresh buffers: (logits, pick, wts, plan)."""
++
++    from tensorfold.cuda import experts as grouped
++
++    R, dev = x.shape[0], x.device
++    logits = torch.full((R, c.experts), float("nan"), dtype=torch.float32, device=dev)
++    pick = torch.full((R, TOPK + 1), -7, dtype=torch.int32, device=dev)
++    wts = torch.full((R, TOPK + 1), float("nan"), dtype=torch.float32, device=dev)
++    plan = grouped.Plan(R, TOPK + 1, c.experts + 1, dev, prefill=prefill, tile=tile)
++    plan.members.fill_(-7)
++    plan.items.fill_(-7)
++    T = plan.tile if prefill else grouped.TILE
++    blocks = int(_ext().route_blocks(R))
++    rank = torch.zeros((R * (TOPK + 1),), dtype=torch.int32, device=dev)
++    hist = torch.zeros((blocks * (c.experts + 1),), dtype=torch.int32, device=dev)
++    tick = torch.zeros((blocks + 1,), dtype=torch.int32, device=dev)
++    _ext().route(x, router, bias, logits, pick, wts, plan.members, plan.items, plan.counts, rank, hist, tick,
++                 float(c.routed_scale), bool(c.norm_topk), c.experts + 1, T, _block(c.experts), True)
++    if int(tick.abs().sum()) != 0:
++        raise RuntimeError("the route kernel left its ticket counters non-zero")
++    return logits, pick, wts, plan
++
++
++def same_route(ref, got) -> bool:
++    """Logits, picks and weights byte for byte; the plans' counts, items (as many as counts[0]) and members."""
++
++    l0, p0, w0, a = ref
++    l1, p1, w1, b = got
++    if not _same((l0, l1), (p0, p1), (w0, w1), (a.counts, b.counts)):
++        return False
++    n = int(a.counts[0])
++    P = p0.numel()
++    return _same((a.items[:n], b.items[:n]), (a.members[:P], b.members[:P]))
++
++
++def check_route(router, bias, c, tile, device) -> bool:
++    """The fused route against the replaced kernels on random rows (the layer's router weights and bias, and a
++    rounded bias with ties), at row counts through every tile of the kernel and several row blocks."""
++
++    tied = torch.round(bias * 4) / 4                    # coarse biases: many choices tie exactly
++    for i, R in enumerate(CHECK_ROUTE_ROWS):
++        for prefill in (False, True):
++            for draw, bb in (("wide", bias), ("ties", tied)):
++                x = route_inputs(R, router.shape[1], 1000 + i, device, draw)
++                ref = route_reference(x, router, bb, c, tile, prefill)
++                if not same_route(ref, route_fused(x, router, bb, c, tile, prefill)):
++                    return False
++                if draw == "wide" and R in (5, 300, 1100) and not same_modes(ref, x, router, bb, c, tile, prefill):
++                    return False
++    return True
++
++
++def same_modes(ref, x, router, bias, c, tile, prefill: bool) -> bool:
++    """The route-only mode's logits, picks and weights, and the plan-only mode's plan of the reference's picks,
++    against the replaced kernels (rowsplit runs both)."""
++
++    from tensorfold.cuda import experts as grouped
++
++    R, dev = x.shape[0], x.device
++    T = tile if prefill else grouped.TILE
++    blocks = int(_ext().route_blocks(R))
++    rank = torch.zeros((R * (TOPK + 1),), dtype=torch.int32, device=dev)
++    hist = torch.zeros((blocks * (c.experts + 1),), dtype=torch.int32, device=dev)
++    tick = torch.zeros((blocks + 1,), dtype=torch.int32, device=dev)
++    logits = torch.full((R, c.experts), float("nan"), device=dev)
++    pick = torch.full((R, TOPK + 1), -7, dtype=torch.int32, device=dev)
++    wts = torch.full((R, TOPK + 1), float("nan"), device=dev)
++    plan = grouped.Plan(R, TOPK + 1, c.experts + 1, dev, prefill=prefill, tile=tile)
++    _ext().route(x, router, bias, logits, pick, wts, plan.members, plan.items, plan.counts, rank, hist, tick,
++                 float(c.routed_scale), bool(c.norm_topk), c.experts + 1, T, _block(c.experts), False)
++    if not _same((ref[0], logits), (ref[1], pick), (ref[2], wts)):
++        return False
++    plan.members.fill_(-7)
++    plan.items.fill_(-7)
++    _ext().plan(ref[1], plan.members, plan.items, plan.counts, rank, hist, tick, c.experts + 1, T)
++    if int(tick.abs().sum()) != 0:
++        return False
++    return same_route(ref, (ref[0], ref[1], ref[2], plan))
++
++
++def check_combine(D: int, device) -> bool:
++    """The CUDA combine against glue.combine_shared (and glue.combine with the shared row in the last slot)."""
++
++    from . import glue
++
++    for i, R in enumerate((1, 3, 64, 257)):
++        g = torch.Generator(device=device).manual_seed(77 + i)
++        y = _wide((R, TOPK + 1, D), g, device, 12)
++        sy = _wide((R, D), g, device, 12)
++        wts = torch.rand((R, TOPK + 1), device=device, generator=g) * 0.5
++        a, b2, c2 = (torch.empty((R, D), device=device) for _ in range(3))
++        glue.combine_shared(y, sy, wts, a)
++        _ext().combine(y, sy, wts, b2)
++        y2 = y.clone()
++        y2[:, TOPK].copy_(sy)
++        d = torch.empty((R, D), device=device)
++        glue.combine(y2, wts, d)
++        _ext().combine(y2, None, wts, c2)
++        if not _same((a, b2), (d, c2), (a, d)):
++            return False
++    return True
++
++
++def check_shared(gu, limit: float, device) -> bool:
++    """The fused gate/up + SwiGLU against the prompt matmul and glue.swiglu (the layer's own weights)."""
++
++    from tensorfold.cuda.kernels import qmm as shared
++
++    from . import glue, qmm
++
++    ni = gu.n // 2
++    for i, R in enumerate((1, 37, 128, 300)):
++        g = torch.Generator(device=device).manual_seed(55 + i)
++        x = (_wide((R, gu.k), g, device, 3) * 0.3).to(torch.bfloat16)
++        if i == 3:
++            x[::7] *= 64                                 # some rows past the SwiGLU clip
++        ref = torch.empty((R, gu.n), dtype=torch.bfloat16, device=device)
++        shared.prefill_matmul(x, gu, f32=False, out=ref, tile=qmm.prefill_tile(gu.n, gu.k, R))
++        act0 = torch.empty((R, ni), dtype=torch.bfloat16, device=device)
++        xs = torch.empty((R, ni // 64), dtype=torch.float32, device=device)
++        glue.swiglu(ref, act0, xs, limit)
++        act1 = torch.full((R, ni), float("nan"), dtype=torch.bfloat16, device=device)
++        _ext().shared_gu(x, gu.weight, gu.scales, gu.biases, act1, ni, float(limit), shared_tile())
++        if not _same((act0, act1)):
++            return False
++    return True
++
++
++__all__ = ["CHECKED", "PARTS", "asks", "check_combine", "check_route", "check_shared", "code", "combine_rows",
++           "describe", "ffn", "lane_front", "moe_block", "on", "parse", "reset", "route", "shared_rows", "state",
++           "wanted"]

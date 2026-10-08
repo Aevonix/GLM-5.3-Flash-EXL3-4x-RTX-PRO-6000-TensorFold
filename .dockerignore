@@ -1,0 +1,8 @@
+**
+!scripts/
+!scripts/apply-patches.sh
+!patches/
+!patches/miaai-lab/
+!patches/miaai-lab/*.patch
+!patches/aevonix/
+!patches/aevonix/*.patch

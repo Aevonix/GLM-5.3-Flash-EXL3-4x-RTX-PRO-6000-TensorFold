@@ -1,0 +1,19 @@
+0025-glm-dflash2-ring: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: MiaAI-Lab's patch (GLM-5.3-Flash EXL3 recipe, Apache-2.0), first written for TensorFold 0.6.0.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: families/glm5_next/cuda/decode.py.
+
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 946e2d6..93ab4dc 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -324,7 +324,7 @@ def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
+     DFlash2's window rows."""
+     n = len(snap.ids)
+     views = _row_views(e.st, n, max(snap.mtp_len, 0))
+-    if drafter is not None and snap.drafter_end == n:
++    if drafter is not None and snap.drafter_end == n and not getattr(drafter, "ring", 0):   # a ring's: drafter_rows
+         views += _drafter_views(drafter, n)
+     return views
+ 

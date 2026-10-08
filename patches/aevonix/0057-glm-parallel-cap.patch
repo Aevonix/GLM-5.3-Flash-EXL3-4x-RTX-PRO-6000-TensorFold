@@ -1,0 +1,93 @@
+0057-glm-parallel-cap.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 2d29916..0f4c08f 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -304,8 +304,11 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+     return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
+ 
+ 
+-PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
+-MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
++from .segments import window_rows as _window_rows  # noqa: E402
++
++PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel)
++MULTI_WINDOW = _window_rows()         # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW;
++                                      # TF_GLM_MULTI_WINDOW, default 32)
+ 
+ 
+ def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
+@@ -462,6 +465,10 @@ class GlmEngine:
+         if not 1 <= parallel <= PARALLEL_MOST:
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+         self.parallel = parallel
++        if parallel > 4:                      # the segment tables and grids hold --parallel streams
++            from . import segments as seg_mod
++
++            seg_mod.MAX_SEGS = max(seg_mod.MAX_SEGS, parallel)
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+         self.comm = comm if comm is not None else open_comm(rank, world, master, port)
+@@ -619,7 +626,7 @@ class GlmEngine:
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv)]
++                                 KV_KINDS.index(kv), MULTI_WINDOW]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 34a23237..e376c3a 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -45,6 +45,7 @@ from tensorfold.cuda.streams import Stream, next_fill
+ from . import multi_prefill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
++from .segments import window_rows
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
+@@ -86,7 +87,7 @@ def _unwatch(seconds: float) -> None:
+ 
+ LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+-MAX_WINDOW = 32                          # rows of every stream's windows together in one round
++MAX_WINDOW = window_rows()               # rows of every stream's windows together in one round (TF_GLM_MULTI_WINDOW)
+ SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/segments.py tensorfold/families/glm5_next/cuda/segments.py
+index ae8b0d9..26b2cb3 100644
+--- tensorfold/families/glm5_next/cuda/segments.py
++++ tensorfold/families/glm5_next/cuda/segments.py
+@@ -15,10 +15,24 @@ import torch
+ 
+ from .sparse import POOL, SPARSE_FROM, TOKENS, split_scratch
+ 
+-MAX_SEGS = 4          # streams a window holds
++MAX_SEGS = 4          # streams a window holds (GlmEngine raises it to --parallel)
+ EXTENT = 2048         # a stream's extent starts at a multiple of this many tokens (its pooled keys at base / 4)
+ 
+ 
++def window_rows(value: str | None = None) -> int:
++    """TF_GLM_MULTI_WINDOW: rows of every stream's verify windows together in one --parallel
++    round (default 32, as before). 16 to 63: the decode buffers hold 64 rows (geometry.MLA_DECODE_ROWS) and a window
++    of 64 rows or more would take the routed experts' prompt kernels (exl3_mm.PROMPT_ROWS)."""
++
++    import os
++
++    value = (os.environ.get("TF_GLM_MULTI_WINDOW", "") if value is None else value).strip()
++    rows = 32 if value == "" else int(value) if value.isdecimal() else -1
++    if not 16 <= rows <= 63:
++        raise ValueError(f"TF_GLM_MULTI_WINDOW: 16 to 63 rows, not {value!r}")
++    return rows
++
++
+ class SegRows:
+     """Device tables of a window of up to ``rows`` rows in up to ``max_segs`` segments, one int32 tensor:
+ 

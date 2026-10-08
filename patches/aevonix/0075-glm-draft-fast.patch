@@ -1,0 +1,1315 @@
+diff --git tensorfold/families/glm5_next/cuda/dflash2_fast.py tensorfold/families/glm5_next/cuda/dflash2_fast.py
+new file mode 100644
+index 0000000..59589f5
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/dflash2_fast.py
+@@ -0,0 +1,1138 @@
++"""TF_GLM_DRAFT_FAST=propose|all: cheaper DFlash2 proposals for the multi-stream drafter (--parallel 2 or more).
++
++Drafts only propose. Every drafted token is verified by the target and kept only when it equals the target's own
++keyed sample at its position, so nothing here can change a reply: drafted equals serial, and a stream's reply equals
++its solo run, by construction. What this module changes is how much a draft costs and, slightly, which tokens get
++proposed (so acceptance, hence speed, can move a little either way). The one thing drafts must never do is differ
++between ranks: every rank verifies the window it drafted, so all ranks must propose the same tokens. Here every rank
++takes rank 0's chains (one small all-gather of the chosen tokens, confidences and depths inside the block graph), so
++the ranks agree by construction.
++
++``propose`` (X2, batched GPU propose): the block pass's layers run as today (``MultiDrafter._layer``), except that
++their two row-parallel projections a layer gather bf16 partials (TF_GLM_DRAFT_FAST_GATHER=bf16, the default: half the
++bytes of today's fp32 gathers, one kernel adding them in rank order; =fp32: today's sums, today's drafts); after them
++- the head's top-k, the candidates' packing and the selector projection run once for all streams (today: about nine
++  launches a stream: "torch.topk and cuBLAS may pick kernels by row count"; a stream's drafts may now depend on which
++  streams share its pass, never a reply);
++- the selector chain runs on the GPU, one program a stream (``_chain_kernel``): the candidates' merge over the ranks
++  (value descending, then id ascending), the selector edges succ . (pred x proj), the request's keyed Gumbel draws
++  (``exact_sampling.uniform_rows``' splitmix64), the pick, its plain and noise-aware confidences, and the stop rule
++  (fcN:P, fncN:P[:B], fcostN:noisy[:B] as ``Drafter.chain``; ``cut`` is the host twin); today numpy on the host,
++  about 0.1 ms a stream a round;
++- one pinned readback of every stream's tokens and depth (today: every rank's candidates and the projected rows).
++
++``all`` (X2 + D2, the fused pass), everything above plus:
++- each layer's two row-parallel projections (attention output, MLP down) produce bf16 partials
++  (TF_GLM_DRAFT_FAST_GATHER=bf16, the default: half the bytes of today's fp32 all-gathers; =fp32: today's sums), and ONE
++  kernel adds the gathered partials in rank order, rounds to bf16, applies the two-tap dynamic convolution and the
++  residual, and normalizes the result for the next projection with its 64-input group sums (the 4-bit matmul's input
++  sums); today a clone, three adds, a cast, the convolution, a norm and a group-sum pass;
++- the first convolution of each half writes its output's group sums (no group-sum launch);
++- q / k normalization and rotary in one kernel that writes keys and values straight into each stream's ring (no index
++  copies, no cos / sin kernels);
++- the block attention split over the context window (flash-decoding: TF_GLM_DRAFT_FAST_SPLITS pieces a block, merged
++  in piece order); today one program a KV head a stream walks ~33 key tiles;
++- a context update stacks the five layers' key / value projections into one 4-bit matmul and writes every layer's ring
++  in one kernel (today: five matmuls, five group-sum passes, five prep kernels, ten index copies, the rotary kernels).
++About 90 launches a block pass at any stream count (today about 180 for one stream plus about 9 a stream).
++
++Settings (every rank must agree: ``code`` joins the engine's startup comparison):
++  TF_GLM_DRAFT_FAST=0|propose|all     off (default) / X2 / X2 + D2 (1 = all)
++  TF_GLM_DRAFT_FAST_GATHER=bf16|fp32|reduce16|auto16  the rank sums: bf16 partials all-gathered and added in rank
++                                      order (default); fp32 (today's sums and drafts); reduce16: NCCL's bf16 all-reduce
++                                      (half an all-gather's bytes received); auto16: all-reduce from 256 KiB a rank
++  TF_GLM_DRAFT_FAST_BLOCK=8|auto|N    ``all``: block rows a stream: 8 (the drafter's block), auto (the drafts a stream
++                                      can verify in the window at this stream count, ``block_rows``), or 2..8
++  TF_GLM_DRAFT_FAST_AHEAD=0|1         the next round's block pass launched at the end of a round (``ahead``), so it
++                                      runs while the host emits, plans and sends the next round; ``propose`` takes its
++                                      results when asked for the same streams or a subset
++  TF_GLM_DRAFT_FAST_SPLITS=auto|N     ``all``: the block attention's window pieces (auto: by stream count, 1..16)
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from typing import Sequence
++
++import numpy as np
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.engine.exact_sampling import Sampling
++
++from . import glue, qmm
++from .dflash2 import EDGE, NOISE, NO_LIMIT, best_depth
++
++from triton.language.extra import libdevice
++
++# rotary cos / sin: libdevice's (accurate range reduction: phases reach 1e6 radians at a 1M context), or tl's under the
++# CPU interpreter (TRITON_INTERPRET=1, tests), which has no libdevice
++_LIBDEVICE = tl.constexpr(os.environ.get("TRITON_INTERPRET", "") != "1")
++
++GATHERS = ("bf16", "fp32", "reduce16", "auto16")
++REDUCE_MIN_BYTES = 256 << 10       # auto16: an all-reduce from this many bytes a rank (32 rows of 4,096), a gather below
++MAX_SPLITS = 16
++
++
++# -- settings -------------------------------------------------------------------------------------------------------------
++MODES = ("off", "propose", "all")
++
++
++@dataclass(frozen=True)
++class FastSettings:
++    mode: str = "off"
++    gather: str = "bf16"
++    splits: int = 0                  # 0: auto
++    block: int = 8                   # ``all``: block rows a stream (8: the drafter's block; 0: auto by stream count)
++    ahead: bool = False              # launch the next round's pass at the end of a round (``ahead``)
++
++    @property
++    def on(self) -> bool:
++        return self.mode != "off"
++
++    @property
++    def fused(self) -> bool:
++        return self.mode == "all"
++
++    def code(self) -> list[int]:
++        """What every rank must agree on (the gathers' sizes and the drafts depend on all of it)."""
++        return [MODES.index(self.mode), GATHERS.index(self.gather), int(self.splits), int(self.block), int(self.ahead)]
++
++    def describe(self) -> str:
++        if not self.on:
++            return "TF_GLM_DRAFT_FAST off"
++        what = ("the fused DFlash2 block pass (attention in " + ("auto" if not self.splits else str(self.splits))
++                + " window pieces, " + ("block rows by stream count" if self.block == 0 else f"{self.block}-row blocks")
++                + "), " if self.fused else "")
++        what += f"{self.gather} rank sums, " + ("next round's pass launched at a round's end, " if self.ahead else "")
++        return (f"TF_GLM_DRAFT_FAST={self.mode}: {what}one top-k and one GPU selector chain for every stream's draft, "
++                "every rank on rank 0's drafts (drafts only propose: replies unchanged)")
++
++
++def settings(env=None) -> FastSettings:
++    env = os.environ if env is None else env
++    raw = (env.get("TF_GLM_DRAFT_FAST", "") or "0").strip().lower()
++    mode = {"0": "off", "off": "off", "propose": "propose", "1": "all", "all": "all", "on": "all"}.get(raw)
++    if mode is None:
++        raise ValueError(f"TF_GLM_DRAFT_FAST: 0, propose or all (1), not {raw!r}")
++    gather = (env.get("TF_GLM_DRAFT_FAST_GATHER", "") or "bf16").strip().lower()
++    if gather not in GATHERS:
++        raise ValueError(f"TF_GLM_DRAFT_FAST_GATHER: bf16 or fp32, not {gather!r}")
++    sp = (env.get("TF_GLM_DRAFT_FAST_SPLITS", "") or "auto").strip().lower()
++    if sp == "auto":
++        splits = 0
++    elif sp.isdecimal() and 1 <= int(sp) <= MAX_SPLITS:
++        splits = int(sp)
++    else:
++        raise ValueError(f"TF_GLM_DRAFT_FAST_SPLITS: auto or 1 to {MAX_SPLITS}, not {sp!r}")
++    bl = (env.get("TF_GLM_DRAFT_FAST_BLOCK", "") or "8").strip().lower()
++    if bl == "auto":
++        block = 0
++    elif bl.isdecimal() and 2 <= int(bl) <= 8:
++        block = int(bl)
++    else:
++        raise ValueError(f"TF_GLM_DRAFT_FAST_BLOCK: auto or 2 to 8 rows, not {bl!r}")
++    ah = (env.get("TF_GLM_DRAFT_FAST_AHEAD", "") or "0").strip()
++    if ah not in ("0", "1"):
++        raise ValueError(f"TF_GLM_DRAFT_FAST_AHEAD: 0 or 1, not {ah!r}")
++    return FastSettings(mode, gather, splits, block, ah == "1")
++
++
++def code(env=None) -> list[int]:
++    try:
++        return settings(env).code()
++    except ValueError:
++        return [-1, -1, -1, -1, -1]      # refused on every rank together by the engine's comparison
++
++
++def block_rows(streams: int, window: int, block: int = 8, setting: int = 0) -> int:
++    """TF_GLM_DRAFT_FAST_BLOCK=auto: the rows of each stream's block when ``streams`` streams share a verify window of
++    ``window`` rows: a pending row and the drafts a stream can expect to verify (one past the even share of the
++    window's draft rows), at least one, at most the drafter's ``block - 1``. A fixed setting (2..8) as given."""
++
++    if setting:
++        return min(setting, block)
++    share = -(-max(window - streams, 0) // max(streams, 1))
++    return 1 + max(1, min(block - 1, share + 1))
++
++
++def all_reduce_bf16(comm, buf: torch.Tensor) -> None:
++    """``buf`` (bf16, contiguous) in place: its sum over the ranks, NCCL's all-reduce (one ring or tree result,
++    the same on every rank); a stand-in communicator's ``all_reduce`` (tests) instead when it has one."""
++
++    fn = getattr(comm, "all_reduce", None)
++    if fn is not None:
++        fn(buf)
++        return
++    import ctypes
++
++    nccl = getattr(comm, "nccl", comm)
++    lib = nccl.lib
++    f = lib.ncclAllReduce
++    if not getattr(f, "_df_bound", False):
++        f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
++                      ctypes.c_void_p]
++        f.restype = ctypes.c_int
++        f._df_bound = True
++    code = f(buf.data_ptr(), buf.data_ptr(), buf.numel(), 9, 0, nccl.comm, torch.cuda.current_stream().cuda_stream)
++    if code != 0:                                         # 9: ncclBfloat16, 0: ncclSum
++        raise RuntimeError(f"NCCL all-reduce error {code}: {lib.ncclGetErrorString(code).decode()}")
++
++
++def auto_splits(streams: int, kv_heads: int, sms: int = 188) -> int:
++    """Window pieces a block's attention runs in: enough programs to cover the SMs about twice, at most 16."""
++    want = max(1, (2 * sms) // max(1, kv_heads * streams))
++    s = 1
++    while s * 2 <= min(want, MAX_SPLITS):
++        s *= 2
++    return s
++
++
++# -- kernels ---------------------------------------------------------------------------------------------------------------
++@triton.jit
++def _cos_sin(ph):
++    if _LIBDEVICE:
++        c = libdevice.cos(ph)
++        s = libdevice.sin(ph)
++    else:
++        c = tl.cos(ph)
++        s = tl.sin(ph)
++    return c, s
++
++
++@triton.jit
++def _dconv_sums_kernel(X, DYN, BASE, OUT, XS, D: tl.constexpr, G: tl.constexpr, GS: tl.constexpr,
++                       BRANCH: tl.constexpr, BLOCK: tl.constexpr, SEG: tl.constexpr):
++    """``dflash2._dconv_kernel`` without a residual (row r mixes rows r and r - 1 of its block of SEG rows), and the
++    64-input group sums of the bf16 result (the 4-bit matmul's ``xs``)."""
++
++    row = tl.program_id(0)
++    cb = tl.program_id(1)
++    c = cb * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(X + row * D + c).to(tl.float32)
++    has_prev = row % SEG != 0
++    prev = tl.load(X + (row - 1) * D + c, mask=(c < D) & has_prev, other=0.0).to(tl.float32)
++    grp = c // GS
++    d0 = tl.load(DYN + ((row * 2 + BRANCH) * 2) * G + grp).to(tl.float32)
++    d1 = tl.load(DYN + ((row * 2 + BRANCH) * 2 + 1) * G + grp).to(tl.float32)
++    b0 = tl.load(BASE + (BRANCH * 2) * D + c).to(tl.float32)
++    b1 = tl.load(BASE + (BRANCH * 2 + 1) * D + c).to(tl.float32)
++    k0 = (b0 + d0).to(tl.bfloat16).to(tl.float32)
++    k1 = (b1 + d1).to(tl.bfloat16).to(tl.float32)
++    y = (x * k0 + prev * k1).to(tl.bfloat16)
++    tl.store(OUT + row * D + c, y)
++    s = tl.sum(tl.reshape(y.to(tl.float32), (BLOCK // 64, 64)), axis=1)
++    tl.store(XS + row * (D // 64) + cb * (BLOCK // 64) + tl.arange(0, BLOCK // 64), s)
++
++
++@triton.jit
++def _sum_dconv_norm_kernel(P, ROWS, DYN, BASE, RES, XOUT, NW, NOUT, NXS, eps, D: tl.constexpr, G: tl.constexpr,
++                           GS: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr, SEG: tl.constexpr,
++                           COMPACT: tl.constexpr, STORE_X: tl.constexpr):
++    """Row r of a row-parallel projection: the W ranks' partials P [W, ROWS, D] added in rank order (fp32), rounded to
++    bf16 (``Drafter._row``); the convolution's second branch over it (row r - 1 the same sum, none at a block's first
++    row) plus the residual RES (``dflash2._dconv_kernel`` with HAS_RES); then RMSNorm with NW (``glue._rmsnorm``) and
++    the normed row's 64-input group sums. COMPACT: the normed rows of each block but its first go to rows
++    (r // SEG) * (SEG - 1) + r % SEG - 1 (the head's rows), the first rows nowhere."""
++
++    row = tl.program_id(0)
++    c = tl.arange(0, BLOCK)
++    ok = c < D
++    s = tl.zeros((BLOCK,), tl.float32)
++    for w in tl.static_range(W):
++        s += tl.load(P + (w * ROWS + row) * D + c, mask=ok, other=0.0).to(tl.float32)
++    y = s.to(tl.bfloat16).to(tl.float32)
++    has_prev = row % SEG != 0
++    sp = tl.zeros((BLOCK,), tl.float32)
++    for w in tl.static_range(W):
++        sp += tl.load(P + (w * ROWS + row - 1) * D + c, mask=ok & has_prev, other=0.0).to(tl.float32)
++    yp = sp.to(tl.bfloat16).to(tl.float32)
++    grp = c // GS
++    d0 = tl.load(DYN + ((row * 2 + 1) * 2) * G + grp, mask=ok, other=0.0).to(tl.float32)
++    d1 = tl.load(DYN + ((row * 2 + 1) * 2 + 1) * G + grp, mask=ok, other=0.0).to(tl.float32)
++    b0 = tl.load(BASE + 2 * D + c, mask=ok, other=0.0).to(tl.float32)
++    b1 = tl.load(BASE + 3 * D + c, mask=ok, other=0.0).to(tl.float32)
++    k0 = (b0 + d0).to(tl.bfloat16).to(tl.float32)
++    k1 = (b1 + d1).to(tl.bfloat16).to(tl.float32)
++    z = (y * k0 + yp * k1).to(tl.bfloat16).to(tl.float32)
++    r = tl.load(RES + row * D + c, mask=ok, other=0.0).to(tl.float32)
++    x = (r + z).to(tl.bfloat16)
++    if STORE_X:
++        tl.store(XOUT + row * D + c, x, mask=ok)
++    xf = tl.where(ok, x.to(tl.float32), 0.0)
++    rinv = 1.0 / tl.sqrt(tl.sum(xf * xf, axis=0) / D + eps)
++    wn = tl.load(NW + c, mask=ok, other=0.0).to(tl.float32)
++    nrm = (wn * (xf * rinv).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    if COMPACT:
++        keep = row % SEG != 0
++        orow = (row // SEG) * (SEG - 1) + row % SEG - 1
++    else:
++        keep = row >= 0
++        orow = row
++    tl.store(NOUT + orow * D + c, nrm, mask=ok & keep)
++    g = tl.sum(tl.reshape(tl.where(ok, nrm.to(tl.float32), 0.0), (BLOCK // 64, 64)), axis=1)
++    gi = tl.arange(0, BLOCK // 64)
++    tl.store(NXS + orow * (D // 64) + gi, g, mask=(gi < D // 64) & keep)
++
++
++@triton.jit
++def _prep_ring_kernel(QKV, QN, KN, INVF, POS, SLOT, QO, KR, VR, R, stride, eps, SLOT_ROWS, CAP, RINGROWS,
++                      N: tl.constexpr, H: tl.constexpr, HKV: tl.constexpr, HALF: tl.constexpr, RING: tl.constexpr):
++    """``dflash2._prep_kernel`` for blocks of N rows side by side (block b at position POS[b] in slot SLOT[b]): q to
++    QO [H, R, 2 HALF]; normalized, rotated keys and the values straight into the ring KR / VR [HKV, SLOT_ROWS, 2 HALF]
++    at the row's slot row; cos / sin of the row's position computed here."""
++
++    row = tl.program_id(0)
++    head = tl.program_id(1)
++    seg = row // N
++    pos = tl.load(POS + seg) + row % N
++    if RING:
++        local = pos % RINGROWS
++    else:
++        local = pos
++    dest = tl.load(SLOT + seg) * CAP + local
++    d = tl.arange(0, HALF)
++    DH: tl.constexpr = 2 * HALF
++    src = QKV + row * stride + head * DH
++    if head < H + HKV:
++        a = tl.load(src + d).to(tl.float32)
++        b = tl.load(src + HALF + d).to(tl.float32)
++        rstd = tl.rsqrt((tl.sum(a * a, axis=0) + tl.sum(b * b, axis=0)) / DH + eps)
++        if head < H:
++            wa = tl.load(QN + d).to(tl.float32)
++            wb = tl.load(QN + HALF + d).to(tl.float32)
++        else:
++            wa = tl.load(KN + d).to(tl.float32)
++            wb = tl.load(KN + HALF + d).to(tl.float32)
++        a = (a * rstd * wa).to(tl.bfloat16).to(tl.float32)
++        b = (b * rstd * wb).to(tl.bfloat16).to(tl.float32)
++        ph = pos.to(tl.float32) * tl.load(INVF + d)
++        cos, sin = _cos_sin(ph)
++        ra = (a * cos - b * sin).to(tl.bfloat16)
++        rb = (b * cos + a * sin).to(tl.bfloat16)
++        if head < H:
++            dst = QO + (head * R + row) * DH
++        else:
++            dst = KR + ((head - H) * SLOT_ROWS + dest) * DH
++        tl.store(dst + d, ra)
++        tl.store(dst + HALF + d, rb)
++    else:
++        dst = VR + ((head - H - HKV) * SLOT_ROWS + dest) * DH
++        tl.store(dst + d, tl.load(src + d))
++        tl.store(dst + HALF + d, tl.load(src + HALF + d))
++
++
++@triton.jit
++def _ctx_prep_kernel(KV, KN, INVF, TPOS, TDEST, KP, VP, stride, eps, LAYER_STRIDE, SLOT_ROWS,
++                     HKV: tl.constexpr, HALF: tl.constexpr):
++    """A context update's keys and values for every layer at once: KV [T, layers x (HKV keys | HKV values) x 2 HALF]
++    (one stacked matmul); program (t, j): layer j // (2 HKV), head j % (2 HKV); keys normalized with the layer's k_norm
++    (KN [layers, 2 HALF]) and rotated at TPOS[t]; both into the layer's ring (KP / VP + layer x LAYER_STRIDE, each
++    [HKV, SLOT_ROWS, 2 HALF]) at row TDEST[t] (``dflash2_multi._taps_compute`` per layer, as ``_prep`` with no q)."""
++
++    t = tl.program_id(0)
++    j = tl.program_id(1)
++    layer = j // (2 * HKV)
++    h = j % (2 * HKV)
++    pos = tl.load(TPOS + t)
++    dest = tl.load(TDEST + t)
++    d = tl.arange(0, HALF)
++    DH: tl.constexpr = 2 * HALF
++    src = KV + t * stride + j * DH
++    if h < HKV:
++        a = tl.load(src + d).to(tl.float32)
++        b = tl.load(src + HALF + d).to(tl.float32)
++        rstd = tl.rsqrt((tl.sum(a * a, axis=0) + tl.sum(b * b, axis=0)) / DH + eps)
++        wa = tl.load(KN + layer * DH + d).to(tl.float32)
++        wb = tl.load(KN + layer * DH + HALF + d).to(tl.float32)
++        a = (a * rstd * wa).to(tl.bfloat16).to(tl.float32)
++        b = (b * rstd * wb).to(tl.bfloat16).to(tl.float32)
++        ph = pos.to(tl.float32) * tl.load(INVF + d)
++        cos, sin = _cos_sin(ph)
++        dst = KP + layer * LAYER_STRIDE + (h * SLOT_ROWS + dest) * DH
++        tl.store(dst + d, (a * cos - b * sin).to(tl.bfloat16))
++        tl.store(dst + HALF + d, (b * cos + a * sin).to(tl.bfloat16))
++    else:
++        dst = VP + layer * LAYER_STRIDE + ((h - HKV) * SLOT_ROWS + dest) * DH
++        tl.store(dst + d, tl.load(src + d))
++        tl.store(dst + HALF + d, tl.load(src + HALF + d))
++
++
++@triton.jit
++def _attn_part_kernel(Q, K, V, ML, ACC, POS, SLOT, window, scale, L, SLOT_ROWS, SPAN,
++                      N: tl.constexpr, G: tl.constexpr, HD: tl.constexpr, CAP: tl.constexpr, BK: tl.constexpr,
++                      CAUSAL: tl.constexpr, RING: tl.constexpr, NSPLIT: tl.constexpr, KVH: tl.constexpr,
++                      MP: tl.constexpr):
++    """Piece ``sp`` (program 2) of block ``seg``'s (program 1) attention for KV head program 0: the keys
++    lo + sp x SPAN .. of the window (lo: the first tile any of the block's queries can see), the masks and online
++    softmax of ``dflash2_multi._dattn_seg_kernel``; its running max, sum and unnormalized output to ML / ACC. The G x N
++    query rows sit in a tile of MP (a power of two, at least 16) rows; the padding rows are never stored."""
++
++    kvh = tl.program_id(0)
++    seg = tl.program_id(1)
++    sp = tl.program_id(2)
++    m = tl.arange(0, MP)
++    valid = m < G * N
++    mm = tl.where(valid, m, 0)
++    qh = kvh * G + mm // N
++    qr = mm % N
++    d = tl.arange(0, HD)
++    q = tl.load(Q + (qh[:, None] * L + seg * N + qr[:, None]) * HD + d[None, :], mask=valid[:, None], other=0.0)
++    s = tl.load(POS + seg).to(tl.int32)
++    base = kvh.to(tl.int64) * SLOT_ROWS + tl.load(SLOT + seg).to(tl.int64) * CAP
++    klen = s + N
++    qpos = s + qr
++    lo = tl.maximum(s - window, 0) // BK * BK
++    start = lo + sp * SPAN
++    end = tl.minimum(start + SPAN, klen)
++    m_i = tl.full([MP], -1e30, tl.float32)
++    l_i = tl.zeros([MP], tl.float32)
++    acc = tl.zeros([MP, HD], tl.float32)
++    for st in range(start, end, BK):
++        kk = st + tl.arange(0, BK)
++        kin = kk < end
++        if RING:
++            krow = kk % CAP
++        else:
++            krow = kk
++        k = tl.load(K + (base + krow[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        v = tl.load(V + (base + krow[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        sc = tl.dot(q, tl.trans(k)) * scale
++        ok = kin[None, :] & (((kk[None, :] < s) & (qpos[:, None] - kk[None, :] <= window)) | (kk[None, :] >= s))
++        if CAUSAL:
++            ok = ok & (kk[None, :] <= qpos[:, None])
++        sc = tl.where(ok, sc, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(sc, axis=1))
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(sc - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++        m_i = m_new
++    piece = (seg * KVH + kvh) * NSPLIT + sp
++    tl.store(ML + piece * 2 * MP + m, m_i)
++    tl.store(ML + piece * 2 * MP + MP + m, l_i)
++    tl.store(ACC + (piece * MP + m[:, None]) * HD + d[None, :], acc)
++
++
++@triton.jit
++def _attn_combine_kernel(ML, ACC, OUT, XS, N: tl.constexpr, G: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr,
++                         NSPLIT: tl.constexpr, KVH: tl.constexpr, MP: tl.constexpr):
++    """Block ``seg``'s output for KV head ``kvh``: the pieces' online-softmax states merged in piece order, bf16 into
++    OUT [rows, NH x HD]; and the 64-input group sums of those columns (the output projection's ``xs``)."""
++
++    kvh = tl.program_id(0)
++    seg = tl.program_id(1)
++    m = tl.arange(0, MP)
++    valid = m < G * N
++    d = tl.arange(0, HD)
++    first = (seg * KVH + kvh) * NSPLIT
++    mx = tl.full([MP], -1e30, tl.float32)
++    for sp in range(NSPLIT):                          # not unrolled: sixteen [MP, HD] fp32 tiles at once spill
++        mx = tl.maximum(mx, tl.load(ML + (first + sp) * 2 * MP + m))
++    l = tl.zeros([MP], tl.float32)
++    acc = tl.zeros([MP, HD], tl.float32)
++    for sp in range(NSPLIT):
++        f = tl.exp(tl.load(ML + (first + sp) * 2 * MP + m) - mx)
++        l += tl.load(ML + (first + sp) * 2 * MP + MP + m) * f
++        acc += tl.load(ACC + ((first + sp) * MP + m[:, None]) * HD + d[None, :]) * f[:, None]
++    out = (acc / tl.where(valid, l, 1.0)[:, None]).to(tl.bfloat16)
++    mm = tl.where(valid, m, 0)
++    qh = kvh * G + mm // N
++    qr = mm % N
++    row = seg * N + qr
++    tl.store(OUT + row[:, None] * (NH * HD) + qh[:, None] * HD + d[None, :], out, mask=valid[:, None])
++    gs = tl.sum(tl.reshape(out.to(tl.float32), (MP, HD // 64, 64)), axis=2)
++    gi = tl.arange(0, HD // 64)
++    tl.store(XS + row[:, None] * (NH * HD // 64) + qh[:, None] * (HD // 64) + gi[None, :], gs, mask=valid[:, None])
++
++
++@triton.jit
++def _rank_sum_kernel(P, OUT, total, W: tl.constexpr, BLOCK: tl.constexpr):
++    """OUT = bf16 of the W ranks' partials P [W, total] added in rank order in fp32 (``Drafter._row``'s sum)."""
++
++    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    ok = i < total
++    s = tl.zeros((BLOCK,), tl.float32)
++    for w in tl.static_range(W):
++        s += tl.load(P + w * total + i, mask=ok, other=0.0).to(tl.float32)
++    tl.store(OUT + i, s.to(tl.bfloat16), mask=ok)
++
++
++@triton.jit
++def _pack_kernel(VALS, IDX, OUT, offset, K: tl.constexpr, KP: tl.constexpr):
++    """Row r of the head's top-k: [K values (fp32) | K global ids as int32 bits] (the candidates' gather format)."""
++
++    r = tl.program_id(0)
++    k = tl.arange(0, KP)
++    ok = k < K
++    v = tl.load(VALS + r * K + k, mask=ok, other=0.0).to(tl.float32)
++    i = (tl.load(IDX + r * K + k, mask=ok, other=0) + offset).to(tl.int32)
++    tl.store(OUT + r * 2 * K + k, v, mask=ok)
++    tl.store(OUT + r * 2 * K + K + k, i.to(tl.float32, bitcast=True), mask=ok)
++
++
++@triton.jit
++def _mix(x):
++    x = x ^ (x >> 30)
++    x = x * 0xBF58476D1CE4E5B9
++    x = x ^ (x >> 27)
++    x = x * 0x94D049BB133111EB
++    return x ^ (x >> 31)
++
++
++# block meta: FIELDS rows of St int64 each (one upload a pass); the kernels read the same numbers as constexprs
++PENDING, SLOT, END, SEED, SAMPLED, TEMP, BETA, DEPTH, RULE, CONF, RMS = range(11)
++FIELDS = RMS + 8                     # round_ms: up to eight values (a round of k = 0..7 drafts)
++RULE_NONE, RULE_PLAIN, RULE_NOISY, RULE_COST = range(4)
++_PENDING, _END, _SEED, _SAMPLED, _TEMP, _BETA, _DEPTH, _RULE, _CONF, _RMS = (
++    tl.constexpr(v) for v in (PENDING, END, SEED, SAMPLED, TEMP, BETA, DEPTH, RULE, CONF, RMS))
++_RULE_PLAIN, _RULE_NOISY, _RULE_COST = tl.constexpr(RULE_PLAIN), tl.constexpr(RULE_NOISY), tl.constexpr(RULE_COST)
++
++
++@triton.jit
++def _chain_kernel(CAND, PROJ, PRED, SUCC, META, OUT, St, ROWS, edge_w, noise_w,
++                  W: tl.constexpr, K: tl.constexpr, WK: tl.constexpr, M: tl.constexpr, RK: tl.constexpr,
++                  MW: tl.constexpr):
++    """``Drafter.chain`` for stream ``s`` (program 0) on the GPU, every position of its block: the W ranks' top-K
++    candidates (CAND [W, ROWS, 2K]) merged by value descending then id ascending to the top K; each candidate's selector
++    edge succ[id] . (pred[prev] * proj[row]); score (value + EDGE x edge) / T; the pick argmax(score + NOISE x g), g the
++    request's keyed Gumbel draw (splitmix64 of seed, position, id: ``exact_sampling.uniform_rows``), first in merged
++    order on ties; its plain confidence softmax(score) and noise-aware one softmax((score + g) / beta)
++    (``dflash2.noisy_confidence``); then the stop rule over the first ``depth`` picks (``cut``): none; the product of
++    plain / noisy confidences holding CONF (the first pick always kept); or ``best_depth`` on the round_ms row.
++    META [FIELDS, St] int64 (see the field names). OUT [S, 3 MW + 1] (MW >= M: the drafter's block - 1): per pick
++    token (int32 bits), plain, noisy; then the number of picks to propose (int32 bits), at most M (the pass's
++    positions a block)."""
++
++    s = tl.program_id(0)
++    prev = tl.load(META + _PENDING * St + s).to(tl.int64)
++    first = tl.load(META + _END * St + s) + 1
++    seed = tl.load(META + _SEED * St + s).to(tl.uint64)
++    sampled = tl.load(META + _SAMPLED * St + s) != 0
++    temp = tl.load(META + _TEMP * St + s).to(tl.float64, bitcast=True)
++    beta = tl.load(META + _BETA * St + s).to(tl.float64, bitcast=True)
++    beta = tl.where(beta > 0, beta, 1.0)
++    depth = tl.minimum(tl.load(META + _DEPTH * St + s).to(tl.int32), M)
++    rule = tl.load(META + _RULE * St + s).to(tl.int32)
++    conf = tl.load(META + _CONF * St + s).to(tl.float64, bitcast=True)
++    c = tl.arange(0, WK)
++    valid = c < W * K
++    wr = c // K
++    kk = c % K
++    r_ = tl.arange(0, RK)
++    h0 = _mix(seed + 0x9E3779B97F4A7C15)
++    count = depth
++    stopped = depth * 0
++    chain = tl.full((), 1.0, tl.float64)
++    alive = tl.full((), 1.0, tl.float64)
++    expect = tl.full((), 1.0, tl.float64)
++    best_ratio = expect / tl.load(META + _RMS * St + s).to(tl.float64, bitcast=True)
++    best_k = depth * 0
++    jj = tl.arange(0, K)
++    for d in tl.static_range(M):
++        row = s * M + d
++        base = (wr * ROWS + row) * (2 * K)
++        v = tl.load(CAND + base + kk, mask=valid, other=float("-inf"))
++        tid = tl.load(CAND + base + K + kk, mask=valid, other=0.0).to(tl.int32, bitcast=True)
++        # rank in (value descending, id ascending) among the valid candidates (ids differ across ranks); the top K in
++        # that order (``merge_candidates``), one row each
++        beats = (v[None, :] > v[:, None]) | ((v[None, :] == v[:, None]) & (tid[None, :] < tid[:, None]))
++        beats = beats & valid[None, :]
++        rank = tl.sum(beats.to(tl.int32), axis=1)
++        onehot = (rank[None, :] == jj[:, None]) & valid[None, :]
++        cv = tl.sum(tl.where(onehot, v[None, :], 0.0), axis=1)
++        ct = tl.sum(tl.where(onehot, tid[None, :], 0), axis=1)
++        pp = tl.load(PRED + prev * RK + r_).to(tl.float32) * tl.load(PROJ + row * RK + r_).to(tl.float32)
++        sc = tl.load(SUCC + ct.to(tl.int64)[:, None] * RK + r_[None, :])
++        edge = tl.sum(sc.to(tl.float32) * pp[None, :], axis=1)
++        score = (cv.to(tl.float64) + edge_w * edge.to(tl.float64)) / temp
++        x = _mix(h0 ^ ((first + d).to(tl.uint64) * 0xD1B54A32D192ED03))
++        x = _mix(x ^ ct.to(tl.uint64))
++        u = (x >> 11).to(tl.float64) * 1.1102230246251565e-16 + 5.551115123125783e-17
++        g = -tl.log(-tl.log(u))
++        g = tl.where(sampled, g, 0.0)
++        pick = score + noise_w * g
++        best = tl.max(pick, axis=0)
++        j = tl.min(tl.where(pick == best, jj, K), axis=0)           # the first maximum in merged order
++        sel = jj == j
++        tok = tl.sum(tl.where(sel, ct, 0), axis=0)
++        sm = tl.max(score, axis=0)
++        pe = tl.exp(score - sm)
++        plain = tl.sum(tl.where(sel, pe, 0.0), axis=0) / tl.sum(pe, axis=0)
++        z = (score + g) / beta
++        pz = tl.exp(z - tl.max(z, axis=0))
++        noisy = tl.sum(tl.where(sel, pz, 0.0), axis=0) / tl.sum(pz, axis=0)
++        o = OUT + s * (3 * MW + 1) + d * 3
++        tl.store(o, tok.to(tl.float32, bitcast=True))
++        tl.store(o + 1, plain.to(tl.float32))
++        tl.store(o + 2, noisy.to(tl.float32))
++        prev = tok.to(tl.int64)
++        # the stop rules over the picks so far (``cut``)
++        live = d < depth
++        chain = chain * tl.where(rule == _RULE_PLAIN, plain, noisy)
++        if d > 0:
++            hit = live & (chain < conf) & (stopped == 0) & ((rule == _RULE_PLAIN) | (rule == _RULE_NOISY))
++            count = tl.where(hit, d, count)
++            stopped = tl.where(hit, 1, stopped)
++        alive = alive * noisy
++        expect = expect + alive
++        ratio = expect / tl.load(META + (_RMS + d + 1) * St + s).to(tl.float64, bitcast=True)
++        better = live & (ratio > best_ratio)
++        best_k = tl.where(better, d + 1, best_k)
++        best_ratio = tl.where(better, ratio, best_ratio)
++    count = tl.where(rule == _RULE_COST, best_k, count)
++    tl.store(OUT + s * (3 * MW + 1) + 3 * MW, count.to(tl.float32, bitcast=True))
++
++
++# -- launch helpers --------------------------------------------------------------------------------------------------------
++def dconv_sums(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int, gs: int, seg: int):
++    rows, D = x.shape
++    out = torch.empty_like(x)
++    xs = torch.empty((rows, D // 64), dtype=torch.float32, device=x.device)
++    block = min(1024, D)
++    if D % block or block % 64:
++        raise ValueError(f"dconv_sums: width {D}")
++    _dconv_sums_kernel[(rows, D // block)](x, dyn, base, out, xs, D=D, G=D // gs, GS=gs, BRANCH=branch, BLOCK=block,
++                                           SEG=seg, num_warps=4)
++    return out, xs
++
++
++def sum_dconv_norm(parts: torch.Tensor, rows: int, dyn: torch.Tensor, base: torch.Tensor, res: torch.Tensor,
++                   weight: torch.Tensor, eps: float, gs: int, seg: int, *, compact: bool = False):
++    """(new residual or None, normed rows, their group sums) after a row-parallel projection (``parts`` [W, rows, D])."""
++
++    W = parts.shape[0]
++    D = res.shape[1]
++    block = triton.next_power_of_2(D)
++    out_rows = rows // seg * (seg - 1) if compact else rows
++    x = None if compact else torch.empty_like(res)
++    nrm = torch.empty((out_rows, D), dtype=torch.bfloat16, device=res.device)
++    nxs = torch.empty((out_rows, D // 64), dtype=torch.float32, device=res.device)
++    _sum_dconv_norm_kernel[(rows,)](parts, rows, dyn, base, res, x if x is not None else res, weight, nrm, nxs, eps,
++                                    D=D, G=D // gs, GS=gs, W=W, BLOCK=block, SEG=seg, COMPACT=compact,
++                                    STORE_X=not compact, num_warps=8 if block <= 4096 else 16)
++    return x, nrm, nxs
++
++
++# -- the drafter --------------------------------------------------------------------------------------------------------
++def cut(tokens: Sequence[int], plain: Sequence[float], noisy: Sequence[float], depth: int, confidence: float,
++        beta: float, round_ms) -> list[int]:
++    """Where ``Drafter.chain`` stops a chain whose picks are ``tokens`` (the same picks at every depth): the first
++    ``depth``; with ``beta`` > 0 by the noise-aware confidences (cut at ``best_depth`` with ``round_ms``, else where
++    their product falls under ``confidence``, the first always kept); else by the plain ones when ``confidence`` > 0."""
++
++    tokens = [int(t) for t in tokens[:depth]]
++    if beta > 0:
++        if round_ms is not None:
++            return tokens[:best_depth([float(c) for c in noisy[:depth]], round_ms)]
++        conf = noisy
++    elif confidence > 0:
++        conf = plain
++    else:
++        return tokens
++    chain = 1.0
++    for d in range(len(tokens)):
++        chain *= float(conf[d])
++        if d > 0 and chain < confidence:
++            return tokens[:d]
++    return tokens
++
++
++def _f64_bits(x: float) -> int:
++    return int(np.array([x], dtype=np.float64).view(np.int64)[0])
++
++
++def rule_of(confidence: float, beta: float, round_ms) -> int:
++    """The stop rule ``Drafter.chain`` applies for these request fields (``cut``)."""
++
++    if beta > 0:
++        return RULE_COST if round_ms is not None else RULE_NOISY
++    return RULE_PLAIN if confidence > 0 else RULE_NONE
++
++
++def make_fast(base_cls):
++    """The fast drafter as a subclass of ``dflash2_multi.MultiDrafter`` (passed in, so this module imports cleanly
++    on its own)."""
++
++    class FastMultiDrafter(base_cls):
++        """``MultiDrafter`` with one top-k and a GPU selector chain for every stream (``propose``), and with the
++        fused block pass and the stacked context update (``all``). The same API (contexts, propose, commit, capture,
++        candidates). Its rings are one tensor a K / V [layers, KV heads, rows, head_dim]; the contexts see per-layer
++        views, as before."""
++
++        def __init__(self, drafter, streams: int = 4, *, tap_rows: int | None = None,
++                     fast: FastSettings | None = None, window: int = 63) -> None:
++            """``window``: the batched verify window's rows (``multi.MAX_WINDOW``), which TF_GLM_DRAFT_FAST_BLOCK=auto
++            sizes the blocks by."""
++
++            self.fast = fast if fast is not None else settings()
++            if not self.fast.on:
++                raise ValueError("FastMultiDrafter: TF_GLM_DRAFT_FAST is off")
++            super().__init__(drafter, streams, tap_rows=tap_rows)
++            self.window_rows = int(window)
++            self.ids_by_rows: dict[int, torch.Tensor] = {}
++            d = self.d
++            dev = self.dev
++            St, m = self.streams, self.block - 1
++            # the five layers' key / value rows in one 4-bit matrix, row for row the per-layer copies' groups
++            self.kv_all = qmm.stack_q4([qmm.to_mlx(L.kv) for L in d.layers]) if self.fast.fused else None
++            self.k_norms = torch.stack([L.k_norm for L in d.layers]).contiguous()
++            # the selector's codebooks on the GPU (bf16, as stored; the engine's estimate counts them at fp32)
++            self.pred_dev = torch.from_numpy(d.pred).to(dev, torch.bfloat16).contiguous()
++            self.succ_dev = torch.from_numpy(d.succ).to(dev, torch.bfloat16).contiguous()
++            pinned = torch.cuda.is_available()
++            self.f_meta = torch.zeros((FIELDS * St,), dtype=torch.int64, device=dev)
++            self.f_host = torch.zeros((FIELDS * St,), dtype=torch.int64, pin_memory=pinned)
++            self.f_np = self.f_host.numpy()                           # filled in place, one upload a pass
++            self.f_ready = torch.cuda.Event() if pinned else None
++            self.b_meta = self.f_meta[:3 * St]                        # the base layers read pending, slot, end here
++            self.out_w = 3 * m + 1                                    # a stream's chain output (``_chain_kernel``)
++            self.t_np = [self.t_host.numpy()] + ([t.numpy() for t, _ in self.t_ring] if self.t_ring else [])
++            self.chain_out = torch.zeros((St * self.out_w,), dtype=torch.float32, device=dev)
++            self.agreed = torch.zeros((d.gathered * St * self.out_w,), dtype=torch.float32, device=dev)
++            self.agreed_host = torch.zeros((St * self.out_w,), dtype=torch.float32, pin_memory=pinned)
++            self.agreed_ready = torch.cuda.Event() if pinned else None
++            self.proj_buf = torch.zeros((St * m, d.hproj.shape[0]), dtype=torch.bfloat16, device=dev)
++            self._ahead = None                       # (keys of the launched streams, S) of a pass launched ahead
++            self.ahead_stats = {"launched": 0, "used": 0, "missed": 0, "paused": 0}
++            self._recent: list[bool] = []            # the last ahead launches' outcomes (used or not)
++            self._pause = 0                          # rounds to skip launching ahead after a run of misses
++
++        # the rings: one stacked tensor a K / V, per-layer views (dflash2_multi's pool hook)
++        def _pools(self, layers: int, kv: int, rows: int, hd: int):
++            self.kpool = torch.zeros((layers, kv, rows, hd), dtype=torch.bfloat16, device=self.dev)
++            self.vpool = torch.zeros((layers, kv, rows, hd), dtype=torch.bfloat16, device=self.dev)
++            return [self.kpool[i] for i in range(layers)], [self.vpool[i] for i in range(layers)]
++
++        def _reduce(self, rows: int) -> bool:
++            """Whether a rank sum of ``rows`` rows goes through the bf16 all-reduce (reduce16, or auto16 from
++            REDUCE_MIN_BYTES a rank): a function of the shape alone, so every rank decides alike."""
++
++            g = self.fast.gather
++            return self.d.gathered > 1 and (g == "reduce16" or (g == "auto16" and rows * self.d.D * 2 >= REDUCE_MIN_BYTES))
++
++        def _gather(self, part: torch.Tensor) -> torch.Tensor:
++            """[W, rows, D] of every rank's partial (W = 1: this rank's alone, or the all-reduced sum)."""
++
++            d = self.d
++            if d.gathered == 1:
++                return part.unsqueeze(0)
++            if self._reduce(part.shape[0]):
++                all_reduce_bf16(d.w.comm, part)
++                return part.unsqueeze(0)
++            got = torch.empty((d.gathered,) + tuple(part.shape), dtype=part.dtype, device=part.device)
++            d.w.comm.all_gather(part.reshape(-1), got.view(-1))
++            return got
++
++        def _project_rows(self, x: torch.Tensor, q, xs: torch.Tensor | None = None) -> torch.Tensor:
++            """``propose``'s row-parallel projections: bf16 partials, then their sum in rank order (an all-gather and
++            one kernel) or NCCL's bf16 all-reduce (reduce16 / auto16); TF_GLM_DRAFT_FAST_GATHER=fp32 (or one rank):
++            today's ``Drafter._row``."""
++
++            d = self.d
++            if self.fast.gather == "fp32" or d.gathered == 1:
++                return d._row(x, q, xs)
++            got = self._gather(qmm.matmul(x.contiguous(), q, xs))
++            if got.shape[0] == 1:
++                return got[0]
++            out = torch.empty(got.shape[1:], dtype=torch.bfloat16, device=self.dev)
++            total = out.numel()
++            _rank_sum_kernel[(triton.cdiv(total, 1024),)](got, out, total, W=got.shape[0], BLOCK=1024, num_warps=4)
++            return out
++
++        def _splits(self, S: int) -> int:
++            return self.fast.splits or auto_splits(S, self.d.kvh)
++
++        def _attention(self, i: int, q: torch.Tensor, S: int, n: int, pos: torch.Tensor, slot: torch.Tensor):
++            d = self.d
++            G, HD, KVH = d.heads // d.kvh, d.hd, d.kvh
++            MP = max(16, triton.next_power_of_2(G * n))
++            ns = self._splits(S)
++            tiles = -(-(d.window + n + 64) // 64) + 1                # key tiles a block's window can span
++            span = -(-tiles // ns) * 64
++            ml = torch.empty((S * KVH * ns * 2 * MP,), dtype=torch.float32, device=self.dev)
++            acc = torch.empty((S * KVH * ns * MP * HD,), dtype=torch.float32, device=self.dev)
++            _attn_part_kernel[(KVH, S, ns)](q, self.kc[i], self.vc[i], ml, acc, pos, slot, d.window, HD ** -0.5,
++                                            S * n, self.slot_rows, span, N=n, G=G, HD=HD, CAP=self.cap, BK=64,
++                                            CAUSAL=d.causal, RING=bool(d.ring), NSPLIT=ns, KVH=KVH, MP=MP, num_warps=4)
++            out = torch.empty((S * n, d.heads * HD), dtype=torch.bfloat16, device=self.dev)
++            xs = torch.empty((S * n, d.heads * HD // 64), dtype=torch.float32, device=self.dev)
++            _attn_combine_kernel[(KVH, S)](ml, acc, out, xs, N=n, G=G, NH=d.heads, HD=HD, NSPLIT=ns, KVH=KVH, MP=MP,
++                                           num_warps=4)
++            return out, xs
++
++        def rows_for(self, S: int) -> int:
++            """The block rows a stream of a pass of S streams (``all``; ``propose`` keeps the drafter's block)."""
++
++            if not self.fast.fused or self.fast.block == 8:
++                return self.block
++            return block_rows(S, self.window_rows, self.block, self.fast.block)
++
++        def _prep_block(self, qkv: torch.Tensor, L, i: int, n: int, pos: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
++            d = self.d
++            R = qkv.shape[0]
++            q = torch.empty((d.heads, R, d.hd), dtype=torch.bfloat16, device=self.dev)
++            _prep_ring_kernel[(R, d.heads + 2 * d.kvh)](qkv, L.q_norm, L.k_norm, d.inv_freq, pos, slot, q,
++                                                         self.kc[i], self.vc[i], R, qkv.stride(0), d.eps,
++                                                         self.slot_rows, self.cap, d.ring or 1, N=n,
++                                                         H=d.heads, HKV=d.kvh, HALF=d.hd // 2, RING=bool(d.ring),
++                                                         num_warps=1)
++            return q
++
++        def _fused_layers(self, S: int, n: int, pend, slot, pos):
++            """``all``: blocks of n rows through every layer with the fused kernels; the final norm's rows 1.. of each
++            block (the head's rows) and their group sums."""
++
++            d, w = self.d, self.d.w
++            St = self.streams
++            f32 = self.fast.gather == "fp32"
++            ids = self.ids_by_rows.get(n)
++            if ids is None:
++                ids = self.ids_by_rows[n] = torch.full((St * n,), d.mask_id, dtype=torch.int32, device=self.dev)
++            ids.view(St, n)[:S, 0].copy_(pend)
++            R = S * n
++            x = torch.empty((R, d.D), dtype=torch.bfloat16, device=self.dev)
++            glue.embed(ids[:R], w.embed, d.D, 1, x)
++            normed, xs = d._norm(x, d.layers[0].in_norm)
++            last = len(d.layers) - 1
++            for i, L in enumerate(d.layers):
++                dyn = qmm.matmul(normed, L.a_kp, xs)
++                c, cs = dconv_sums(normed, dyn, L.a_base, 0, d.gs, n)
++                q = self._prep_block(qmm.matmul(c, L.qkv, cs), L, i, n, pos, slot)
++                out, os_ = self._attention(i, q, S, n, pos, slot)
++                parts = self._gather(qmm.matmul(out, L.o, os_, f32=f32))
++                x, normed, xs = sum_dconv_norm(parts, R, dyn, L.a_base, x, L.post_norm, d.eps, d.gs, n)
++                dyn = qmm.matmul(normed, L.m_kp, xs)
++                c, cs = dconv_sums(normed, dyn, L.m_base, 0, d.gs, n)
++                gu = qmm.matmul(c, L.gu, cs)
++                act = torch.empty((R, d.inter), dtype=torch.bfloat16, device=self.dev)
++                axs = torch.empty((R, d.inter // 64), dtype=torch.float32, device=self.dev)
++                glue.swiglu(gu, act, axs, NO_LIMIT)
++                parts = self._gather(qmm.matmul(act, L.down, axs, f32=f32))
++                nxt = d.norm if i == last else d.layers[i + 1].in_norm
++                x, normed, xs = sum_dconv_norm(parts, R, dyn, L.m_base, x, nxt, d.eps, d.gs, n, compact=i == last)
++            return normed, xs
++
++        def _base_layers(self, S: int, n: int, pend, slot, pos):
++            """``propose``: the block rows through ``MultiDrafter._layer`` as today; the final norm's head rows."""
++
++            d, w = self.d, self.d.w
++            St, m = self.streams, self.block - 1
++            n = self.block
++            self.ids.view(St, n)[:S, 0].copy_(pend)
++            rowpos = (pos[:, None] + self.ar[:n][None, :]).reshape(-1)
++            idx = (slot[:, None] * self.cap + self._local(rowpos).view(S, n)).reshape(-1)
++            R = S * n
++            x = torch.empty((R, d.D), dtype=torch.bfloat16, device=self.dev)
++            glue.embed(self.ids[:R], w.embed, d.D, 1, x)
++            cos, sin = self._rotary(rowpos)
++            for i in range(len(d.layers)):
++                x = self._layer(i, x, cos, sin, idx, S, pos, slot)
++            return d._norm(x.view(S, n, d.D)[:, 1:].reshape(S * m, d.D), d.norm)
++
++        def _block_compute(self, S: int, n: int | None = None) -> None:
++            """S streams' block passes (n rows a block, default ``rows_for(S)``), then the head's candidates for every
++            stream at once, their gather, the selector chains on the GPU, and every rank's agreement on rank 0's."""
++
++            d, w = self.d, self.d.w
++            n = self.rows_for(S) if n is None else n
++            St, m, K = self.streams, n - 1, d.top_k
++            meta = self.f_meta
++            pend, slot, pos = meta[PENDING * St:PENDING * St + S], meta[SLOT * St:SLOT * St + S], \
++                meta[END * St:END * St + S]
++            h, hs = (self._fused_layers if self.fast.fused else self._base_layers)(S, n, pend, slot, pos)
++            logits = qmm.matmul(h, w.draft_head if w.draft_head is not None else w.head, hs)
++            vals, local = torch.topk(logits, K, dim=-1, sorted=False)
++            size = d.gathered * S * m * 2 * K
++            send = torch.empty((S * m, 2 * K), dtype=torch.float32, device=self.dev)
++            _pack_kernel[(S * m,)](vals, local, send, int(w.vocab_offset), K=K, KP=triton.next_power_of_2(K),
++                                   num_warps=1)
++            torch.mm(h, d.hproj.t(), out=self.proj_buf[:S * m])
++            if d.gathered > 1:
++                w.comm.all_gather(send.view(-1), self.cand[:size])
++            else:
++                self.cand[:size].copy_(send.view(-1))
++            wk = triton.next_power_of_2(d.gathered * K)
++            _chain_kernel[(S,)](self.cand, self.proj_buf, self.pred_dev, self.succ_dev, meta, self.chain_out, St,
++                                S * m, EDGE, NOISE, W=d.gathered, K=K, WK=wk, M=m, RK=d.hproj.shape[0],
++                                MW=self.block - 1, num_warps=8)
++            got = S * self.out_w
++            if d.gathered > 1:                                       # every rank takes rank 0's chains
++                w.comm.all_gather(self.chain_out[:got], self.agreed[:d.gathered * got])
++            else:
++                self.agreed[:got].copy_(self.chain_out[:got])
++
++        def _taps_compute(self, T: int) -> None:
++            """``all``: context updates of T stacked rows (``MultiDrafter._taps_compute``) as fc, norm, ONE key /
++            value matmul for every layer and one kernel writing every layer's ring; then each updated stream's
++            device end. ``propose``: as today."""
++
++            if not self.fast.fused:
++                return super()._taps_compute(T)
++            d, St, Tm = self.d, self.streams, self.t_max
++            tpos, tdest = self.t_meta[:T], self.t_meta[Tm:Tm + T]
++            ctx = torch.empty((T, d.D), dtype=torch.bfloat16, device=self.dev)
++            cxs = torch.empty((T, d.D // 64), dtype=torch.float32, device=self.dev)
++            glue.rmsnorm(qmm.matmul(self.tap_in[:T], d.fc), d.hidden_norm, d.eps, ctx, cxs)
++            kv = qmm.matmul(ctx, self.kv_all, cxs)
++            layers = len(d.layers)
++            _ctx_prep_kernel[(T, layers * 2 * d.kvh)](kv, self.k_norms, d.inv_freq, tpos, tdest, self.kpool, self.vpool,
++                                                      kv.stride(0), d.eps, self.kpool.stride(0), self.slot_rows,
++                                                      HKV=d.kvh, HALF=d.hd // 2, num_warps=1)
++            self.pos.index_copy_(0, self.t_meta[2 * Tm:2 * Tm + St], self.t_meta[2 * Tm + St:2 * Tm + 2 * St])
++
++        def _launch_taps(self, pieces) -> None:
++            """``MultiDrafter._launch_taps`` with one copy kernel for every stream's rows and the tables filled by numpy
++            in the pinned buffer (today: a copy kernel and about eight host tensor ops a stream)."""
++
++            St, Tm = self.streams, self.t_max
++            if self.t_ring is not None:                      # TF_GLM_DRAFT_PROMPT_SKIP: the ring's next table
++                idx = self.t_next
++                h, ready = self.t_ring[idx]
++                hn = self.t_np[1 + idx]
++                self.t_next = (self.t_next + 1) % len(self.t_ring)
++                if ready is not None:
++                    ready.synchronize()
++            else:
++                if self.t_ready is not None:
++                    self.t_ready.synchronize()
++                h, ready, hn = self.t_host, self.t_ready, self.t_np[0]
++            k = len(pieces)
++            rows = np.fromiter((part.shape[0] for _, part, _ in pieces), dtype=np.int64, count=k)
++            starts = np.fromiter((p0 for _, _, p0 in pieces), dtype=np.int64, count=k)
++            slots = np.fromiter((c.slot for c, _, _ in pieces), dtype=np.int64, count=k)
++            off = int(rows.sum())
++            which = np.repeat(np.arange(k), rows)
++            pos = starts[which] + (np.arange(off) - np.repeat(np.cumsum(rows) - rows, rows))
++            hn[:off] = pos
++            hn[Tm:Tm + off] = slots[which] * self.cap + (pos % self.d.ring if self.d.ring else pos)
++            hn[2 * Tm:2 * Tm + St] = St
++            hn[2 * Tm + St:] = 0
++            hn[2 * Tm:2 * Tm + k] = slots
++            hn[2 * Tm + St:2 * Tm + St + k] = starts + rows
++            if k == 1:
++                self.tap_in[:off].copy_(pieces[0][1])
++            else:
++                torch.cat([part for _, part, _ in pieces], dim=0, out=self.tap_in[:off])
++            T, g = off, None
++            if self.tap_graphs:
++                T = next(b for b in self.buckets if b >= off)
++                g = self.tap_graphs[T]
++            if T > off:                                      # padded rows: the trash
++                hn[off:T] = 0
++                hn[Tm + off:Tm + T] = St * self.cap + np.arange(off, T)
++            self.t_meta.copy_(h, non_blocking=True)
++            if ready is not None:
++                ready.record()
++            if g is not None:
++                g.replay()
++            else:
++                self._taps_compute(T)
++            for c, part, p0 in pieces:
++                c.context_end = p0 + part.shape[0]
++
++        def _trash_tables(self) -> None:
++            super()._trash_tables()                  # slot St (the trash rows) for pending / slot / end (b_meta)
++            St = self.streams
++            self.f_meta[SEED * St:].zero_()
++            self.f_meta[TEMP * St:(TEMP + 1) * St].fill_(_f64_bits(1.0))
++            self.f_meta[BETA * St:(BETA + 1) * St].fill_(_f64_bits(1.0))
++            self.f_meta[RMS * St:].fill_(_f64_bits(1.0))
++
++        def _upload(self, reqs) -> int:
++            """The block meta of ``reqs`` [(ctx, pending, depth, sampling, confidence, beta, round_ms)] (one pinned
++            upload; the previous one has left the pinned table first)."""
++
++            St, k, m = self.streams, len(reqs), self.block - 1
++            if self.f_ready is not None:
++                self.f_ready.synchronize()
++            h = self.f_np
++
++            def put(field: int, values) -> None:
++                h[field * St:field * St + k] = values
++
++            sampled = [r[3] is not None and r[3].temperature > 0 for r in reqs]
++            put(PENDING, [int(r[1]) for r in reqs])
++            put(SLOT, [r[0].slot for r in reqs])
++            put(END, [r[0].context_end for r in reqs])
++            put(SEED, np.array([int(r[3].seed) & 0xFFFFFFFFFFFFFFFF if on else 0 for r, on in zip(reqs, sampled)],
++                               dtype=np.uint64).view(np.int64))
++            put(SAMPLED, sampled)
++            put(TEMP, np.array([float(r[3].temperature) if on else 1.0 for r, on in zip(reqs, sampled)],
++                               dtype=np.float64).view(np.int64))
++            put(BETA, np.array([float(r[5]) if r[5] > 0 else 1.0 for r in reqs], dtype=np.float64).view(np.int64))
++            put(DEPTH, [min(int(r[2]), m) for r in reqs])
++            put(RULE, [rule_of(r[4], r[5], r[6]) for r in reqs])
++            put(CONF, np.array([float(r[4]) for r in reqs], dtype=np.float64).view(np.int64))
++            rms = np.full((8, k), 1e30, dtype=np.float64)
++            for j, r in enumerate(reqs):
++                if r[6] is not None:
++                    vals = [float(v) for v in r[6][:8]]
++                    rms[:len(vals), j] = vals
++            for i in range(8):
++                put(RMS + i, rms[i].view(np.int64))
++            self.f_meta.copy_(self.f_host, non_blocking=True)
++            if self.f_ready is not None:
++                self.f_ready.record()
++            return k
++
++        def _run(self, S: int) -> None:
++            g = self.block_graphs.get(S)
++            if g is not None:
++                g.replay()
++            else:
++                self._block_compute(S)
++
++        @torch.no_grad()
++        def candidates(self, reqs: Sequence[tuple]) -> list[tuple[np.ndarray, ...]]:
++            """``MultiDrafter.candidates`` (TF_GLM_MULTI_DEPTH=joint, tests): the gathered candidates and projected
++            rows back on the host for ``Drafter.chain``."""
++
++            S, St = len(reqs), self.streams
++            if not 1 <= S <= St:
++                raise ValueError(f"a block pass takes 1..{St} streams, got {S}")
++            if len({c.slot for c, _, _ in reqs}) != S or any(c.owner is not self for c, _, _ in reqs):
++                raise ValueError("a block pass takes each of this drafter's streams at most once")
++            self._ahead = None
++            self._upload([(c, p, dp, None, 0.0, 0.0, None) for c, p, dp in reqs])
++            if self.rows_for(S) == self.block:
++                self._run(S)
++            else:                                                     # the full block, eagerly (joint mode, tests)
++                self._block_compute(S, self.block)
++            d = self.d
++            m, k = self.block - 1, d.top_k
++            self.proj[:S * m].copy_(self.proj_buf[:S * m].float())
++            if self.cand_ready is not None:
++                self.cand_host.copy_(self.cand, non_blocking=True)
++                self.cand_ready.record()
++                self.cand_ready.synchronize()
++            else:
++                self.cand_host.copy_(self.cand)
++            from .dflash2 import merge_candidates
++
++            g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)
++            p_all = self.cand_host[self.cand_n:].view(St * m, -1)
++            return [merge_candidates(g_all[:, s * m:s * m + depth], p_all[s * m:s * m + depth], k)
++                    for s, (_, _, depth) in enumerate(reqs)]
++
++        def _key(self, r) -> tuple:
++            """Everything a stream's chain depends on: its slot and context end, the pending token, the depth and the
++            request's sampling and stop rule (a pass launched ahead serves a request only when they all agree)."""
++
++            sp = r.sampling
++            on = sp is not None and sp.temperature > 0
++            return (r.ctx.slot, r.ctx.context_end, int(r.pending), min(int(r.depth), self.block - 1),
++                    (int(sp.seed), float(sp.temperature)) if on else None, float(r.confidence), float(r.beta),
++                    tuple(float(v) for v in r.round_ms[:8]) if r.round_ms is not None else None)
++
++        def _live(self, reqs) -> list[int]:
++            live = [i for i, r in enumerate(reqs) if min(r.depth, self.block - 1) >= 1 and r.ctx.context_end > 0]
++            if len({reqs[i].ctx.slot for i in live}) != len(live) or any(reqs[i].ctx.owner is not self for i in live):
++                raise ValueError("a block pass takes each of this drafter's streams at most once")
++            return live
++
++        def _launch(self, reqs, live) -> int:
++            """Upload and replay a pass for ``reqs[i]``, i in ``live``, and start its pinned readback."""
++
++            S = len(live)
++            self._upload([(r.ctx, r.pending, r.depth, r.sampling, r.confidence, r.beta, r.round_ms)
++                          for r in (reqs[i] for i in live)])
++            self._run(S)
++            n = S * self.out_w
++            if self.agreed_ready is not None:
++                self.agreed_host[:n].copy_(self.agreed[:n], non_blocking=True)
++                self.agreed_ready.record()
++            else:
++                self.agreed_host[:n].copy_(self.agreed[:n])
++            return n
++
++        def wants_ahead(self) -> bool:
++            """Whether the round's end should build the next round's requests for ``ahead``: TF_GLM_DRAFT_FAST_AHEAD on
++            and not paused (after a run of launches nobody used, every rank pauses alike for a while; each call
++            counts one paused round)."""
++
++            if not self.fast.ahead:
++                return False
++            if self._pause > 0:
++                self._pause -= 1
++                self.ahead_stats["paused"] += 1
++                self._ahead = None
++                return False
++            return True
++
++        @torch.no_grad()
++        def ahead(self, reqs) -> None:
++            """TF_GLM_DRAFT_FAST_AHEAD: launch the next round's pass for ``reqs`` now (no readback wait). Every rank
++            calls this with the same requests (they come from state the ranks share), so the pass's collectives line
++            up."""
++
++            self._ahead = None
++            if not self.fast.ahead:
++                return
++            live = self._live(reqs)
++            if not live:
++                return
++            self._launch(reqs, live)
++            self._ahead = ([self._key(reqs[i]) for i in live], [reqs[i] for i in live])
++            self.ahead_stats["launched"] += 1
++
++        def _outcome(self, used: bool) -> None:
++            self.ahead_stats["used" if used else "missed"] += 1
++            self._recent = (self._recent + [used])[-16:]
++            if len(self._recent) == 16 and sum(self._recent) < 8:     # under half used: pause 32 rounds
++                self._pause, self._recent = 32, []
++
++        @torch.no_grad()
++        def chains(self, reqs) -> tuple[list[int], np.ndarray]:
++            """(stream index of each live request, rank 0's chain outputs [S, 3 m + 1] as float32) for ``reqs``
++            (``DraftRequest``s); tests and tools read the confidences here. A pass launched ahead serves them when
++            every live request's key was in it (the same streams or a subset)."""
++
++            live = self._live(reqs)
++            ahead, self._ahead = self._ahead, None
++            if ahead is not None:
++                keys, launched = ahead
++                where = {k: j for j, k in enumerate(keys)}
++                idx = [where.get(self._key(reqs[i])) for i in live]
++                used = bool(live) and all(j is not None for j in idx)
++                self._outcome(used)
++                if used:
++                    n = len(keys) * self.out_w
++                    if self.agreed_ready is not None:
++                        self.agreed_ready.synchronize()
++                    got = self.agreed_host[:n].numpy().reshape(len(keys), self.out_w)
++                    return live, got[idx].copy()
++            if not live:
++                return [], np.zeros((0, self.out_w), dtype=np.float32)
++            n = self._launch(reqs, live)
++            if self.agreed_ready is not None:
++                self.agreed_ready.synchronize()
++            return live, self.agreed_host[:n].numpy().reshape(len(live), self.out_w)
++
++        def propose(self, reqs) -> list[list[int]]:
++            """Each stream's ``Drafter.propose`` (the same request fields): one pass for every stream with a depth
++            and a context; the chains and where they stop from the GPU (rank 0's), in one small readback."""
++
++            out: list[list[int]] = [[] for _ in reqs]
++            live, got = self.chains(reqs)
++            if not live:
++                return out
++            m = self.block - 1
++            toks = got[:, :3 * m].reshape(-1, m, 3)[:, :, 0].copy().view(np.int32)
++            counts = got[:, 3 * m:].copy().view(np.int32)[:, 0]
++            for s, i in enumerate(live):
++                out[i] = toks[s, :int(counts[s])].tolist()
++            return out
++
++    return FastMultiDrafter
++
++
++def fast_drafter(drafter, streams: int, fast: FastSettings | None = None, window: int = 63):
++    """A ``FastMultiDrafter`` over ``drafter`` (a ``dflash2.Drafter``) for ``streams`` streams sharing a verify
++    window of ``window`` rows."""
++
++    from .dflash2_multi import MultiDrafter
++
++    return make_fast(MultiDrafter)(drafter, streams, fast=fast, window=window)
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index d60c927..37a490f 100644
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -163,8 +163,7 @@ class MultiDrafter:
+         self.trash = self.t_max
+         self.slot_rows = streams * self.cap + self.trash
+         KV, hd = d.kvh, d.hd
+-        self.kc = [torch.zeros((KV, self.slot_rows, hd), dtype=torch.bfloat16, device=self.dev) for _ in d.layers]
+-        self.vc = [torch.zeros((KV, self.slot_rows, hd), dtype=torch.bfloat16, device=self.dev) for _ in d.layers]
++        self.kc, self.vc = self._pools(len(d.layers), KV, self.slot_rows, hd)
+         self.pos = torch.zeros((streams + 1,), dtype=torch.int64, device=self.dev)   # + the trash entry
+         self.contexts = [DraftContext(self, i) for i in range(streams)]
+         pinned = torch.cuda.is_available()
+@@ -198,6 +197,14 @@ class MultiDrafter:
+         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+         self.buckets = list(range(n, T + 1, n))
+ 
++    def _pools(self, layers: int, kv: int, rows: int, hd: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
++        """The context rings: a key and a value tensor [kv heads, rows, head_dim] a layer (``dflash2_fast`` stacks
++        them into one tensor each and hands out per-layer views)."""
++
++        def ring() -> torch.Tensor:
++            return torch.zeros((kv, rows, hd), dtype=torch.bfloat16, device=self.dev)
++        return [ring() for _ in range(layers)], [ring() for _ in range(layers)]
++
+     def nbytes(self) -> int:
+         """The pool's context rows (the weights are the drafter's)."""
+         return 2 * sum(t.numel() * 2 for t in self.kc)
+@@ -231,14 +238,20 @@ class MultiDrafter:
+         _dattn_seg_kernel[(d.kvh, S)](q, self.kc[i], self.vc[i], out, pos, slot, d.window, d.hd ** -0.5, rows,
+                                       self.slot_rows, N=n, G=d.heads // d.kvh, NH=d.heads, HD=d.hd, CAP=self.cap,
+                                       BK=64, CAUSAL=d.causal, RING=bool(d.ring), num_warps=4)
+-        x = _dconv(d._row(out, L.o), dyn, L.a_base, 1, d.gs, x, seg=n)
++        x = _dconv(self._project_rows(out, L.o), dyn, L.a_base, 1, d.gs, x, seg=n)
+         normed, xs = d._norm(x, L.post_norm)
+         dyn = _mm(normed, L.m_kp, xs)
+         gu = _mm(_dconv(normed, dyn, L.m_base, 0, d.gs, seg=n), L.gu)
+         act = torch.empty((rows, d.inter), dtype=torch.bfloat16, device=self.dev)
+         axs = torch.empty((rows, d.inter // 64), dtype=torch.float32, device=self.dev)
+         glue.swiglu(gu, act, axs, NO_LIMIT)
+-        return _dconv(d._row(act, L.down, axs), dyn, L.m_base, 1, d.gs, x, seg=n)
++        return _dconv(self._project_rows(act, L.down, axs), dyn, L.m_base, 1, d.gs, x, seg=n)
++
++    def _project_rows(self, x: torch.Tensor, q, xs: torch.Tensor | None = None) -> torch.Tensor:
++        """A row-parallel projection's rows (``Drafter._row``: fp32 partials gathered and added in rank order);
++        ``dflash2_fast`` may gather bf16 partials instead."""
++
++        return self.d._row(x, q, xs)
+ 
+     def _block_compute(self, S: int) -> None:
+         """S streams' blocks [pending, mask x (block - 1)] at their committed lengths (``b_meta``), then each
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index ba2987d..bb31ec2 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -652,6 +652,9 @@ class GlmEngine:
+         from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
+ 
+         mine += draft_skip_mod.code()
++        from . import dflash2_fast                                    # TF_GLM_DRAFT_FAST*: drafts' passes, gathers
++
++        mine += dflash2_fast.code() if parallel > 1 and drafter is not None else [0, 0, 0]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -665,7 +668,8 @@ class GlmEngine:
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
+-                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP): "
++                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
++                               "TF_GLM_DRAFT_FAST*): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -765,6 +769,8 @@ class GlmEngine:
+             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+         if rank == 0 and moe_glue_mod.on():
+             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
++        if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
++            print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
+         if rank == 0 and lanes_mod.LANES > 1:
+             print(f"[tensorfold] {lanes_mod.describe()}"
+                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 9eebb01..4f2bdef 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -384,9 +384,12 @@ class MultiDecoder:
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
++            from . import dflash2_fast
+             from .dflash2_multi import MultiDrafter
+ 
+-            self.drafts = MultiDrafter(engine.drafter, streams=streams)
++            fast = dflash2_fast.settings()               # TF_GLM_DRAFT_FAST=1: the fused block pass (drafts only)
++            self.drafts = (dflash2_fast.fast_drafter(engine.drafter, streams, fast, window=MAX_WINDOW) if fast.on
++                           else MultiDrafter(engine.drafter, streams=streams))
+             graphs = os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None else draft_graphs
+             if graphs and torch.cuda.is_available():
+                 self.drafts.capture()
+@@ -1399,6 +1402,9 @@ class MultiDecoder:
+             if l.policy is not None:
+                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
+                               max(0, s.count - len(s.out)))
++        wants = getattr(self.drafts, "wants_ahead", None)
++        if wants is not None and tune.depth != "joint" and wants():
++            self._draft_ahead(lanes)                       # TF_GLM_DRAFT_FAST_AHEAD (dflash2_fast)
+         if prof is not None:
+             prof.mark("emit")
+             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
+@@ -1427,6 +1433,27 @@ class MultiDecoder:
+             drafts[k] = drafts[k][:n]
+ 
+     # -- ends ----------------------------------------------------------------------------------------------------------------
++    def _draft_ahead(self, lanes: list[Lane]) -> None:
++        """Both ranks, at a round's end: the next round's DFlash2 requests of these lanes, as ``_round`` builds them
++        (copy drafts first), handed to the drafter, which launches their pass now when TF_GLM_DRAFT_FAST_AHEAD is on
++        (it then runs while the host emits, plans and sends the next round). Drafts only: nothing here can change a
++        reply, and every rank builds the same requests from the state they share."""
++
++        from .decode import copy_room
++        from .dflash2_multi import DraftRequest
++
++        reqs = []
++        for l in lanes:
++            if l.s.done or not l.dflash or l.depth <= 0:
++                continue
++            if l.copies is not None and l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)):
++                continue
++            conf = l.policy.confidence
++            if self.tune.depth == "scale":
++                conf = scaled_confidence(conf, len(lanes), self.tune.alpha)
++            reqs.append(DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling, conf, **l.policy.chain_rule))
++        self.drafts.ahead(reqs)
++
+     def finish(self, done: list[Stream]) -> None:
+         """Rank 0: finished (or cancelled) streams leave on both ranks; an idle rank 1 is told to wait for the bell."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index ca15202..b548884 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -93,6 +93,9 @@ class BatchedVerify:
+         if taps:
+             self.b.set_taps(tuple(taps), c.hidden)
+         self.taps = bool(taps)
++        from .dflash2_fast import settings as _fast              # TF_GLM_DRAFT_FAST: one copy of the window's taps
++
++        self.one_cat = self.taps and _fast().on
+         self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS, ring=e.caches.ring if e.caches.rings else None)
+         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+@@ -243,10 +246,14 @@ class BatchedVerify:
+             select = index and self.seg_rows.any_sparse()
+             logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
+         out, taps, at = [], [], 0
++        whole = torch.cat([t[:R] for t in b.taps], dim=1) if self.one_cat else None     # views of one copy, the same rows
+         for seg in segments:
+             n = len(seg.tokens)
+             out.append(logits[at:at + n])
+-            taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
++            if whole is not None:
++                taps.append(whole[at:at + n])
++            else:
++                taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
+             at += n
+         return Verified(out, taps)
+ 

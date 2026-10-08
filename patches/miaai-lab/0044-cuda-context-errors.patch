@@ -1,0 +1,30 @@
+0044-cuda-context-errors.patch: TensorFold v0.6.5 port.
+Origin: existing recipe series; original patch preserved in the private port evidence.
+Port: rebased in sequence onto v0.6.5; see docs/PORT-v0.6.5.md.
+
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index b6f7dde..0cda666 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -22,6 +22,8 @@ from typing import Any
+ 
+ import numpy as np
+ 
++from tensorfold.server.errors import CONTEXT_LIMIT
++
+ from .images_http import ImageInputError
+ 
+ IMAGE, VIDEO = "<|image|>", "<|video|>"
+@@ -463,8 +465,10 @@ class GlmVision:
+                 rest = rest[v + len(VIDEO_SPAN):]
+         ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+-            raise ValueError(f"the prompt with its images is {len(ids):,} tokens; this server's window is "
+-                             f"{max_prompt_tokens:,}: send fewer or smaller images, or a shorter video")
++            # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
++            raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "
++                             f"tokens, which exceeds the context window; send fewer or smaller images, or a shorter "
++                             f"video")
+         positions = [p for p, t in enumerate(ids) if t == self.image_token]
+         rows = sum(self._rows(kind, x) for kind, x in items)
+         if len(positions) != rows:

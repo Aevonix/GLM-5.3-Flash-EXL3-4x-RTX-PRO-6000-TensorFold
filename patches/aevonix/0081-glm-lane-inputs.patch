@@ -1,0 +1,704 @@
+diff --git tensorfold/families/glm5_next/cuda/ce.py tensorfold/families/glm5_next/cuda/ce.py
+index 87e34fd..76c3ee1 100644
+--- tensorfold/families/glm5_next/cuda/ce.py
++++ tensorfold/families/glm5_next/cuda/ce.py
+@@ -28,10 +28,17 @@ ranks must be restarted together. GPU-side waits on a peer that died mid-step do
+ host-side ones do (TF_GLM_CE_TIMEOUT_S). The same protocol, with its own staging, also runs behind comm.exchange /
+ exchange_all as a transport of the communicator (``tensorfold.cuda.ce_comm``, TENSORFOLD_EXCHANGE=ce).
+ 
++TF_GLM_LANE_INPUTS (patch 0183, ``lane_inputs``) adds a third kind of step: a lane's bf16 input rows of an output
++projection, each peer's rows into its input staging ([N - 1, H] rows of the widest chosen input, one slot a sender as
++for the rows), which the receiver's own projections then read (``inputs``, ``staged``); the same protocol and reuse
++rule (its readers run on the exchange stream before this rank's next record). TF_GLM_LANE_DIRECT (the same patch):
++row buffers that live in the arena ("homes", after the staging) take the peers' rows straight from their copies
++(``rows(direct=True)``): no staging and no local copies for them (their readers' order: ``lane_inputs``).
++
+ Needs: every rank on one host, each process seeing every GPU (its own first: TensorFold uses device 0) with peer
+ access between them, and room in each GPU's BAR1 for the arena (about 7 x R x D bytes: 56 MiB at 2,048 rows, 112 MiB
+-at 4,096; TF_GLM_CE_ARENA_MIB caps it, default 192). The startup check exchanges a pattern and stops the server, on
+-every rank, if anything is missing or wrong."""
++at 4,096, and (N - 1) x H x 2 bytes x the widest input with TF_GLM_LANE_INPUTS; TF_GLM_CE_ARENA_MIB caps it, default
++192). The startup check exchanges a pattern and stops the server, on every rank, if anything is missing or wrong."""
+ 
+ from __future__ import annotations
+ 
+@@ -105,14 +112,26 @@ class _Raw:
+                                          "version": 3, "strides": None}
+ 
+ 
+-def arena_bytes(rows: int, world: int, width: int, tensors: int, narrow: int = 0) -> tuple[int, int]:
++def arena_bytes(rows: int, world: int, width: int, tensors: int, narrow: int = 0,
++                inputs: int = 0) -> tuple[int, int]:
+     """(partials' staging bytes, rows' staging bytes) for prompt buffers of ``rows`` rows: H = ceil(rows / world)
+     rows a rank; [N, H, D] fp32 (hc_post reads every rank's slot) and [T, N - 1, H, D] bf16 (one slot a peer), then
+     ``narrow`` bytes a row for the narrow row buffers ``rows`` may carry beside them ([N - 1, H, narrow]: a sender's
+-    rows of each narrow buffer back to back; TF_GLM_MOE_GLUE rowsplit's picks and weights)."""
++    rows of each narrow buffer back to back; TF_GLM_MOE_GLUE rowsplit's picks and weights), then ``inputs`` bytes a
++    row for TF_GLM_LANE_INPUTS's input staging ([N - 1, H, inputs], from a 256-byte boundary)."""
+ 
+     H = -(-int(rows) // int(world))
+-    return world * H * width * 4, tensors * (world - 1) * H * width * 2 + (world - 1) * H * int(narrow)
++    rs = world * H * width * 4
++    ag = tensors * (world - 1) * H * width * 2 + (world - 1) * H * int(narrow)
++    if inputs:
++        ag = _inputs_at(rs, ag) - rs + (world - 1) * H * int(inputs)
++    return rs, ag
++
++
++def _inputs_at(rs: int, ag: int) -> int:
++    """The input staging's byte offset in the arena: past the rows' (and narrow rows') staging, on 256 bytes."""
++
++    return -(-(rs + ag) // 256) * 256
+ 
+ 
+ def arena_cap() -> int:
+@@ -134,16 +153,29 @@ class CeExchange:
+     """One rank's copy-engine exchange for a prompt buffer's row split (set up collectively by every rank)."""
+ 
+     def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce",
+-                 narrow: int = 0) -> None:
++                 narrow: int = 0, inputs: int = 0, homes: dict | None = None) -> None:
+         self.rank, self.world, self.store = int(rank), int(world), store
+         self.narrow = int(narrow)            # bytes a row of narrow row buffers ``rows`` carries (0: none)
++        self.inp_row = int(inputs)           # bytes a row of the input staging (TF_GLM_LANE_INPUTS; 0: none)
+         # peers in rotated order (rank + 1, rank + 2, ..): at each moment every rank copies to a different peer, so
+         # no GPU takes three senders' traffic at once while another takes none
+         self.peers = [(self.rank + i) % self.world for i in range(1, self.world)]
+         self.width, self.tensors = int(width), int(tensors)
+         self.H = -(-int(rows) // self.world)
+-        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors, self.narrow)
++        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors, self.narrow, self.inp_row)
+         self.ag_main = self.tensors * (self.world - 1) * self.H * self.width * 2      # the bf16 rows' part
++        self.nw_bytes = (self.world - 1) * self.H * self.narrow                       # the narrow rows' part
++        self.inp_off = _inputs_at(self.rs_bytes, self.ag_main + self.nw_bytes)        # the input staging's start
++        # TF_GLM_LANE_DIRECT: row buffers living in the arena ({name: bytes}), each from a 256-byte boundary past the
++        # staging; a peer writes its rows into them directly (``home``, ``rows(direct=True)``)
++        end = self.rs_bytes + self.ag_bytes
++        self.home_off: dict[str, int] = {}
++        self.home_size: dict[str, int] = {}
++        for name, nbytes in (homes or {}).items():
++            end = -(-end // 256) * 256
++            self.home_off[name], self.home_size[name] = end, int(nbytes)
++            end += int(nbytes)
++        self.total = end
+         self.timeout = timeout_s()
+         self.step = 0
+         self.key = f"tf_{tag}"
+@@ -184,7 +216,7 @@ class CeExchange:
+         if bad:
+             raise RuntimeError("TF_GLM_HC_EXCHANGE=ce could not start (" + "; ".join(bad) + "). It needs every rank "
+                                "on one host, each process seeing every GPU (its own first) with peer access, and "
+-                               f"BAR1 room for the arena ({(self.rs_bytes + self.ag_bytes) >> 20} MiB a GPU beside "
++                               f"BAR1 room for the arena ({self.total >> 20} MiB a GPU beside "
+                                "NCCL's peer buffers: nvidia-smi -q -d MEMORY shows BAR1; shorter prompt chunks "
+                                "shrink it); TF_GLM_HC_EXCHANGE=p2p is NCCL's exchange.")
+ 
+@@ -192,7 +224,7 @@ class CeExchange:
+         """This rank's part: the arena (allocated and exported), its events (exported), its host identity; rank 0
+         also creates the host table. Writes every key ``_connect`` reads."""
+ 
+-        total = self.rs_bytes + self.ag_bytes
++        total = self.total
+         if total > arena_cap():
+             raise RuntimeError(f"the arena would take {total >> 20} MiB, past TF_GLM_CE_ARENA_MIB "
+                                f"({arena_cap() >> 20}): shorter prompt chunks (TF_GLM_PREFILL_ROWS) or a larger cap")
+@@ -210,10 +242,14 @@ class CeExchange:
+         arena = torch.as_tensor(_Raw(self.base, total), device="cuda")
+         if arena.data_ptr() != self.base or arena.numel() != total:
+             raise RuntimeError("the arena's tensor view does not cover the allocation")
++        self.arena = arena
+         self.rs = arena[:self.rs_bytes].view(torch.float32)
+         self.ag = arena[self.rs_bytes:self.rs_bytes + self.ag_main].view(torch.bfloat16).view(
+             self.tensors, self.world - 1, self.H, self.width)
+-        self.nw = arena[self.rs_bytes + self.ag_main:]       # the narrow rows' part (bytes), empty without it
++        self.nw = arena[self.rs_bytes + self.ag_main:self.rs_bytes + self.ag_main + self.nw_bytes]   # narrow rows
++        # TF_GLM_LANE_INPUTS: the input staging (bytes), empty without it
++        self.inp = arena[self.inp_off:self.inp_off + (self.world - 1) * self.H * self.inp_row] if self.inp_row \
++            else arena[:0]
+         handle = _IpcHandle()
+         self._check(lib.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(self.base)), "cudaIpcGetMemHandle")
+         s.set(f"{self.key}/mem/{self.rank}", bytes(handle))
+@@ -293,6 +329,13 @@ class CeExchange:
+             for p in self.peers:
+                 if not bool(torch.all(got[p] == float(p + 1))):
+                     raise RuntimeError(f"the startup pattern from rank {p} did not arrive")
++            if self.inp_row:                           # TF_GLM_LANE_INPUTS: the input staging too, one step
++                k = self.inp_row // 2
++                x = torch.full((self.world * n, k), float(self.rank + 1), dtype=torch.bfloat16, device=self.device)
++                self.inputs(x, n, 0, n)
++                for p in self.peers:
++                    if not bool(torch.all(self.staged(p, k, 0, n) == float(p + 1))):
++                        raise RuntimeError(f"the startup input rows from rank {p} did not arrive")
+             self._sync()
+         except Exception as exc:                       # noqa: BLE001
+             problem = f"{type(exc).__name__}: {exc}"
+@@ -378,6 +421,19 @@ class CeExchange:
+                   for q in self.peers]
+         self.exchange(copies)
+ 
++    def home(self, name: str, dtype: torch.dtype, shape: tuple) -> torch.Tensor:
++        """TF_GLM_LANE_DIRECT: the arena region ``name`` as a tensor (a row buffer that lives there)."""
++
++        off, size = self.home_off[name], self.home_size[name]
++        t = self.arena[off:off + size].view(dtype)
++        return t.view(*shape)
++
++    def _direct(self, buf: torch.Tensor) -> bool:
++        """Whether ``buf`` lies inside one of this arena's homes."""
++
++        lo, hi = buf.data_ptr(), buf.data_ptr() + buf.numel() * buf.element_size()
++        return any(self.base + o <= lo and hi <= self.base + o + self.home_size[k] for k, o in self.home_off.items())
++
+     def block(self, off: int, n: int) -> torch.Tensor:
+         """The piece's staging block [N, n, D] in this rank's arena (``hcsplit``'s ``got``)."""
+ 
+@@ -385,12 +441,13 @@ class CeExchange:
+         return self.rs[self.world * off * d:self.world * (off + n) * d].view(self.world, n, d)
+ 
+     def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None,
+-             narrow: tuple | list = ()) -> None:
++             narrow: tuple | list = (), direct: bool = False) -> None:
+         """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging
+         (its rows ``at`` .., ``at`` = off unless given), then the peers' rows from this rank's staging into place
+         (rows p H + off ..). ``narrow``: contiguous row buffers of any dtype whose rows together take at most the
+         arena's ``narrow`` bytes, moved the same way in the same step (their staging: a sender's slot of [H, row]
+-        a buffer, back to back)."""
++        a buffer, back to back). ``direct`` (TF_GLM_LANE_DIRECT): buffers that live in the arena's homes go straight
++        to the same place in each peer's (no staging, no local copies); the others as before."""
+ 
+         if len(outs) > self.tensors:
+             raise ValueError(f"ce rows: {len(outs)} buffers, the staging holds {self.tensors}")
+@@ -402,27 +459,70 @@ class CeExchange:
+         mine = self.rank * H + off
+         N = self.world
+         copies = []
++        placed = set()                           # direct: buffers whose rows the peers write in place
+         for t, buf in enumerate(outs):
+             if buf.shape[1] != d or buf.dtype != torch.bfloat16 or not buf.is_contiguous():
+                 raise ValueError("ce rows: contiguous bf16 rows of the arena's width")
++            if direct and self._direct(buf):     # the same offset in each peer's arena
++                placed.add(id(buf))
++                src = buf[mine].data_ptr()
++                copies += [(self.remote[q] + src - self.base, src, n * row) for q in self.peers]
++                continue
+             for q in self.peers:                 # sender r's slot in receiver q's staging: (r - q - 1) mod N
+                 pos = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + at) * row
+                 copies.append((self.remote[q] + self.rs_bytes + pos, buf[mine].data_ptr(), n * row))
+         lay = self._narrow_layout(narrow)
+         for buf, start, rb in lay:
++            if direct and self._direct(buf):
++                placed.add(id(buf))
++                src = buf[mine].data_ptr()
++                copies += [(self.remote[q] + src - self.base, src, n * rb) for q in self.peers]
++                continue
+             for q in self.peers:
+                 pos = ((self.rank - q - 1) % N) * self.H * self.narrow + start * self.H + at * rb
+                 copies.append((self.remote[q] + self.rs_bytes + self.ag_main + pos, buf[mine].data_ptr(), n * rb))
+         self.exchange(copies)
+         for t, buf in enumerate(outs):
++            if id(buf) in placed:
++                continue
+             for p in self.peers:
+                 buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, at:at + n])
+         for buf, start, rb in lay:
++            if id(buf) in placed:
++                continue
+             for p in self.peers:
+                 pos = ((p - self.rank - 1) % N) * self.H * self.narrow + start * self.H + at * rb
+                 got = self.nw[pos:pos + n * rb].view(buf.dtype).view(n, *buf.shape[1:])
+                 buf[p * H + off:p * H + off + n].copy_(got)
+ 
++    # -- TF_GLM_LANE_INPUTS: an output projection's input rows ---------------------------------------------------------
++    def inputs(self, x: torch.Tensor, H: int, off: int, n: int, at: int | None = None) -> None:
++        """Piece (off, n) of a lane's bf16 input rows of an output projection (``lane_inputs``): this rank's rows of
++        each peer q (x[q H + off ..]) into q's input staging (sender r's slot (r - q - 1) mod N, rows ``at`` ..,
++        ``at`` = off unless given, packed at the input's own width), the peers' rows of this rank's rows into this
++        rank's (``staged``)."""
++
++        if x.dim() != 2 or x.dtype != torch.bfloat16 or not x.is_contiguous():
++            raise ValueError("ce inputs: contiguous bf16 rows")
++        rb = x.shape[1] * 2
++        if not rb or rb > self.inp_row or rb % 16:
++            raise ValueError(f"ce inputs: rows of {rb} bytes, the input staging holds {self.inp_row} (16-byte rows)")
++        at = off if at is None else at
++        if at + n > self.H:
++            raise ValueError(f"ce inputs: staging rows {at} .. {at + n} past its {self.H}")
++        N = self.world
++        copies = [(self.remote[q] + self.inp_off + ((self.rank - q - 1) % N) * self.H * self.inp_row + at * rb,
++                   x[q * H + off].data_ptr(), n * rb) for q in self.peers]
++        self.exchange(copies)
++
++    def staged(self, p: int, k: int, at: int, n: int) -> torch.Tensor:
++        """Peer p's input rows ``at`` .. ``at`` + n (``k`` bf16 wide) in this rank's input staging, as the last inputs
++        step of those rows left them: [n, k], contiguous."""
++
++        rb = k * 2
++        start = ((p - self.rank - 1) % self.world) * self.H * self.inp_row + at * rb
++        return self.inp[start:start + n * rb].view(torch.bfloat16).view(n, k)
++
+     def _narrow_layout(self, narrow) -> list[tuple[torch.Tensor, int, int]]:
+         """(buffer, byte offset of its rows within a row's narrow bytes, row bytes) for each narrow buffer."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 7c993fc..88f1a3a 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -539,6 +539,10 @@ class GlmEngine:
+         # TF_GLM_KVB=fp8/q4 (an EXL3 checkpoint, latent cache): kv_b as the absorb and expand kernels read it
+         kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
+         weights_estimate = kvb_weights(weights_estimate, kvb)
++        # TF_GLM_LANE_INPUTS (patch 0183): every rank's slice of the chosen output projections on each rank
++        from . import lane_inputs as lane_inputs_mod
++
++        weights_estimate = lane_inputs_mod.weights(weights_estimate, cfg, world)
+         # TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows (``kv8``), half the bytes
+         from .kv8 import KINDS as KV_KINDS, kv_kind
+ 
+@@ -712,7 +716,7 @@ class GlmEngine:
+         mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
+                 quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
+                 quiet(_exl3_stream.code),
+-                quiet(_segprof.code)]
++                quiet(_segprof.code), quiet(lane_inputs_mod.mask)]
+         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
+         tables = [row[0] for row in got]
+         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
+@@ -724,7 +728,8 @@ class GlmEngine:
+             why = "; ".join(w for _, w in mine if w)
+             raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
+                                "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
+-                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF* by rank "
++                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF*, "
++                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask) by rank "
+                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
+                                + ": give every rank the same valid values")
+         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
+@@ -764,6 +769,9 @@ class GlmEngine:
+         w.comm = self.comm
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+         self.comm.barrier()
++        # TF_GLM_LANE_INPUTS: the other ranks' slices of the chosen output projections (a collective; the estimate
++        # counted them); before the prompt buffers' split sizes its copy-engine arena by them
++        lane_inputs_added = lane_inputs_mod.gather(w)
+         self.w = w
+         if rank == 0 and cfg.mtp_layers and not self.mtp_on:
+             print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
+@@ -793,6 +801,8 @@ class GlmEngine:
+             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+         if rank == 0 and moe_glue_mod.on():
+             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
++        if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
++            print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
+         if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
+             print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
+         if rank == 0 and lanes_mod.LANES > 1:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 1f2c00f..c64e8cb 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -466,6 +466,9 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
+     def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
+         mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
+ 
++    ranks = getattr(q, "ranks", None)            # TF_GLM_LANE_INPUTS: every rank's slice is here (lane_inputs.py);
++    if ranks is not None and b.prefill:          # a prompt lane then swaps the inputs (lanes.LaneSplit._inputs)
++        fill.inputs, fill.ranks = x, ranks
+     return partials(w, b, R, fill, site=site)
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 2bfb58a..b6ca1ed 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -195,14 +195,27 @@ class HcSplit:
+         if self.ce_mode:
+             from .ce import CeExchange
+ 
++            from .lane_inputs import direct, row_bytes
+             from .moe_glue import narrow_bytes
+ 
+             b = self.b
+             taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
+             store = getattr(self.w.comm, "nccl", self.w.comm).store
+-            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it)
+-            self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
+-                                 taps + 1, narrow=narrow_bytes())
++            rows = getattr(b, "alloc_rows", b.rows)
++            # TF_GLM_LANE_DIRECT: the normed rows (and rowsplit's picks and weights) live in the arena, where the
++            # peers write their rows of them in place (``ce.CeExchange.rows(direct=True)``, prompt lanes)
++            homes = {}
++            if direct(self.world):
++                homes["normed"] = b.normed.numel() * b.normed.element_size()
++                if narrow_bytes():
++                    homes.update(pick=b.pick.numel() * b.pick.element_size(), wts=b.wts.numel() * b.wts.element_size())
++            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it);
++            # TF_GLM_LANE_INPUTS: an input staging of the widest chosen projection input (0 bytes without it)
++            self.ce = CeExchange(self.rank, self.world, store, rows, b.part.shape[1],
++                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes)
++            for name in homes:                   # the buffers move into the arena (nothing holds the old ones)
++                old = getattr(b, name)
++                setattr(b, name, self.ce.home(name, old.dtype, tuple(old.shape)))
+             return
+         if self.gather:
+             return
+@@ -296,7 +309,8 @@ class HcSplit:
+         off, n = self.pieces[j]
+         mine = self.mine() + off
+         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
+-            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow)
++            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow,
++                         direct=getattr(self, "direct", False))       # TF_GLM_LANE_DIRECT: prompt lanes only
+             return
+         if narrow:
+             raise RuntimeError("narrow rows travel with the copy-engine exchange only (TF_GLM_HC_EXCHANGE=ce)")
+diff --git tensorfold/families/glm5_next/cuda/lane_inputs.py tensorfold/families/glm5_next/cuda/lane_inputs.py
+new file mode 100644
+index 0000000..78007b2
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/lane_inputs.py
+@@ -0,0 +1,254 @@
++"""TF_GLM_LANE_INPUTS (patch 0183): prompt lanes exchange a row-parallel output projection's bf16 inputs instead of its
++fp32 partials, and each rank computes every rank's partial of its own rows itself.
++
++Where: prompt chunks in two lanes (TF_GLM_PREFILL_LANES=2) on the row split (TF_GLM_HC_SPLIT=1) with the copy-engine
++exchange (TF_GLM_HC_EXCHANGE=ce). At a lane's exchange site after an output projection whose input columns are split
++between the ranks (KDA's and DSA's o_proj, the dense MLP's down_proj), every rank today computes its fp32 partial of
++the projection for all of the lane's rows (its input columns times its slice of the weight) and sends each peer that
++peer's rows of it (16 KiB a row: 4,096 fp32); the peer sums the N partials of its own rows rank 0 first (hc_post).
++With the setting each rank sends each peer the peer's rows of its bf16 INPUT instead (at four ranks KDA 2,048 columns
++= 4 KiB a row, DSA 4,096 = 8 KiB, the MLP's down 3,072 = 6 KiB), and the peer computes every rank's partial of its own
++rows from them, with that rank's slice of the weight, which every rank holds (gathered from its owner at start, byte
++for byte; never quantized again). The main stream computes only its own rows' partial (a quarter of today's projection
++at four ranks); the lanes' exchange stream runs the peers' slot projections after the copies, beside the other lane's
++block. The normed rows' exchange after the glue is unchanged.
++
++Value: a comma-separated list of kda, dsa, mlp; "all" for the three; unset, "0", "off" or "none": none (the default,
++today's code path). Every rank must be given the same value (the engine compares it at start).
++
++Exact: slot q of a rank's staging block today holds rank q's prompt matmul of all the lane's rows, restricted to this
++rank's rows; with the setting it holds the prompt matmul of those rows alone with rank q's weight bytes. The prompt
++matmul gives a row the same bits in any row range and any tile (``prefill_matmul``: weights rounded once to bf16, one
++fp32 chain over K in order; qmm_prefill.cu), so the two are equal byte for byte; hc_post reads the same slots in the
++same order, and everything after it is unchanged. Hence it needs 4-bit projections on the prompt matmul (an MLX
++checkpoint, or TF_GLM_DENSE=q4 on an EXL3 one) of the same shape on every rank: the start refuses anything else.
++
++TF_GLM_LANE_DIRECT=1 (same patch): the lanes' swapped normed rows (and TF_GLM_MOE_GLUE rowsplit's picks and weights)
++are written by the peers' copy engines straight into this rank's row buffers, which then live in the copy-engine arena,
++instead of into its staging and from there by three local copies a step on the exchange stream (13,830 copies of
++4 MiB a rank in a cold 100K prompt, 54 GiB of local traffic; the copies the host blocked on when the exchange stream's
++launch queue was full). Exact: the same bytes in the same places; a peer's copies of a step start after this rank's
++record of the step before, and every read of those rows' previous contents (the lane's block on the main stream, its
++shared expert on the MoE glue's stream, its plan and combine) is ordered before the lane's next partials or inputs
++step, which waits for the block's fill or input rows (tests/k4/test_lane_inputs_cpu.py models the peers' writes).
++
++Memory: every rank holds the other ranks' slices of the chosen projections. GLM-5.3-Flash at four ranks with 4-bit
++projections: KDA 34 layers x 3 x 4.5 MiB = 459 MiB, DSA 11 x 3 x 9 MiB = 297 MiB, MLP down 3 x 3 x 6.75 MiB = 61 MiB.
++The startup estimate counts them (``weights``: the pool shrinks by what they take); the copy-engine arena grows by
++(N - 1) x H x 2 bytes x the widest input (H = a chunk's rows a rank: 24 MiB at 4,096-row chunks with dsa).
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold's row split, prompt lanes and copy-engine
++exchange (patches 0122, 0123) and its 4-bit prompt matmul."""
++
++from __future__ import annotations
++
++import os
++import re
++
++import torch
++
++KINDS = ("kda", "dsa", "mlp")
++OFF = ("", "0", "off", "none")
++_ENV = "TF_GLM_LANE_INPUTS"
++# a checkpoint tensor of an output projection the setting may hold whole: (layer, which, part)
++_NAME = re.compile(r"(?:^|\.)layers\.(\d+)\.(self_attn\.o_proj|mlp\.down_proj)\.(weight|scales|biases)$")
++
++
++def parse(value: str | None) -> frozenset:
++    v = (value or "").strip().lower()
++    if v in OFF:
++        return frozenset()
++    if v == "all":
++        return frozenset(KINDS)
++    names = [p.strip() for p in v.split(",") if p.strip()]
++    bad = [n for n in names if n not in KINDS]
++    if bad or not names:
++        raise ValueError(f"{_ENV}: a comma-separated list of {', '.join(KINDS)}, or all, or 0 (off), not {value!r}")
++    return frozenset(names)
++
++
++def wanted() -> frozenset:
++    return parse(os.environ.get(_ENV, ""))
++
++
++def mask() -> int:
++    """The settings as a bit mask: KINDS, then TF_GLM_LANE_DIRECT (ValueError when one is not valid); the engine
++    compares it across ranks."""
++
++    kinds = wanted()
++    return sum(1 << i for i, n in enumerate(KINDS) if n in kinds) + (8 if direct_wanted() else 0)
++
++
++def direct_wanted() -> bool:
++    v = (os.environ.get("TF_GLM_LANE_DIRECT", "") or "0").strip()
++    if v not in ("0", "1"):
++        raise ValueError(f"TF_GLM_LANE_DIRECT: 0 (off) or 1, not {v!r}")
++    return v == "1"
++
++
++def direct(world: int) -> bool:
++    """TF_GLM_LANE_DIRECT asked for and usable (``usable``, two ranks or more); never raises (the start refuses a
++    value that is not valid)."""
++
++    try:
++        return direct_wanted() and int(world) > 1 and usable()
++    except ValueError:
++        return False
++
++
++def usable(env=None) -> bool:
++    """Prompt lanes on the row split with the copy-engine exchange (settings only: the same answer on every rank)."""
++
++    env = os.environ if env is None else env
++    return ((env.get("TF_GLM_PREFILL_LANES", "") or "1").strip() == "2"
++            and (env.get("TF_GLM_HC_SPLIT", "") or "0").strip() == "1"
++            and (env.get("TF_GLM_HC_EXCHANGE", "") or "p2p").strip() == "ce")
++
++
++def used(world: int) -> frozenset:
++    """The kinds that run: the wanted ones where they can (``usable``, two ranks or more). Never raises: a value that
++    is not valid runs none here, and the start's comparison refuses it on every rank."""
++
++    try:
++        kinds = wanted()
++    except ValueError:
++        return frozenset()
++    return kinds if kinds and int(world) > 1 and usable() else frozenset()
++
++
++def describe(world: int, added: int = 0) -> str:
++    kinds = [n for n in KINDS if n in wanted()]
++    if not kinds:                                   # TF_GLM_LANE_DIRECT alone
++        return ("prompt lanes' swapped rows written straight into the peers' row buffers (TF_GLM_LANE_DIRECT)"
++                + ("" if direct(world) else " [not used: it needs TF_GLM_PREFILL_LANES=2, TF_GLM_HC_SPLIT=1 and "
++                                             "TF_GLM_HC_EXCHANGE=ce]"))
++    what = {"kda": "KDA's", "dsa": "DSA's", "mlp": "the dense MLP's down"}
++    text = (f"prompt lanes exchange {', '.join(what[n] for n in kinds)} output projection inputs (bf16) instead of "
++            f"their fp32 partials, each rank computing every rank's partial of its rows (TF_GLM_LANE_INPUTS)")
++    if not used(world):
++        return text + " [not used: it needs TF_GLM_PREFILL_LANES=2, TF_GLM_HC_SPLIT=1 and TF_GLM_HC_EXCHANGE=ce]"
++    text += f"; every rank's slices of them on each rank (+{added / 2 ** 20:.0f} MiB)"
++    return text + ("; swapped rows written straight into the peers' row buffers (TF_GLM_LANE_DIRECT)"
++                   if direct(world) else "")
++
++
++def chosen(cfg, kinds, index: int, which: str) -> bool:
++    """Whether layer ``index``'s projection ``which`` (self_attn.o_proj or mlp.down_proj) is one the kinds hold whole
++    (the MTP layer's never: it runs no prompt lane)."""
++
++    if not 0 <= index < int(cfg.layers):
++        return False
++    if which == "self_attn.o_proj":
++        return cfg.kinds[index] in kinds
++    return "mlp" in kinds and cfg.mlp_kinds[index] == "dense"
++
++
++def weights(base, cfg, world: int):
++    """A split_weights transform for the startup estimate: the chosen projections' tensors whole (every rank's slice,
++    ``world`` times this rank's share: the start refuses shares that differ)."""
++
++    kinds = used(world)
++    if not kinds:
++        return base
++
++    def transform(name: str, info: dict) -> tuple[int, int]:
++        total, extra = base(name, info)
++        m = _NAME.search(name)
++        if total and m and chosen(cfg, kinds, int(m.group(1)), m.group(2)):
++            return total * int(world), extra
++        return total, extra
++    return transform
++
++
++def targets(w, kinds) -> list[tuple[int, str, object]]:
++    """(layer, kind, projection) of every projection the kinds cover, in layer order (the same list on every rank)."""
++
++    out = []
++    for layer in w.layers:
++        if layer.kind in kinds:
++            out.append((layer.index, layer.kind, (layer.kda if layer.kind == "kda" else layer.dsa).o))
++        if "mlp" in kinds and layer.mlp is not None:
++            out.append((layer.index, "mlp", layer.mlp.down))
++    return out
++
++
++def _signature(q) -> list[int]:
++    """What every rank's copy of a projection must agree on: its shapes, group size and the tensors' sizes."""
++
++    return [int(q.n), int(q.k), int(q.gs), q.weight.numel(), q.scales.numel(), q.biases.numel()]
++
++
++def gather(w) -> int:
++    """Every rank's slice of the chosen projections on every rank, as ``q.ranks`` (rank r's ``Q4``; None at this
++    rank's own index, whose slice is ``q`` itself). A collective: every rank calls it at start after the weights
++    load; it raises on every rank alike when a projection is not a 4-bit prompt-matmul one or the ranks' shapes
++    differ. Each slice is its owner's bytes (an all-gather), checked against the owner's copy of its own. Returns the
++    bytes it added on this rank."""
++
++    from .qmm import Q4
++
++    world, rank = int(w.world), int(w.rank)
++    kinds = used(world)
++    if not kinds:
++        return 0
++    comm = getattr(w.comm, "nccl", w.comm)
++    mats = targets(w, kinds)
++    # every rank's signatures (fixed length: a row a layer), to refuse together
++    width = 7
++    sig = torch.zeros((len(w.layers) * 2, width), dtype=torch.int64)
++    for j, (index, kind, q) in enumerate(mats):
++        slot = 2 * index + (kind == "mlp")
++        sig[slot, 0] = 1 if isinstance(q, Q4) else -1
++        if isinstance(q, Q4):
++            sig[slot, 1:] = torch.tensor(_signature(q), dtype=torch.int64)
++    mine = sig.view(-1).to(w.device)
++    got = torch.empty((world * mine.numel(),), dtype=torch.int64, device=w.device)
++    comm.all_gather(mine, got)
++    every = got.view(world, -1, width).cpu()
++    if bool((every[:, :, 0] == -1).any()):
++        raise RuntimeError(f"{_ENV}: the chosen output projections must be 4-bit (the prompt matmul's: an MLX "
++                           "checkpoint, or TF_GLM_DENSE=q4 for an EXL3 one); a rank holds them as BF16 / FP8")
++    if not bool((every == every[0]).all()):
++        raise RuntimeError(f"{_ENV}: the ranks' slices of the chosen projections differ in shape (shares that are not "
++                           "equal, e.g. three ranks): the setting needs equal shares")
++    added = 0
++    for index, kind, q in mats:
++        parts = []
++        for t in (q.weight, q.scales, q.biases):
++            src = t.contiguous().view(-1)
++            whole = torch.empty((world * src.numel(),), dtype=src.dtype, device=src.device)
++            comm.all_gather(src, whole)
++            whole = whole.view(world, *t.shape)
++            if not torch.equal(whole[rank], t):
++                raise RuntimeError(f"{_ENV}: layer {index}'s gathered slice of this rank is not its own")
++            parts.append(whole)
++        ranks = []
++        for r in range(world):
++            if r == rank:
++                ranks.append(None)
++                continue
++            wt, sc, bi = (p[r].clone() for p in parts)
++            ranks.append(Q4(wt, sc, bi, q.n, q.k, q.gs))
++            added += sum(t.numel() * t.element_size() for t in (wt, sc, bi))
++        q.ranks = tuple(ranks)
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++    return added
++
++
++def row_bytes(w) -> int:
++    """Bytes a row of the widest chosen input (bf16): what each sender's staging row in the copy-engine arena holds
++    (0 when nothing is chosen or gathered). The same on every rank (``gather`` checked the shapes)."""
++
++    widest = 0
++    for _, _, q in targets(w, KINDS):
++        if getattr(q, "ranks", None) is not None:
++            widest = max(widest, int(q.k))
++    return widest * 2
++
++
++def inputs_of(q):
++    """The other ranks' slices of a projection (``q.ranks``) when the setting holds it, else None."""
++
++    return getattr(q, "ranks", None)
+diff --git tensorfold/families/glm5_next/cuda/lanes.py tensorfold/families/glm5_next/cuda/lanes.py
+index 180006a..a8e6131 100644
+--- tensorfold/families/glm5_next/cuda/lanes.py
++++ tensorfold/families/glm5_next/cuda/lanes.py
+@@ -28,7 +28,11 @@ rank at TP4) through the lane's 32-row sub-chunks in order, so the GPU is mostly
+ recurrence waits for lane A's (it starts from the state lane A leaves). With the setting, the recurrences run on a
+ stream of their own: lane A's beside lane B's input projections, lane B's beside lane A's output projection (1), and
+ with 2 also lane B's output projection follows on that stream while the main stream runs lane A's MLP / MoE block.
+-The same calls on the same rows and states in the same order on every buffer (``kda_lanes``): the same bits."""
++The same calls on the same rows and states in the same order on every buffer (``kda_lanes``): the same bits.
++
++TF_GLM_LANE_INPUTS (patch 0183, ``lane_inputs``): at the sites after an output projection that every rank holds whole,
++a lane swaps the projection's bf16 inputs instead of its fp32 partials; the current stream computes only this rank's
++rows' partial and the exchange stream every peer's (``LaneSplit._inputs``): the same partials, the same bits."""
+ 
+ from __future__ import annotations
+ 
+@@ -169,14 +173,21 @@ class LaneSplit(HcSplit):
+         self.ev_done = torch.cuda.Event()
+         self.ev_front = torch.cuda.Event()       # TF_GLM_KDA_OVERLAP: the lane's KDA projections written (main)
+         self.ev_rec = torch.cuda.Event()         # ... and its recurrence's read-outs (the recurrence stream)
++        self.ev_in = torch.cuda.Event()          # TF_GLM_LANE_INPUTS: an output projection's input rows written
+         self.ce = parent.ce
+         self.ce_at = ce_at
++        # TF_GLM_LANE_DIRECT: the peers write the lane's swapped rows that live in the arena in place (lane_inputs)
++        self.direct = bool(getattr(self.ce, "home_off", None))
+ 
+     def partial(self, fill) -> None:
+         """The lane's whole partial on the main stream, then its exchange on the exchange stream. A fill that left
+         its last rows to another stream says so in ``fill.ready`` (an event: TF_GLM_MOE_GLUE defer); the exchange
+-        waits for it too."""
++        waits for it too. An output projection that every rank holds whole exchanges its inputs instead
++        (TF_GLM_LANE_INPUTS: ``_inputs``)."""
+ 
++        if getattr(fill, "inputs", None) is not None:
++            self._inputs(fill)
++            return
+         main = torch.cuda.current_stream()
+         fill(0, self.R)
+         self.ev_fill[0].record(main)
+@@ -188,6 +199,50 @@ class LaneSplit(HcSplit):
+             with prof.timed("lane: partials exchange", events_only=True):
+                 self._swap_partial(0)
+ 
++    def _inputs(self, fill) -> None:
++        """TF_GLM_LANE_INPUTS (``lane_inputs``): an output projection's partials from its inputs. The current stream
++        records that the projection's input rows are written (``ev_in``) and computes this rank's rows' partial with
++        its own slice (``fill`` on those rows: b.part, as before); the exchange stream, from that record on, swaps the
++        input rows (``_swap_inputs``), computes every peer's partial of this rank's rows with that peer's slice into
++        the peer's slot of the staging block (``_slot_partials``: where the peer's copy landed before), then waits for
++        the own rows' partial; ``glue_async`` sums the slots rank 0 first as before. The input rows stay unwritten
++        until the lane's next block, which waits for the lane's glue (``wait``), which follows the swap. For a fill
++        with inputs (``forward.out_proj`` sets them: ``fill.inputs``, ``fill.ranks``)."""
++
++        x, ranks = fill.inputs, fill.ranks
++        if self.ce is None or self.ce.inp_row < x.shape[1] * 2:
++            raise RuntimeError("TF_GLM_LANE_INPUTS: the copy-engine arena has no input staging for this projection")
++        cur = torch.cuda.current_stream()
++        lo = self.mine()
++        self.ev_in.record(cur)
++        fill(lo, lo + self.H)
++        self.ev_fill[0].record(cur)
++        ready = getattr(fill, "ready", None)
++        with torch.cuda.stream(self.stream):
++            self.stream.wait_event(self.ev_in)
++            self._swap_inputs(x)
++            self._slot_partials(x, ranks)
++            self.stream.wait_event(self.ev_fill[0])
++            if ready is not None:
++                self.stream.wait_event(ready)
++
++    def _swap_inputs(self, x) -> None:
++        """The lane's input rows of a projection: this rank's rows of each peer out, the peers' rows of this rank's
++        rows in (one copy-engine step)."""
++
++        self.ce.inputs(x, self.H, 0, self.H, at=self.ce_at)
++
++    def _slot_partials(self, x, ranks) -> None:
++        """Each peer's fp32 partial of this rank's rows: its staged input rows times its slice of the weight (the
++        prompt matmul, as the peer's own ``fill`` runs it), into its slot of the staging block."""
++
++        from .forward import mm
++
++        block = self.got[0]
++        k = x.shape[1]
++        for p in self.peers:
++            mm(self.b, self.ce.staged(p, k, self.ce_at, self.H), ranks[p], None, block[p], f32=True)
++
+     def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
+         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
+         exchange: hc_post, the taps' and final stream means, the next hc_pre, the rows' exchange. ``moe``: the layer

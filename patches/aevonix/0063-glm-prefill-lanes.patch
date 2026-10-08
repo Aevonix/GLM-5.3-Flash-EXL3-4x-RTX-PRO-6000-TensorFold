@@ -1,0 +1,416 @@
+0063-glm-prefill-lanes: TensorFold 0.6.2 port series (apply after the lower numbers, patch -p0 in the directory
+that holds the installed tensorfold package).
+Origin: the 4x RTX PRO 6000 release series (Apache-2.0), first written for TensorFold 0.6.0 + 0001-0056.
+Port: applied by a 3-way merge without conflict; the change is the 0.6.0 patch's, at 0.6.2's lines.
+Files: families/glm5_next/cuda/ce.py, families/glm5_next/cuda/engine.py, families/glm5_next/cuda/forward.py, families/glm5_next/cuda/hcsplit.py, families/glm5_next/cuda/lanes.py.
+
+diff --git tensorfold/families/glm5_next/cuda/ce.py tensorfold/families/glm5_next/cuda/ce.py
+index cc1265c..056b209 100644
+--- tensorfold/families/glm5_next/cuda/ce.py
++++ tensorfold/families/glm5_next/cuda/ce.py
+@@ -321,15 +321,19 @@ class CeExchange:
+         stream.wait_event(self.theirs[p][k])
+ 
+     # -- the row split's two exchanges ---------------------------------------------------------------------------------
+-    def partials(self, part: torch.Tensor, H: int, off: int, n: int) -> None:
++    def partials(self, part: torch.Tensor, H: int, off: int, n: int, at: int | None = None) -> None:
+         """Piece (off, n): this rank's fp32 partial rows of each peer q (part[q H + off ..]) into q's staging block
+-        of the piece ([N, n, D] at N x off rows of the arena, this rank's slot); the peers' into this rank's."""
++        of the piece ([N, n, D] at N x ``at`` rows of the arena, ``at`` = off unless given; this rank's slot); the
++        peers' into this rank's."""
+ 
+         d = self.width
+         if part.shape[1] != d or part.dtype != torch.float32 or not part.is_contiguous():
+             raise ValueError("ce partials: contiguous fp32 rows of the arena's width")
++        at = off if at is None else at
++        if at + n > self.H:
++            raise ValueError(f"ce partials: arena rows {at} .. {at + n} past its {self.H}")
+         row = d * 4
+-        copies = [(self.remote[q] + (self.world * off + self.rank * n) * row, part[q * H + off].data_ptr(), n * row)
++        copies = [(self.remote[q] + (self.world * at + self.rank * n) * row, part[q * H + off].data_ptr(), n * row)
+                   for q in self.peers]
+         self.exchange(copies)
+ 
+@@ -339,12 +343,16 @@ class CeExchange:
+         d = self.width
+         return self.rs[self.world * off * d:self.world * (off + n) * d].view(self.world, n, d)
+ 
+-    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int) -> None:
+-        """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging,
+-        then the peers' rows from this rank's staging into place (rows p H + off ..)."""
++    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None) -> None:
++        """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging
++        (its rows ``at`` .., ``at`` = off unless given), then the peers' rows from this rank's staging into place
++        (rows p H + off ..)."""
+ 
+         if len(outs) > self.tensors:
+             raise ValueError(f"ce rows: {len(outs)} buffers, the staging holds {self.tensors}")
++        at = off if at is None else at
++        if at + n > self.H:
++            raise ValueError(f"ce rows: staging rows {at} .. {at + n} past its {self.H}")
+         d = self.width
+         row = d * 2
+         mine = self.rank * H + off
+@@ -354,9 +362,9 @@ class CeExchange:
+             if buf.shape[1] != d or buf.dtype != torch.bfloat16 or not buf.is_contiguous():
+                 raise ValueError("ce rows: contiguous bf16 rows of the arena's width")
+             for q in self.peers:                 # sender r's slot in receiver q's staging: (r - q - 1) mod N
+-                at = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + off) * row
+-                copies.append((self.remote[q] + self.rs_bytes + at, buf[mine].data_ptr(), n * row))
++                pos = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + at) * row
++                copies.append((self.remote[q] + self.rs_bytes + pos, buf[mine].data_ptr(), n * row))
+         self.exchange(copies)
+         for t, buf in enumerate(outs):
+             for p in self.peers:
+-                buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, off:off + n])
++                buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, at:at + n])
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 500c149..5dbfe16 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -649,6 +649,9 @@ class GlmEngine:
+         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
+ 
+         mine += index_split_settings().code()
++        from . import lanes as lanes_mod                              # patch 0123: TF_GLM_PREFILL_LANES*
++
++        mine += lanes_mod.code()
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -661,7 +664,8 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
++                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -724,6 +728,9 @@ class GlmEngine:
+                           "(only shorter ones split)", flush=True)
+         if rank == 0 and index_split_settings().on and world > 1:
+             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
++        if rank == 0 and lanes_mod.LANES > 1:
++            print(f"[tensorfold] {lanes_mod.describe()}"
++                  + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
+         c = self.copy
+         if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
+             print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 8966900..7309242 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, index_split, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
++from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -970,7 +970,10 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+     if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
+-        split_layers(w, st, b, R, nch, host_pos, mixer)      # also leaves the taps and b.hidden[:R]
++        if lanes.applies(w, b, R, host_pos, sparse_np, mixer):
++            lanes.lane_layers(w, st, b, R, host_pos)        # TF_GLM_PREFILL_LANES=2 (patch 0123): two lanes
++        else:
++            split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
+     else:
+         for layer in w.layers:
+             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 5dfa61f..36bff35 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -160,6 +160,7 @@ class HcSplit:
+         # takes the [N, n, D] staging blocks of more than two ranks at any world size
+         self.ce_mode = settings.exchange == "ce"
+         self.ce = None
++        self.ce_at = 0                  # the arena rows this split's staging starts at (a prefill lane's offset)
+         self.blocks = world > 2 or self.ce_mode
+         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
+         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
+@@ -229,7 +230,7 @@ class HcSplit:
+         if self.ce_mode and self.ce is None:
+             raise RuntimeError("TF_GLM_HC_EXCHANGE=ce: the copy-engine exchange is set up by warm() at startup")
+         if self.ce is not None:                       # the staging blocks in this rank's copy-engine arena
+-            self.got = [self.ce.block(off, n) for off, n in self.pieces]
++            self.got = [self.ce.block(self.ce_at + off, n) for off, n in self.pieces]
+         elif N == 2 and self.gather:
+             self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
+                         for off, n in self.pieces]
+@@ -268,7 +269,7 @@ class HcSplit:
+         off, n = self.pieces[j]
+         b = self.b
+         if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
+-            self.ce.partials(b.part, self.H, off, n)
++            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off)
+             return
+         if self.world > 2:
+             if self.gather:                             # every rank's whole partial (one piece)
+@@ -291,7 +292,7 @@ class HcSplit:
+         off, n = self.pieces[j]
+         mine = self.mine() + off
+         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
+-            self.ce.rows(outs, self.H, off, n)
++            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off)
+             return
+         if self.gather:                                 # one piece: rank order is row order
+             for t in outs:
+diff --git tensorfold/families/glm5_next/cuda/lanes.py tensorfold/families/glm5_next/cuda/lanes.py
+new file mode 100644
+index 0000000..c4884f8
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/lanes.py
+@@ -0,0 +1,246 @@
++"""TF_GLM_PREFILL_LANES=2 (patch 0123): a prompt chunk's rows in two lanes, interleaved block by block, so each lane's
++row-split exchange and glue run while the other lane computes.
++
++Without lanes every one of a chunk's 90 exchange sites waits for its own exchange: the row split (``hcsplit``) hides a
++site's exchange only behind the little row-independent work around it (the own rows' partial, the glue, the next
++block's front on own rows). With two lanes, lane A (rows 0 .. RA) and lane B (rows RA .. R) take turns on the main
++stream: A's attention block, B's attention block, A's MLP / MoE block, B's MLP / MoE block, and so on; each lane's
++site (its partials' exchange, hc_post, the taps and stream mean, the next hc_pre, the rows' exchange) runs on the
++exchange stream while the other lane's block runs. The exchange then costs only what the other lane's compute does not
++cover (with TF_GLM_HC_EXCHANGE=ce the copies take no SMs from it).
++
++Exact: each lane is a chunk of its own rows from its own position (RA a multiple of the 64-row prompt grid), run
++through the calls a chunk makes (``forward._mixer`` and ``_ffn`` on the lane's rows, the row split's glue kernels and
++exchanges on the lane's rows). At every layer lane A's block runs before lane B's on the main stream, so lane B reads
++lane A's KDA state, conv window, latents, index keys and pooled keys of that layer as the next chunk would; nothing of
++a lane depends on the other lane's later layers (A's rows come first; a layer's attention reads only that layer's
++caches). TensorFold gives a prompt row the same bits in any chunking on the prompt grid (a resumed prompt equals a
++fresh one), so every row gets the unsplit chunk's bits; the glue's hc_post / hc_pre / stream means are
++row-independent kernels, run on the exchange stream instead of the main one (events order the two).
++
++When: chunks that run split (TF_GLM_HC_SPLIT=1), of one prompt (multi-prompt chunks run as before), with every row
++past the dense limit (a prompt's first 2,051 tokens run as before), two lanes of at least TF_GLM_LANE_MIN_ROWS rows
++(default 512) that each split into whole shares a rank. Pair it with 4,096-row chunks (TF_GLM_PREFILL_ROWS): each
++lane then has the rows of a 2,048-row chunk and the index split (TF_GLM_INDEX_SPLIT) still gives every rank a block."""
++
++from __future__ import annotations
++
++import copy
++import os
++from types import SimpleNamespace
++
++import torch
++
++from . import glue
++from .hcsplit import HcSplit, SplitSettings
++
++# Buffers attributes whose first axis is the window's rows: a lane views its rows of each
++ROWS = ("ids", "ids_host", "hin", "x", "normed", "xs", "post", "comb", "hcpart", "ka", "kg", "xs_fa", "xs_ga", "kxs",
++        "dp", "qr", "xs_qr", "lat", "xs_lat", "q", "kn", "vn", "xs_ao", "ikr", "igr", "qi", "gu", "act", "xs_act",
++        "mlog", "pick", "wts", "ey", "sgu", "sact", "sxs", "sy", "part", "hidden", "fnormed", "fxs", "me", "mcat",
++        "mxs", "mx")
++# handled one by one below
++SPECIAL = ("eact", "kproj", "taps", "kscratch", "lat_s", "gath", "split", "rows", "alloc_rows")
++
++
++def lane_count(value: str | None = None) -> int:
++    value = (os.environ.get("TF_GLM_PREFILL_LANES", "") if value is None else value).strip() or "1"
++    if value not in ("1", "2"):
++        raise ValueError(f"TF_GLM_PREFILL_LANES: 1 (off) or 2, not {value!r}")
++    return int(value)
++
++
++def lane_min_rows(value: str | None = None) -> int:
++    value = (os.environ.get("TF_GLM_LANE_MIN_ROWS", "") if value is None else value).strip() or "512"
++    if not value.isdecimal() or not 64 <= int(value) <= 8192:
++        raise ValueError(f"TF_GLM_LANE_MIN_ROWS: rows from 64 to 8,192, not {value!r}")
++    return int(value)
++
++
++LANES = lane_count()
++MIN_ROWS = lane_min_rows()
++GRID = 64                       # lanes start on the prompt grid (TF_GLM_PROMPT_GRID's 64; a multiple of 32 and 16)
++
++
++def code() -> list[int]:
++    return [LANES, MIN_ROWS if LANES > 1 else 0]
++
++
++def describe() -> str:
++    return (f"prompt chunks in two lanes interleaved block by block (each lane's exchange and glue beside the other "
++            f"lane's compute; lanes of {MIN_ROWS}+ rows)")
++
++
++def cut(R: int, world: int) -> int | None:
++    """Lane A's rows of a chunk of R: about half, on the 64-row grid; None when the chunk does not take lanes (a lane
++    under MIN_ROWS, or a lane that does not split into whole shares a rank)."""
++
++    ra = -(-(R // 2) // GRID) * GRID
++    rb = R - ra
++    if ra < MIN_ROWS or rb < MIN_ROWS or ra % world or rb % world:
++        return None
++    return ra
++
++
++def applies(w, b, R: int, host_pos: int | None, sparse_np, mixer) -> bool:
++    """Whether this chunk runs in lanes (the same answer on every rank: settings and the chunk's numbers only)."""
++
++    sp = b.split
++    return (LANES > 1 and b.prefill and sp is not None and mixer is None and sparse_np is None and host_pos is not None
++            and host_pos >= w.cfg.dense_limit and sp.applies(R) and cut(R, int(w.world)) is not None)
++
++
++def rows_view(b, lo: int, hi: int):
++    """Rows lo .. hi of a prompt buffer set (``forward.Buffers``) as a buffer set of its own: every row-indexed tensor
++    sliced, the scratch the main stream uses one block at a time shared. A row-indexed tensor this module does not
++    know stops it (so a new buffer can never be shared unsliced by mistake)."""
++
++    n = hi - lo
++    alloc = getattr(b, "alloc_rows", b.rows)
++    v = SimpleNamespace()
++    for name, value in vars(b).items():
++        if name in ROWS:
++            if value.shape[0] != alloc:
++                raise RuntimeError(f"prefill lanes: buffer {name} has {value.shape[0]} rows, not {alloc}")
++            setattr(v, name, value[lo:hi])
++        elif name in SPECIAL:
++            continue
++        elif isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] == alloc and alloc > 1:
++            raise RuntimeError(f"prefill lanes: buffer {name} looks row-indexed but has no lane view")
++        else:
++            setattr(v, name, value)
++    v.rows = v.alloc_rows = n
++    slots = b.eact.shape[0] // alloc
++    v.eact = b.eact[lo * slots:hi * slots]
++    v.kproj = b.kproj[:, lo:hi]
++    v.taps = [t[lo:hi] for t in b.taps]
++    s = b.kscratch
++    v.kscratch = SimpleNamespace(out=s.out[lo:hi], k=s.k[lo:hi], v=s.v[lo:hi], g=s.g[lo:hi], b=s.b[lo:hi])
++    lat = copy.copy(b.lat_s)
++    lat.qa, lat.ol, lat.rows = b.lat_s.qa[lo:hi], b.lat_s.ol[lo:hi], n
++    v.lat_s = lat
++    d = b.part.shape[1]
++    v.gath = b.gath[lo * d:]          # the split's staging blocks: lane A's N x HA rows first, then lane B's
++    v.split = None
++    return v
++
++
++class LaneSplit(HcSplit):
++    """A lane's row split: one piece, its partials' exchange, glue and rows' exchange all on the lanes' exchange
++    stream (``glue_async``), the main stream waiting only where the lane's next block needs its rows (``wait``)."""
++
++    def __init__(self, w, view, parent: HcSplit, stream, ce_at: int) -> None:
++        s = parent.settings
++        super().__init__(w, view, SplitSettings(True, False, 1, s.min_rows, s.exchange, False))
++        self.stream = stream
++        self.ev_fill = [torch.cuda.Event()]
++        self.ev_done = torch.cuda.Event()
++        self.ce = parent.ce
++        self.ce_at = ce_at
++
++    def partial(self, fill) -> None:
++        """The lane's whole partial on the main stream, then its exchange on the exchange stream."""
++
++        main = torch.cuda.current_stream()
++        fill(0, self.R)
++        self.ev_fill[0].record(main)
++        with torch.cuda.stream(self.stream):
++            self.stream.wait_event(self.ev_fill[0])
++            self._swap_partial(0)
++
++    def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False) -> None:
++        """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
++        exchange: hc_post, the taps' and final stream means, the next hc_pre, the rows' exchange."""
++
++        b, c = self.b, self.w.cfg
++        lo, hi = self.mine(), self.mine() + self.H
++        outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if hc is not None else [])
++        with torch.cuda.stream(self.stream):
++            self._post(0, lo, hi)
++            x = b.x[lo:hi]
++            for slot in taps:
++                glue.stream_mean(x, b.taps[slot][lo:hi])
++            if final:
++                glue.stream_mean(x, b.hidden[lo:hi])
++            if hc is not None:
++                glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
++                            b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
++            self._swap_rows(0, outs)
++            self.ev_done.record(self.stream)
++
++    def wait(self) -> None:
++        torch.cuda.current_stream().wait_event(self.ev_done)
++
++
++def _lanes(w, b, R: int):
++    """The chunk's two lanes (row views, splits), cached on the prompt buffers by their row ranges."""
++
++    sp = b.split
++    ra = cut(R, int(w.world))
++    cache = getattr(sp, "_lanes", None)
++    if cache is None:
++        cache = sp._lanes = {}
++        sp._lane_stream = sp.stream if sp.stream is not None else torch.cuda.Stream()
++    key = (ra, R)
++    if key not in cache:
++        made = []
++        for lo, hi in ((0, ra), (ra, R)):
++            view = rows_view(b, lo, hi)
++            ls = LaneSplit(w, view, sp, sp._lane_stream, lo // int(w.world))
++            view.split = ls
++            made.append((lo, hi, view, ls))
++        cache[key] = made
++    return cache[key], sp._lane_stream
++
++
++def _lane_state(st, lo: int):
++    """The chunk's state seen from row ``lo`` (lane B): the same caches, KDA states, conv windows and parity list,
++    its first row's position on the host and on the device."""
++
++    if lo == 0:
++        return st
++    v = copy.copy(st)
++    v.pos = st.pos + lo
++    v.pos_dev = st.pos_dev + lo
++    return v
++
++
++def lane_layers(w, st, b, R: int, host_pos: int) -> None:
++    """Every layer of a prompt chunk in two lanes (``applies``); leaves b.normed's, the taps' and b.hidden's rows
++    as ``forward.split_layers`` does."""
++
++    from .forward import _ffn, _mixer, chunks_for
++
++    c = w.cfg
++    if st.pos != host_pos:
++        raise RuntimeError(f"prefill lanes: the state is at {st.pos}, the chunk at {host_pos}")
++    lanes, stream = _lanes(w, b, R)
++    main = torch.cuda.current_stream()
++    run = []
++    for lo, hi, view, ls in lanes:
++        ls.begin(hi - lo)
++        lst = _lane_state(st, lo)
++        run.append((view, ls, lst, hi - lo, chunks_for(lst, hi - lo)))
++    stream.wait_stream(main)
++    try:
++        layers = w.layers
++        first, h = layers[0], layers[0].attn_hc
++        glue.hc_pre(b.x[:R], h.fn, h.base, h.scale, first.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
++                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=True)
++        for i, layer in enumerate(layers):
++            nxt = layers[i + 1] if i + 1 < len(layers) else None
++            for view, ls, lst, n, nch in run:     # attention blocks: lane A's, then lane B's (it reads A's caches)
++                ls.wait()
++                _mixer(layer, w, lst, view, n, nch, lst.pos, None, None)
++                ls.glue_async(layer.ffn_hc, layer.post_norm)
++            for view, ls, lst, n, nch in run:     # MLP / MoE blocks
++                ls.wait()
++                _ffn(layer, w, view, n, None)
++                ls.glue_async(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
++                              taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None)
++        for view, ls, lst, n, nch in run:
++            ls.wait()
++    finally:
++        main.wait_stream(stream)
++        for view, ls, lst, n, nch in run:
++            ls.active = False
